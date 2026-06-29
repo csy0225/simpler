@@ -426,7 +426,14 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         return -1;
     }
     char myName[kIpcNameLen]{};
-    aret = aclrtIpcMemGetExportKey(localBuf, win_size, myName, kIpcNameLen, 0);
+    // DISABLE_PID_VALIDATION: some containerized/forked deployments reject
+    // the subsequent cross-process peer import even after SetImportPid()
+    // whitelist setup.  Exporting without PID validation matches the standalone
+    // IPC probe path and still relies on ENABLE_PEER_ACCESS at import time for
+    // cross-card access.
+    aret = aclrtIpcMemGetExportKey(
+        localBuf, win_size, myName, kIpcNameLen, ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION
+    );
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] ipc: GetExportKey -> %d", rank, static_cast<int>(aret));
         aclrtFree(localBuf);
@@ -521,12 +528,10 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         if (p == rank) continue;
         peerPids.push_back(peers[p].pid);
     }
-    aret = aclrtIpcMemSetImportPid(myName, peerPids.data(), peerPids.size());
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] ipc: SetImportPid -> %d", rank, static_cast<int>(aret));
-        aclrtFree(localBuf);
-        return -1;
-    }
+    // Export uses ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION, so the PID
+    // whitelist API is intentionally skipped. On containerized 0234 this call
+    // returns 207006 and blocks the otherwise-working peer import.
+    (void)peerPids;
     if (!file_barrier(rootinfo, rank, nranks, "ipc_auth_done", run_token)) {
         aclrtFree(localBuf);
         return -1;
@@ -693,7 +698,12 @@ static int domain_alloc_via_ipc(
         return -1;
     }
     char myName[kIpcNameLen]{};
-    aret = aclrtIpcMemGetExportKey(localBuf, win_size, myName, kIpcNameLen, 0);
+    // See alloc_windows_via_ipc(): containerized/forked deployments can reject
+    // SetImportPid-whitelisted cross-process peer imports.  Disable PID
+    // validation at export and keep ENABLE_PEER_ACCESS at import.
+    aret = aclrtIpcMemGetExportKey(
+        localBuf, win_size, myName, kIpcNameLen, ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION
+    );
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: GetExportKey -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(localBuf);
@@ -784,12 +794,10 @@ static int domain_alloc_via_ipc(
         if (p == my_dr) continue;
         peerPids.push_back(peers[p].pid);
     }
-    aret = aclrtIpcMemSetImportPid(myName, peerPids.data(), peerPids.size());
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: SetImportPid -> %d", h->rank, static_cast<int>(aret));
-        aclrtFree(localBuf);
-        return -1;
-    }
+    // Export uses ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION, so the PID
+    // whitelist API is intentionally skipped. On containerized 0234 this call
+    // returns 207006 and blocks the otherwise-working peer import.
+    (void)peerPids;
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "auth_done"), run_token)) {
         aclrtFree(localBuf);
         return -1;
