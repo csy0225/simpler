@@ -89,6 +89,9 @@ public:
     // can be called from the orch thread while the target worker is
     // running a task (MemoryAllocator is mutex-protected).
     uint64_t malloc(int worker_id, size_t size);
+    // Import an ACL device-IPC key on the given NEXT_LEVEL worker, returning a
+    // device pointer valid in that worker's (forked chip child's) ACL context.
+    uint64_t import_ipc(int worker_id, const uint8_t *key, size_t key_len);
     void free(int worker_id, uint64_t ptr);
     void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
     void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);

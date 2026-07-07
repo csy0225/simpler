@@ -37,6 +37,12 @@ uint64_t Orchestrator::malloc(int worker_id, size_t size) {
     return wt->control_malloc(size);
 }
 
+uint64_t Orchestrator::import_ipc(int worker_id, const uint8_t *key, size_t key_len) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::import_ipc: invalid worker_id");
+    return wt->control_import_ipc(key, key_len);
+}
+
 void Orchestrator::free(int worker_id, uint64_t ptr) {
     auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::free: invalid worker_id");

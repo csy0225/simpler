@@ -148,6 +148,12 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
+// Import an ACL device-IPC key inside the chip child's own ACL context
+// (a parent-imported pointer is invalid across the fork). arg0 carries the
+// key length; the raw key bytes are staged at MAILBOX_OFF_ARGS; the result
+// is the imported device pointer.
+static constexpr uint64_t CTRL_IMPORT_IPC = 12;
+static constexpr size_t CTRL_IMPORT_IPC_KEY_MAX = 256;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
@@ -197,6 +203,7 @@ public:
 
     virtual void shutdown_child() {}
     virtual uint64_t control_malloc(size_t size);
+    virtual uint64_t control_import_ipc(const uint8_t *key, size_t key_len);
     virtual void control_free(uint64_t ptr);
     virtual void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     virtual void control_copy_from(uint64_t dst, uint64_t src, size_t size);
@@ -246,6 +253,7 @@ public:
 
     void shutdown_child() override;
     uint64_t control_malloc(size_t size) override;
+    uint64_t control_import_ipc(const uint8_t *key, size_t key_len) override;
     void control_free(uint64_t ptr) override;
     void control_copy_to(uint64_t dst, uint64_t src, size_t size) override;
     void control_copy_from(uint64_t dst, uint64_t src, size_t size) override;
@@ -363,6 +371,7 @@ public:
     // `mailbox_mu_` so a control request issued mid-dispatch waits for
     // TASK_DONE before claiming the mailbox.
     uint64_t control_malloc(size_t size);
+    uint64_t control_import_ipc(const uint8_t *key, size_t key_len);
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);

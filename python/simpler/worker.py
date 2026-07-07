@@ -191,6 +191,11 @@ _CTRL_RELEASE_DOMAIN = 8
 _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
+# Import an ACL device-IPC key inside the forked chip child's own ACL context
+# (the parent-imported pointer is invalid across the fork — see P6). The request
+# stages the key length (uint64) at CTRL_OFF_ARG0 and the raw key bytes at
+# OFF_ARGS; the child returns the imported device pointer at CTRL_OFF_RESULT.
+_CTRL_IMPORT_IPC = 12
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -235,6 +240,42 @@ _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_ARG1 = 24
 _CTRL_OFF_ARG2 = 32
 _CTRL_OFF_RESULT = 40
+
+
+_ACL_LIB: ctypes.CDLL | None = None
+
+
+def _acl_import_ipc(key: bytes) -> int:
+    """Import an ACL device-IPC key in the *current* ACL context, returning a device ptr.
+
+    Must be called from the process/context that will use the pointer — for the
+    chip child this is after ``ChipWorker.init`` has run ``aclrtSetDevice``, so the
+    returned pointer is valid for the kernels that run in this child (a parent-
+    imported pointer is not — see the device-shared/attention bring-up notes).
+
+    Args:
+        key: Raw key bytes produced by ``aclrtIpcMemGetExportKey`` on the exporter.
+
+    Returns:
+        Device pointer (as an int) valid in the current ACL context.
+
+    Raises:
+        RuntimeError: If ``aclrtIpcMemImportByKey`` returns a non-zero status.
+    """
+    global _ACL_LIB
+    if _ACL_LIB is None:
+        _ACL_LIB = ctypes.CDLL("libascendcl.so")
+        _ACL_LIB.aclrtIpcMemImportByKey.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_char_p,
+            ctypes.c_uint64,
+        ]
+    dev_ptr = ctypes.c_void_p()
+    key_buf = ctypes.create_string_buffer(key, len(key))
+    rc = _ACL_LIB.aclrtIpcMemImportByKey(ctypes.byref(dev_ptr), key_buf, 0)
+    if rc != 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey failed: rc={rc} (key_len={len(key)})")
+    return int(dev_ptr.value or 0)
 
 
 @dataclass
@@ -854,6 +895,11 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 if sub_cmd == _CTRL_MALLOC:
                     size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                     ptr = cw.malloc(size)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
+                elif sub_cmd == _CTRL_IMPORT_IPC:
+                    key_len = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    key = bytes(buf[_OFF_ARGS : _OFF_ARGS + key_len])
+                    ptr = _acl_import_ipc(key)
                     struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
                 elif sub_cmd == _CTRL_FREE:
                     ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -2523,6 +2569,22 @@ class Worker:
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         return self._orch.malloc(worker_id, size)
+
+    def import_ipc(self, key: bytes, worker_id: int = 0) -> int:
+        """Import an ACL device-IPC *key*, returning a device pointer.
+
+        The import runs in the ACL context that will execute the kernel: for L2
+        (no fork) that is this process; for L3+ it is the forked chip child
+        (routed via the orchestrator). The returned pointer can back a
+        :class:`~pypto.runtime.DeviceTensor` (``child_memory``) kernel argument
+        with no H2D/D2H copy.
+        """
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return _acl_import_ipc(bytes(key))
+        self._check_chip_worker_id(worker_id)
+        assert self._orch is not None
+        return self._orch.import_ipc(worker_id, bytes(key))
 
     def free(self, ptr: int, worker_id: int = 0) -> None:
         """Free memory allocated by ``malloc()``."""
