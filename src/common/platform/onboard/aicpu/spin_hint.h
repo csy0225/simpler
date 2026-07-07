@@ -34,6 +34,6 @@
 // with the op-exec / stream-sync timeouts. The sim build keeps the full 5 s (no
 // STARS to race). The runtime consumes it as SCHEDULER_TIMEOUT_MS (see
 // scheduler_types.h).
-constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 2000;
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 50000;  // RAISED 2s->50s (< op-exec 60s)
 
 #endif  // PLATFORM_A2A3_AICPU_SPIN_HINT_H_

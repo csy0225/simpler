@@ -64,7 +64,7 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
  * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
  * AICore task execution and kills ops that exceed this threshold.
  */
-constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 60000000;  // RAISED 3s->60s (slow-vs-hang probe)
 
 /**
  * Host-side stream synchronization timeout (milliseconds).
@@ -73,7 +73,7 @@ constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
  * STARS to reap the timed-out op and surface the error, rather than giving up
  * first.
  */
-constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 4000;  // 4s (> op-exec 3s)
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 70000;  // RAISED 4s->70s (> op-exec 60s)
 
 // =============================================================================
 // Derived Platform Limits
