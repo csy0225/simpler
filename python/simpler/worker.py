@@ -218,6 +218,16 @@ _CTRL_L3_L2_ORCH_COMM_INIT = 13
 # for the buffer's registered lifetime — see docs/comm-domain.md.
 _CTRL_MAP_HOST = 14
 _CTRL_UNMAP_HOST = 15
+# Import one external ACL IPC key in each chip child and return the imported
+# device VA through a reply shm.  The import must run in the child that owns the
+# ACL context; importing in the parent would produce an unusable pointer.
+_CTRL_IMPORT_IPC = 16
+_IPC_KEY_BYTES = 256
+_IPC_REPLY_HEADER = struct.Struct("<I")
+_IPC_REPLY_RECORD = struct.Struct("<IQ")
+_IPC_REQUEST_NAME_LEN = struct.Struct("<H")
+_IPC_REQUEST_COUNT = struct.Struct("<I")
+_IPC_REQUEST_RECORD = struct.Struct("<I")
 
 # MAP_HOST payload: token (u64), parent_va (u64), nbytes (u64), then the
 # NUL-free host-buffer shm name as the trailing bytes. UNMAP_HOST payload is the
@@ -421,6 +431,128 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
             if parent_lo <= addr < parent_hi:
                 struct.pack_into("<Q", buf, addr_off, child_base + (addr - parent_lo))
                 break
+
+
+def _normalize_ipc_device_key_map(device_key_map: dict[int, bytes]) -> dict[int, bytes]:
+    if not isinstance(device_key_map, dict) or not device_key_map:
+        raise ValueError("import_ipc_all requires a non-empty device_id -> 256-byte key map")
+    normalized: dict[int, bytes] = {}
+    for raw_device_id, raw_key in device_key_map.items():
+        if isinstance(raw_device_id, bool) or not isinstance(raw_device_id, int) or raw_device_id < 0:
+            raise TypeError(f"IPC device id must be a non-negative int, got {raw_device_id!r}")
+        try:
+            key = bytes(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"IPC key for device {raw_device_id} must be bytes-like") from exc
+        if len(key) != _IPC_KEY_BYTES:
+            raise ValueError(
+                f"IPC key for device {raw_device_id} must be exactly {_IPC_KEY_BYTES} bytes, got {len(key)}"
+            )
+        normalized[raw_device_id] = key
+    return normalized
+
+
+def _encode_ipc_import_payload(reply_name: str, device_key_map: dict[int, bytes]) -> bytes:
+    normalized = _normalize_ipc_device_key_map(device_key_map)
+    reply_name_bytes = reply_name.encode("utf-8")
+    if not reply_name_bytes or len(reply_name_bytes) > 0xFFFF:
+        raise ValueError("IPC reply shm name must be non-empty and fit in uint16")
+    payload = bytearray()
+    payload += _IPC_REQUEST_NAME_LEN.pack(len(reply_name_bytes))
+    payload += reply_name_bytes
+    payload += _IPC_REQUEST_COUNT.pack(len(normalized))
+    for device_id in sorted(normalized):
+        payload += _IPC_REQUEST_RECORD.pack(device_id)
+        payload += normalized[device_id]
+    return bytes(payload)
+
+
+def _decode_ipc_import_payload(payload: bytes) -> tuple[str, dict[int, bytes]]:
+    min_size = _IPC_REQUEST_NAME_LEN.size + _IPC_REQUEST_COUNT.size
+    if len(payload) < min_size:
+        raise RuntimeError(f"IPC import payload is truncated: {len(payload)} bytes")
+    offset = 0
+    (reply_name_len,) = _IPC_REQUEST_NAME_LEN.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_NAME_LEN.size
+    reply_name_end = offset + reply_name_len
+    if reply_name_len == 0 or reply_name_end + _IPC_REQUEST_COUNT.size > len(payload):
+        raise RuntimeError("IPC import payload has an invalid reply shm name length")
+    reply_name = payload[offset:reply_name_end].decode("utf-8")
+    offset = reply_name_end
+    (count,) = _IPC_REQUEST_COUNT.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_COUNT.size
+    expected_size = offset + count * (_IPC_REQUEST_RECORD.size + _IPC_KEY_BYTES)
+    if expected_size != len(payload):
+        raise RuntimeError(
+            f"IPC import payload size mismatch: expected {expected_size}, got {len(payload)}"
+        )
+    device_key_map: dict[int, bytes] = {}
+    for _ in range(count):
+        (device_id,) = _IPC_REQUEST_RECORD.unpack_from(payload, offset)
+        offset += _IPC_REQUEST_RECORD.size
+        if device_id in device_key_map:
+            raise RuntimeError(f"IPC import payload repeats device id {device_id}")
+        device_key_map[device_id] = payload[offset : offset + _IPC_KEY_BYTES]
+        offset += _IPC_KEY_BYTES
+    return reply_name, device_key_map
+
+
+def _handle_ctrl_import_ipc(buf: memoryview, device_id: int) -> None:
+    """Import this chip's external ACL IPC key and publish its peer VA.
+
+    Staged request payload:
+    ``<u16 reply-name-len><reply-name><u32 count><count * (u32 device, 256B key)>``.
+
+    Reply shm:
+    ``<u32 count><count * (u32 device, u64 imported-va)>``.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        if payload_size <= 0 or payload_size > staged.size:
+            raise RuntimeError(
+                f"IPC import payload size mismatch: payload={payload_size}, shm={staged.size}"
+            )
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    reply_name, device_key_map = _decode_ipc_import_payload(payload)
+    try:
+        key = device_key_map[device_id]
+    except KeyError as exc:
+        raise RuntimeError(f"IPC import has no key for device_id {device_id}") from exc
+
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtIpcMemImportByKey.restype = ctypes.c_int
+    acl.aclrtIpcMemImportByKey.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_uint64]
+    key_buffer = ctypes.create_string_buffer(key, _IPC_KEY_BYTES)
+    va = ctypes.c_void_p(0)
+    rc = acl.aclrtIpcMemImportByKey(ctypes.byref(va), key_buffer, ctypes.c_uint64(0x1))
+    if rc != 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey rc={rc} device_id={device_id}")
+    va_int = int(va.value or 0)
+    if va_int <= 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey returned null VA for device_id={device_id}")
+
+    reply = SharedMemory(name=reply_name)
+    try:
+        reply_buf = reply.buf
+        assert reply_buf is not None
+        (reply_count,) = _IPC_REPLY_HEADER.unpack_from(reply_buf, 0)
+        found = False
+        for index in range(reply_count):
+            record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+            reply_device_id, _ = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+            if reply_device_id == device_id:
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, va_int)
+                found = True
+                break
+        if not found:
+            raise RuntimeError(f"IPC reply shm has no slot for device_id={device_id}")
+    finally:
+        reply.close()
 
 
 def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
@@ -1292,6 +1424,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_IMPORT_IPC:
+                        _handle_ctrl_import_ipc(buf, device_id)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -3989,6 +4123,64 @@ class Worker:
     # ------------------------------------------------------------------
     # Post-fork zero-copy host buffers
     # ------------------------------------------------------------------
+
+    def import_ipc_all(self, device_key_map: dict[int, bytes]) -> dict[int, int]:
+        """Import one external ACL IPC allocation in every chip child.
+
+        ``device_key_map`` is keyed by physical device id.  Each 256-byte key is
+        imported inside the matching child ACL context with peer access enabled;
+        the returned map contains child-valid device VAs.  This is a zero-copy
+        ownership bridge: the exporter must keep every allocation alive until
+        this Worker is closed.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("import_ipc_all requires Worker.init()")
+        normalized = _normalize_ipc_device_key_map(device_key_map)
+        expected_devices = [int(device_id) for device_id in self._config.get("device_ids", [])]
+        if set(normalized) != set(expected_devices):
+            raise ValueError(
+                "import_ipc_all device map must exactly match Worker device_ids: "
+                f"expected={sorted(expected_devices)}, got={sorted(normalized)}"
+            )
+        device_ids = sorted(normalized)
+        reply = SharedMemory(
+            create=True,
+            size=_IPC_REPLY_HEADER.size + len(device_ids) * _IPC_REPLY_RECORD.size,
+        )
+        try:
+            reply_buf = reply.buf
+            assert reply_buf is not None
+            _IPC_REPLY_HEADER.pack_into(reply_buf, 0, len(device_ids))
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, 0)
+            payload = _encode_ipc_import_payload(reply.name, normalized)
+            results = self._worker.broadcast_control_all(
+                WorkerType.NEXT_LEVEL,
+                int(_CTRL_IMPORT_IPC),
+                payload,
+                None,
+                timeout_s=self._py_control_timeout_s,
+            )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"import_ipc_all failed on {len(errors)} chip children; first: {errors[0]}"
+                )
+            imported: dict[int, int] = {}
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                reply_device_id, va = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+                if reply_device_id != device_id or va <= 0:
+                    raise RuntimeError(
+                        "import_ipc_all received an invalid reply: "
+                        f"expected device={device_id}, got device={reply_device_id}, va=0x{va:x}"
+                    )
+                imported[device_id] = va
+            return imported
+        finally:
+            reply.close()
+            reply.unlink()
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
         """Allocate a born-shared host buffer, attached into every chip child,
