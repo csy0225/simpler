@@ -258,16 +258,27 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     // in one place (DeviceRunner) and matches HCCL's API shape, which already
     // takes a caller-supplied stream.
 
+    // SIMPLER_COMM_NO_HCCL: skip the vestigial HCCL control comm
+    // (HcclGetRootInfo / HcclCommInitRootInfo) so a pypto worker can co-reside on
+    // the same NPUs as vLLM's HCCL world. run_token + file_barrier still
+    // synchronise every rank; all bulk data movement + comm-domain setup already
+    // use file_barrier + IPC peer-access, not HCCL. Flag unset => original path,
+    // byte-identical.
+    const char *_nh = std::getenv("SIMPLER_COMM_NO_HCCL");
+    const bool no_hccl = (_nh != nullptr && _nh[0] != '\0' && _nh[0] != '0');
+
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
         cleanup_handshake_files(h->rootinfo_path);
         h->run_token = make_run_token(rank);
-        HcclResult hret = hccl_get_root_info(&rootInfo);
-        if (hret != HCCL_SUCCESS) {
-            LOG_ERROR("[comm rank 0] HcclGetRootInfo failed: %d", (int)hret);
-            delete h;
-            return nullptr;
+        if (!no_hccl) {
+            HcclResult hret = hccl_get_root_info(&rootInfo);
+            if (hret != HCCL_SUCCESS) {
+                LOG_ERROR("[comm rank 0] HcclGetRootInfo failed: %d", (int)hret);
+                delete h;
+                return nullptr;
+            }
         }
         RootInfoFileHeader header{};
         header.run_token = h->run_token;
@@ -294,13 +305,15 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
         return nullptr;
     }
 
-    // Init communicator
-    HcclResult hret =
-        hccl_comm_init_root_info(static_cast<uint32_t>(nranks), &rootInfo, static_cast<uint32_t>(rank), &h->hccl_comm);
-    if (hret != HCCL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] HcclCommInitRootInfo failed: %d", rank, (int)hret);
-        delete h;
-        return nullptr;
+    // Init communicator (skipped under SIMPLER_COMM_NO_HCCL -> hccl_comm stays nullptr)
+    if (!no_hccl) {
+        HcclResult hret =
+            hccl_comm_init_root_info(static_cast<uint32_t>(nranks), &rootInfo, static_cast<uint32_t>(rank), &h->hccl_comm);
+        if (hret != HCCL_SUCCESS) {
+            LOG_ERROR("[comm rank %d] HcclCommInitRootInfo failed: %d", rank, (int)hret);
+            delete h;
+            return nullptr;
+        }
     }
 
     return h;
@@ -425,6 +438,14 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         LOG_ERROR("[comm rank %d] ipc: aclrtMalloc -> %d", rank, static_cast<int>(aret));
         return -1;
     }
+    // VA layout diagnostic: the comm domain window shares the HUGE_FIRST region
+    // with any IPC-imported weight pool. Logging its [base, base+size) lets us
+    // detect a VA overlap against the imported pool (Blocker B).
+    LOG_INFO_V0(
+        "[comm rank %d] ipc: domain window localBuf=%p win_size=%llu end=%p", rank, localBuf,
+        static_cast<unsigned long long>(win_size),
+        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(localBuf) + win_size)
+    );
     char myName[kIpcNameLen]{};
     // DISABLE_PID_VALIDATION: some containerized/forked deployments reject
     // the subsequent cross-process peer import even after SetImportPid()
@@ -697,6 +718,16 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain: aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
         return -1;
     }
+    // VA layout diagnostic (Blocker B): per-layer MoE dispatch domain windows
+    // are HUGE_FIRST, sharing the low-VA huge region with any IPC-imported
+    // weight pool.  Logging [base, base+size) for every domain alloc lets us
+    // detect whether a window overlaps the imported pool at scale (42 layers).
+    LOG_INFO_V0(
+        "[comm rank %d] alloc_domain: id=%llu localBuf=%p win_size=%llu end=%p", h->rank,
+        static_cast<unsigned long long>(allocation_id), localBuf,
+        static_cast<unsigned long long>(win_size),
+        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(localBuf) + win_size)
+    );
     char myName[kIpcNameLen]{};
     // See alloc_windows_via_ipc(): containerized/forked deployments can reject
     // SetImportPid-whitelisted cross-process peer imports.  Disable PID
@@ -985,6 +1016,9 @@ extern "C" int comm_derive_context(
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
+    // SIMPLER_COMM_NO_HCCL: control comm is null -> barrier is vestigial (all
+    // real cross-rank sync uses file_barrier). No-op instead of null-deref.
+    if (h->hccl_comm == nullptr) return 0;
     // HcclBarrier is synchronous — it blocks until all ranks arrive.
     // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
     // switches the thread's ACL context, which invalidates the caller-owned
@@ -1027,7 +1061,9 @@ extern "C" int comm_alloc_domain_windows(
     // + run_token are set, used to scope barrier filenames).  We do NOT
     // require comm_alloc_windows on the base in the orch-only model — the
     // dynamic alloc path does its own per-allocation aclrtMalloc + IPC dance.
-    if (h->rootinfo_path.empty() || h->hccl_comm == nullptr) {
+    // SIMPLER_COMM_NO_HCCL: hccl_comm may be null; domain alloc goes via IPC
+    // (domain_alloc_via_ipc), not HCCL, so only rootinfo_path is required.
+    if (h->rootinfo_path.empty()) {
         LOG_ERROR("[comm rank %d] alloc_domain: base communicator not initialised", h->rank);
         return -1;
     }
