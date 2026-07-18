@@ -13,7 +13,7 @@
  *
  * 1. wire_task()         — fanout wiring, early-finished detection,
  *                          fanin_count initialization, ready push
- * 2. on_mixed_task_complete() — COMPLETED transition, fanout traversal,
+ * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
  * 3. on_task_release()   — fanin traversal, producer release,
  *                          self-CONSUMED check
@@ -231,7 +231,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 }
 
 // =============================================================================
-// on_mixed_task_complete: notifies consumers via fanout chain
+// on_task_complete: notifies consumers via fanout chain
 // =============================================================================
 
 TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
@@ -264,7 +264,7 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     dep_entries[1].next = &dep_entries[0];
     producer.fanout_head = &dep_entries[1];
 
-    sched.on_mixed_task_complete(producer);
+    sched.on_task_complete(producer);
 
     // Producer should be COMPLETED
     EXPECT_EQ(producer.task_state.load(), PTO2_TASK_COMPLETED);
@@ -376,8 +376,9 @@ TEST_F(WiringTest, AdvanceRingPointersResetsSlots) {
 
     rss.advance_ring_pointers();
 
-    // After reset_for_reuse: fanout_count=1, fanin_refcount=0, etc.
-    EXPECT_EQ(slot.fanout_count, 1);
+    // After reset_for_reuse: fanout_count=PTO2_FANOUT_SCOPE_BIT (bit31 owning-scope
+    // ref, 0 consumers), fanin_refcount=0, etc.
+    EXPECT_EQ(slot.fanout_count, PTO2_FANOUT_SCOPE_BIT);
     EXPECT_EQ(slot.fanin_refcount.load(), 0);
     EXPECT_EQ(slot.fanout_refcount.load(), 0);
     EXPECT_EQ(slot.completed_subtasks.load(), 0);

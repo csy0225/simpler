@@ -75,9 +75,7 @@ def build_all(
     lib_dir: Path,
     cache_dir: Path,
     platforms: Optional[list] = None,
-    clone_protocol: str = "ssh",
     sanitizer: str = "none",
-    pto_isa_commit: Optional[str] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -85,16 +83,9 @@ def build_all(
         lib_dir: Final binary output directory (lib/).
         cache_dir: Persistent cmake build directory (build/cache/).
         platforms: List of platform strings. None = auto-detect.
-        clone_protocol: Protocol used by ensure_pto_isa_root() when an
-            onboard platform needs the pto-isa headers and PTO_ISA_ROOT is
-            not pre-set. Mirrors conftest's --clone-protocol flag.
         sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
-        pto_isa_commit: pto-isa commit to pin the onboard a2a3 host build to.
-            None = clone/use HEAD. Must match the `--pto-isa-commit` the scene
-            tests pin at run time so host_runtime.so (which compiles the pto-isa
-            SDMA headers) and the test-time kernels share one pto-isa revision.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -118,25 +109,20 @@ def build_all(
         return
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
+    pto_isa_root_for_metadata: Optional[str] = None
+    pto_isa_runtime_keys: list[str] = []
 
     # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
     # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
     # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve PTO_ISA_ROOT now so
-    # the protocol declared on the CLI (and surfaced in the top-level
-    # CMakeLists invocation) is the one actually used, instead of relying on
-    # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
-    # is already set. Skipped when only sim platforms are being built.
-    #
-    # pto_isa_commit pins the clone to the same revision the scene tests later
-    # check out via `--pto-isa-commit`. Without it, host_runtime.so would be
-    # built against whatever pto-isa HEAD (or a stale clone) happened to be at
-    # install time, diverging from the test-time kernels — see issue #1067.
+    # the runtime compiler consumes the same pinned managed checkout as kernel
+    # compilation. Skipped when only sim platforms are being built.
     if "a2a3" in platforms:
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
-            commit=pto_isa_commit, clone_protocol=clone_protocol, verbose=True
-        )
+        pto_isa_root = ensure_pto_isa_root(verbose=True)
+        os.environ["PTO_ISA_ROOT"] = pto_isa_root
+        pto_isa_root_for_metadata = pto_isa_root
 
     # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
     # host toolchain, not per arch/variant) — build them once before iterating
@@ -161,7 +147,7 @@ def build_all(
     # Collect all (platform, runtime_name) tasks to run in parallel
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
-        arch, _ = parse_platform(platform)
+        arch, variant = parse_platform(platform)
         runtimes = discover_runtimes(arch)
 
         if not runtimes:
@@ -170,6 +156,10 @@ def build_all(
 
         for runtime_name in runtimes:
             tasks.append((platform, runtime_name))
+            if arch == "a2a3" and variant == "onboard":
+                from simpler_setup.pto_isa import pto_isa_runtime_artifact_key  # noqa: PLC0415
+
+                pto_isa_runtime_keys.append(pto_isa_runtime_artifact_key(arch, variant, runtime_name))
 
     def _build_runtime(platform: str, runtime_name: str) -> None:
         try:
@@ -198,6 +188,11 @@ def build_all(
         # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
         # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
 
+    if pto_isa_root_for_metadata is not None:
+        from simpler_setup.pto_isa import write_pto_isa_build_metadata  # noqa: PLC0415
+
+        write_pto_isa_build_metadata(lib_dir, pto_isa_root_for_metadata, pto_isa_runtime_keys)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Pre-build runtime binaries for available platforms")
@@ -224,31 +219,12 @@ def main():
         help="List buildable platforms and exit",
     )
     parser.add_argument(
-        "--clone-protocol",
-        choices=["ssh", "https"],
-        default="ssh",
-        help=(
-            "Protocol for cloning pto-isa when an onboard a2a3 build needs it "
-            "and PTO_ISA_ROOT is not pre-set (default: ssh, matching conftest)"
-        ),
-    )
-    parser.add_argument(
         "--sanitizer",
         default="none",
         help=(
             f"Compiler sanitizer for host-compiled targets. Preset "
             f"({'/'.join(SANITIZER_PRESETS)}) or a raw -fsanitize token list. "
             "Default: none. asan/tsan are mutually exclusive (separate builds)."
-        ),
-    )
-    parser.add_argument(
-        "--pto-isa-commit",
-        default=None,
-        help=(
-            "Pin the onboard a2a3 pto-isa clone to this commit before building "
-            "host_runtime. Must match the scene tests' --pto-isa-commit so the "
-            "host runtime and test-time kernels share one pto-isa revision "
-            "(default: clone/use HEAD)."
         ),
     )
     args = parser.parse_args()
@@ -274,9 +250,7 @@ def main():
         lib_dir=args.lib_dir,
         cache_dir=args.cache_dir,
         platforms=args.platforms,
-        clone_protocol=args.clone_protocol,
         sanitizer=args.sanitizer,
-        pto_isa_commit=args.pto_isa_commit,
     )
 
 

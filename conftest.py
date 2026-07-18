@@ -17,12 +17,14 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import typing
 
@@ -148,14 +150,6 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
-        "--enable-device-log-timing",
-        action="store_true",
-        default=False,
-        help="After the run, parse the CANN device log and print per-round Total / Orch / "
-        "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N. "
-        "Onboard only — ignored on sim and L3.",
-    )
-    parser.addoption(
         "--dump-args",
         nargs="?",
         const=1,
@@ -188,17 +182,12 @@ def pytest_addoption(parser):
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
     )
     parser.addoption(
-        "--pto-isa-commit",
-        action="store",
-        default=None,
-        help="Pin pto-isa clone to this commit before running tests",
-    )
-    parser.addoption(
-        "--clone-protocol",
-        action="store",
-        default="ssh",
-        choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+        "--enable-swimlane-overhead",
+        action="store_true",
+        default=False,
+        help="Add the 8 Overhead Analysis counter tracks (per-engine "
+        "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
+        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
     )
     parser.addoption(
         "--sanitizer",
@@ -436,14 +425,8 @@ def pytest_configure(config):
     log_level = config.getoption("--log-level", default=None)
     configure_logging(log_level or DEFAULT_LOG_LEVEL)
 
-    commit = config.getoption("--pto-isa-commit")
-    clone_protocol = config.getoption("--clone-protocol")
-    # Pre-clone / refresh PTO-ISA up front so that (a) the requested
-    # --clone-protocol is honored before SceneTestCase's lazy default-ssh
-    # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # --pto-isa-commit request doesn't miss a recently-published commit.
-    # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
-    #
+    # Pre-clone / refresh PTO-ISA up front so scene-test children inherit the
+    # pinned managed checkout resolved from pto_isa.pin.
     # Pre-clone is an optimization, not a requirement: jobs that don't actually
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
@@ -453,12 +436,7 @@ def pytest_configure(config):
     # (CI scene-test jobs) want the session to die here rather than fan out
     # into device subprocesses that each re-attempt the clone.
     try:
-        root = ensure_pto_isa_root(
-            verbose=True,
-            commit=commit,
-            clone_protocol=clone_protocol,
-            update_if_exists=True,
-        )
+        root = ensure_pto_isa_root(verbose=True)
     except OSError as e:
         if config.getoption("--require-pto-isa"):
             pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)
@@ -763,6 +741,39 @@ def _emit_group(header: str, body: str) -> None:
     print("::endgroup::", flush=True)
 
 
+def _github_actions_escape(value: object) -> str:
+    """Escape a value for the GitHub Actions workflow-command payload."""
+    return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _emit_resource_failure_summary(
+    results: list[_ps.JobResult],
+    *,
+    emit_annotations: bool = True,
+    heading: str = "Resource phase failed",
+) -> None:
+    """Print failed Resource child jobs outside collapsible groups."""
+    failed = [r for r in results if r.returncode != 0]
+    if not failed:
+        return
+
+    print(f"\n*** {heading}: {len(failed)} child job(s) ***", flush=True)
+    for res in failed:
+        devices = ",".join(str(d) for d in res.device_ids)
+        nodeid = res.nodeid or "<unknown>"
+        if emit_annotations:
+            message = _github_actions_escape(f"{nodeid} ({res.label}) rc={res.returncode} devices=[{devices}]")
+            print(f"::error title=Resource phase failed::{message}", flush=True)
+
+        print(
+            f"- nodeid={nodeid}",
+            flush=True,
+        )
+        print(f"  label={res.label}", flush=True)
+        print(f"  rc={res.returncode} devices={res.device_ids} duration={res.duration_s:.1f}s", flush=True)
+        print("  full output is in the Resource child group above", flush=True)
+
+
 def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     """Run Resource → L2 phases.
 
@@ -789,6 +800,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
     resource_failed = False
+    resource_results: list[_ps.JobResult] = []
     if resource_specs:
         jobs = []
         for spec in resource_specs:
@@ -826,18 +838,20 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                     device_count=spec.device_count,
                     build_cmd=_build,
                     cwd=str(cwd),
+                    nodeid=spec.nodeid,
                 )
             )
 
         def _on_done(res):
             tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
-            header = f"{res.label} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
+            nodeid = res.nodeid or "<unknown>"
+            header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
             _emit_group(header, res.output)
             if res.returncode != 0:
                 # Out-of-group summary so a reviewer scanning the collapsed
                 # log still sees the failure without having to expand.
                 print(
-                    f"*** FAIL: {res.label} (devices={res.device_ids}) — expand group above ***",
+                    f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
                     flush=True,
                 )
 
@@ -857,7 +871,10 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             print(f"\n*** Resource phase ABORTED: {e} ***\n", flush=True)
             session.testsfailed = 1
             return True
+        resource_results = results
         resource_failed = any(r.returncode != 0 for r in results)
+        if resource_failed:
+            _emit_resource_failure_summary(results)
         if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
             print("\n*** Resource phase: TIMED OUT ***\n", flush=True)
             os._exit(TIMEOUT_EXIT_CODE)
@@ -891,6 +908,15 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         cmd = base_args + ["--runtime", rt, "--level", "2"]
         if xdist_available:
             cmd += ["-n", str(max_parallel), "--dist", "loadfile"]
+        # Per-runtime sink for the in-process poison guards (issue #1110). Each
+        # xdist worker appends the classes it poison-skips; we re-run them in a
+        # fresh subprocess after this one exits so they don't silently lose
+        # coverage. mkstemp gives an unpredictable, exclusively-created path
+        # (this dev box is shared — a predictable /tmp name is exposed to symlink
+        # / TOCTOU attacks and pid-recycle collisions); the children just append.
+        sink_fd, sink_path = tempfile.mkstemp(prefix="simpler_l2_poison_", suffix=f"_{rt}.jsonl")
+        os.close(sink_fd)
+        run_env = {**os.environ, _L2_POISON_SINK_ENV: sink_path}
         # L2 subprocesses run serially (one runtime at a time) so we don't
         # need to buffer their stdout — we can stream it directly through
         # the group markers. ``::group::`` on its own line before the run
@@ -898,7 +924,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         label = f"L2 {rt}" + (f" [-n {max_parallel}]" if xdist_available else "")
         start = time.monotonic()
         print(f"::group::{label}", flush=True)
-        result = subprocess.run(cmd, check=False, cwd=cwd)
+        result = subprocess.run(cmd, check=False, cwd=cwd, env=run_env)
         duration = time.monotonic() - start
         tag = "PASS" if result.returncode == 0 else f"FAIL rc={result.returncode}"
         print(f"--- L2 {rt}: {tag} {duration:.1f}s ---", flush=True)
@@ -907,11 +933,34 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         if result.returncode == TIMEOUT_EXIT_CODE:
             print(f"*** L2 {rt}: TIMED OUT ***", flush=True)
             os._exit(TIMEOUT_EXIT_CODE)
+
+        # Restore coverage for classes the in-process poison guard skipped: a
+        # fresh subprocess gets a clean card. Collect strictly from the sink the
+        # guards registered, never from "outcome == skipped", so legitimate
+        # skips are untouched.
+        deferred = _read_l2_poison_sink(sink_path)
+        try:
+            os.unlink(sink_path)
+        except FileNotFoundError:
+            pass
+        if deferred and _l2_poison_retry(base_args, rt, deferred, cwd) != 0:
+            l2_failed = True
+            print(f"*** FAIL: L2 {rt} poison-retry — expand group above ***", flush=True)
+            if fail_fast:
+                break
+
         if result.returncode != 0:
             l2_failed = True
             print(f"*** FAIL: L2 {rt} — expand group above ***", flush=True)
             if fail_fast:
                 break
+
+    if resource_failed:
+        _emit_resource_failure_summary(
+            resource_results,
+            emit_annotations=False,
+            heading="Resource phase failed recap",
+        )
 
     session.testsfailed = 1 if (resource_failed or l2_failed) else 0
     if not (resource_failed or l2_failed):
@@ -1050,14 +1099,18 @@ def _register_l2_pool_heal(request, pool, key):
     fresh Worker / ACL context instead of inheriting a poisoned one. No-op on
     pass or on a non-device failure (golden mismatch, assertion).
 
-    NOTE: on a5, an AICore op-timeout poisons the device context for the life of
-    the *process*: an in-process rebuild's Worker.init fails (rtStreamCreate
-    507899), and aclrtResetDeviceForce is unsafe on this shared box (it resets
-    the physical device for other users). So this heal can only *recover* on
-    arches where in-process re-init works; where it cannot, the st_worker L2
-    branch falls back to skipping the remaining tests for that runtime (see
-    _l2_poisoned). Either way one device error stops cascading into a worker-wide
-    storm of confusing 507899 failures."""
+    NOTE: an AICore op-timeout poisons the device context. `DeviceRunner::
+    finalize()` force-resets the card (`aclrtResetDeviceForce`, per-card safe
+    under the exclusive task-submit lock), so the rebuilt Worker.init normally
+    lands on a clean card and the next test runs. But force-reset only fires
+    when `device_unusable_` was set, and that flag is gated on the bounded drain
+    failing — a "drain succeeded but card still poisoned" false-negative skips
+    force-reset, the rebuild's Worker.init then fails (rtStreamCreate 507899),
+    and the st_worker L2 branch falls back to skipping the rest of the runtime
+    (see _l2_poisoned). The dispatcher re-runs those poison-skipped classes in a
+    fresh subprocess (= clean card) so they keep coverage — see
+    _register_l2_poison_skip / issue #1110. Either way one device error stops
+    cascading into a worker-wide storm of confusing 507899 failures."""
 
     def _heal():
         if not _is_device_runtime_error(getattr(request.node, _ST_CALL_EXCINFO, None)):
@@ -1118,6 +1171,95 @@ def _l2_worker_pool(request, st_platform):
     pool.clear()
 
 
+_L2_POISON_SINK_ENV = "SIMPLER_L2_POISON_SINK"
+
+
+def _register_l2_poison_skip(node):
+    """Record a poison-skipped L2 class so the dispatcher can re-run it in a
+    fresh subprocess (= clean card), restoring coverage the in-process skip
+    would otherwise drop (issue #1110).
+
+    Called from the *two* ``st_worker`` poison guards only — legitimate skips
+    (``@pytest.mark.skip``, platform-required, ``requires SceneTestCase``,
+    ``No cases matched``) never reach this sink and so are never retried. The
+    record is a class selector (``ClassName::``) because one ``test_run`` node
+    runs every case of its class; ``--case ClassName::`` reselects them all.
+
+    The sink is a per-runtime JSONL file shared across the xdist-worker → L2
+    subprocess → dispatcher process boundaries; ``O_APPEND`` makes concurrent
+    worker writes atomic. No-op when the env var is unset (a direct ``pytest``
+    run not under the dispatcher) — registration is then simply skipped.
+
+    Best-effort: this runs immediately before an intended ``pytest.skip`` in the
+    poison guards, so an I/O failure here must not raise — that would convert
+    the skip into a setup ERROR. A failed write only costs the coverage retry
+    (the class is not re-run in a fresh process), which is no worse than the
+    pre-#1110 behavior; we warn so the dropped retry is diagnosable."""
+    sink = os.environ.get(_L2_POISON_SINK_ENV)
+    if not sink:
+        return
+    cls = getattr(node, "cls", None)
+    if cls is None:
+        return
+    record = json.dumps({"selector": f"{cls.__name__}::", "nodeid": node.nodeid})
+    try:
+        fd = os.open(sink, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (record + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(
+            f"*** WARN: could not register L2 poison-skip for {cls.__name__} "
+            f"(sink write failed: {e}); class will not be retried ***",
+            flush=True,
+        )
+
+
+def _read_l2_poison_sink(path):
+    """Read poison-skipped class selectors from the sink, deduped and
+    order-preserved (both poison guards may register the same class)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return []
+    selectors = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            sel = json.loads(line).get("selector")
+        except json.JSONDecodeError:
+            continue
+        if sel:
+            selectors.append(sel)
+    return list(dict.fromkeys(selectors))
+
+
+def _l2_poison_retry(base_args, rt, selectors, cwd):
+    """Re-run poison-skipped L2 classes for ``rt`` in a fresh subprocess.
+
+    A new process gets a clean card — the op-timeout poison does not survive a
+    process exit — so classes the in-process skip dropped get real coverage
+    (issue #1110), independent of whether the in-place force-reset recovery
+    worked. Runs *without* the sink env so a retried class that itself
+    re-poisons is not collected again: this is a single bounded pass, not a
+    recursive loop. Returns the subprocess return code."""
+    cmd = base_args + ["--runtime", rt, "--level", "2"]
+    for sel in selectors:
+        cmd += ["--case", sel]
+    env = {k: v for k, v in os.environ.items() if k != _L2_POISON_SINK_ENV}
+    label = f"L2 {rt} poison-retry ({len(selectors)} class(es), fresh process)"
+    print(f"::group::{label}", flush=True)
+    result = subprocess.run(cmd, check=False, cwd=cwd, env=env)
+    tag = "PASS" if result.returncode == 0 else f"FAIL rc={result.returncode}"
+    print(f"--- {label}: {tag} ---", flush=True)
+    print("::endgroup::", flush=True)
+    return result.returncode
+
+
 @pytest.fixture(scope="session")
 def _l2_poisoned():
     """Runtimes whose L2 device context was poisoned by a device-runtime error
@@ -1150,6 +1292,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         # the triggering failure is already reported; a fresh worker process is
         # the only real recovery.
         if runtime in _l2_poisoned:
+            _register_l2_poison_skip(request.node)
             pytest.skip(
                 f"L2 device context for runtime '{runtime}' was poisoned by an earlier device-runtime error on "
                 f"this worker process and cannot be re-initialized in-process; skipping to avoid a misleading "
@@ -1190,6 +1333,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         except RuntimeError as e:
             if _is_device_runtime_error_msg(str(e)):
                 _l2_poisoned.add(runtime)
+                _register_l2_poison_skip(request.node)
                 try:
                     w.close()
                 except Exception:  # noqa: BLE001

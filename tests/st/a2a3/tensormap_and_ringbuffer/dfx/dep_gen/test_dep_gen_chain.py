@@ -31,6 +31,7 @@ predecessor — the barrier.
 """
 
 import json
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -64,12 +65,16 @@ class TestDepGenChain(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": f"{DUMMY_KERNELS}/aic/kernel_write_const.cpp",
                 "core_type": "aic",
+                # Single-AIC task with one INOUT tensor at payload slot 0.
+                "signature": [D.INOUT],
             },
             {
                 "func_id": 1,
                 "name": "COPY_FIRST",
                 "source": f"{DUMMY_KERNELS}/aic/kernel_copy_first.cpp",
                 "core_type": "aic",
+                # Single-AIC task: copies args[0] -> args[1] (IN, INOUT).
+                "signature": [D.IN, D.INOUT],
             },
         ],
     }
@@ -125,14 +130,17 @@ class TestDepGenChain(SceneTestCase):
         args.y[0] = self.SENTINEL
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so _post_validate binds to this
+        # invocation's output dir rather than a stale same-label leftover.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if not self._effective_enable_dep_gen(request):
             return
         for case in self.CASES:
             if st_platform in case.get("platforms", []):
-                self._post_validate(case)
+                self._post_validate(case, run_marker)
 
-    def _post_validate(self, case):
+    def _post_validate(self, case, run_marker):
         """Verify every explicit dep edge survived the writer → replay round-trip.
 
         With dep_gen on, deps.json must contain N edges from the producers to
@@ -144,9 +152,11 @@ class TestDepGenChain(SceneTestCase):
         n = int(case["params"]["n"])
         safe_label = _sanitize_for_filename(f"TestDepGenChain_{case_name}")
         outputs = _outputs_dir()
-        matches = sorted(outputs.glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        assert matches, f"no output dir for case {case_name!r} — scene didn't run on this platform?"
-        out_dir = matches[-1]
+        matches = [p for p in outputs.glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
+        assert matches, (
+            f"no output dir for case {case_name!r} created this run — scene didn't run / capture regression?"
+        )
+        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
         deps_path = out_dir / "deps.json"
         # _post_validate is only invoked when dep_gen was effectively enabled;
         # absence of deps.json means the host runner declined to emit it (most

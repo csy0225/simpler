@@ -33,6 +33,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -40,7 +41,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args.h"
-#include "../task_interface/tensor_arg.h"
+#include "../task_interface/tensor.h"
 #include "ring.h"
 #include "scope.h"
 #include "tensormap.h"
@@ -73,17 +74,17 @@ public:
     // the Scheduler's dispatch_ready walks each queue independently.
     void init(
         TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr
+        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
-    // visible to forked child workers). Returns a ContinuousTensor whose
-    // `.data` points into the ring.
+    // visible to forked child workers). Returns a contiguous Tensor whose
+    // `.buffer.addr` points into the ring.
     //
     // Lifetime: aligned with a synthetic task slot. The buffer is reclaimed
     // (FIFO, via last_alive) once every downstream consumer tagging the
     // pointer has reached CONSUMED and scope_end has released the scope ref.
-    ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
+    Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
     // Memory management on a specific next-level worker. Thread-safe:
     // can be called from the orch thread while the target worker is
@@ -97,17 +98,17 @@ public:
     // by Worker.register(); the child resolves its digest to a private slot.
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
-    // `worker`: logical worker id for affinity (-1 = unconstrained).
+    // `worker_id`: stable NEXT_LEVEL worker id for affinity (-1 = unconstrained).
     SubmitResult submit_next_level(
-        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1,
-        const std::vector<int32_t> &eligible_endpoint_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id = -1,
+        const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
-    // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
-    // `workers`: per-args affinity (empty = all unconstrained).
+    // Submit a group of NEXT_LEVEL tasks: N args -> N worker selections, 1 DAG node.
+    // `worker_ids`: per-args stable NEXT_LEVEL worker id affinity.
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-        const std::vector<int8_t> &workers = {}, const std::vector<std::vector<int32_t>> &eligible_endpoint_ids = {},
+        const std::vector<int32_t> &worker_ids = {}, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 
@@ -162,6 +163,7 @@ private:
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;
     WorkerManager *manager_ = nullptr;
+    std::function<void()> ready_notify_cb_;
     // Strict-4 per-worker-type ready queues. Each queue handles tasks of
     // exactly one WorkerType so the Scheduler can dispatch from an idle pool
     // without being blocked by another pool's saturation.
@@ -192,13 +194,13 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
-        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {},
-        std::vector<std::vector<int32_t>> eligible_endpoint_ids = {},
+        std::vector<TaskArgs> args_list, std::vector<int32_t> affinities = {},
+        std::vector<std::vector<int32_t>> eligible_worker_ids = {},
         std::vector<RemoteTaskArgsSidecar> remote_sidecars = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
-    static uint64_t output_alloc_bytes(const ContinuousTensor &t);
+    static uint64_t output_alloc_bytes(const Tensor &t);
 
     // Rewrite any OUTPUT tensors with a null data pointer to point into a
     // freshly-allocated HeapRing slab. Returns the total aligned byte span
@@ -212,19 +214,19 @@ private:
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
     // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
-    // `affinities` maps args_list[i] → worker id for TensorKey construction.
+    // `affinities` maps args_list[i] to worker id for TensorKey construction.
     void infer_deps(
-        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &affinities,
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
         std::vector<TensorKey> &output_keys
     );
-    void validate_endpoint_eligibility(
-        WorkerType worker_type, size_t args_count, const std::vector<int8_t> &affinities,
-        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+    void validate_worker_eligibility(
+        WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
+        const std::vector<std::vector<int32_t>> &eligible_worker_ids
     ) const;
     void validate_remote_sidecars(
         const std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
-        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+        const std::vector<std::vector<int32_t>> &eligible_worker_ids
     ) const;
 
     // Release one fanout reference on 'slot'.

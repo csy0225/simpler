@@ -237,34 +237,89 @@ AICore uses `last_reg_val` to detect new dispatches — identical values cause s
 
 ### 7.2 Runtime Overrides
 
-Precedence per value: **per-task `CallConfig` field > `PTO2_RING_*` env var
-> compile-time default**. Uniform across all rings of that task's runtime.
+Each ring resource (`ring_task_window` / `ring_heap` / `ring_dep_pool`) is a
+single `CallConfig.runtime_env` field that accepts **either** a scalar (broadcast
+to every ring) **or** a list of four per-ring values. Precedence is resolved
+independently for each resource and ring:
+
+```text
+per-ring CallConfig entry (a scalar is broadcast to every entry)
+  > per-ring PTO2_RING_* env value
+  > scalar PTO2_RING_* env value
+  > compile-time default
+```
+
+`ring_id` is the scope-depth ring selected by the runtime:
+
+```text
+scope depth 0 -> ring 0
+scope depth 1 -> ring 1
+scope depth 2 -> ring 2
+scope depth >=3 -> ring 3
+```
 
 Per-task via `CallConfig.runtime_env` — different L2 tasks in one launch can
-each carry their own sizes. Invalid values raise at submit time (`validate()`):
+each carry their own sizes. Invalid values raise at submit time (`validate()`).
+Assign a scalar to size every ring the same:
 
 ```python
 cfg = CallConfig()
 cfg.runtime_env.ring_task_window = 128   # power of 2, >= 4
-cfg.runtime_env.ring_heap = 262144       # bytes/ring, power of 2, >= 1024
+cfg.runtime_env.ring_heap = 262144       # bytes/ring, >= 1024
 cfg.runtime_env.ring_dep_pool = 256      # 4 .. INT32_MAX
 orchestrator.submit_next_level(handle, args, cfg)
 ```
 
-Scene tests set the same keys under a nested `runtime_env` block in the
-per-case `config` dict:
+Assign a four-entry list to tune the scope-depth rings independently. The list
+must contain exactly four entries; use `0` for an entry that should fall through
+to the next precedence tier. All `CallConfig` values are integer byte/count
+values, and each field always reads back as a four-entry list.
 
 ```python
-"config": {"runtime_env": {"ring_task_window": 128, "ring_heap": 262144, "ring_dep_pool": 256}}
+cfg = CallConfig()
+cfg.runtime_env.ring_task_window = [8192, 16384, 131072, 524288]
+cfg.runtime_env.ring_heap = [
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    384 * 1024 * 1024,
+    512 * 1024 * 1024,
+]
+cfg.runtime_env.ring_dep_pool = [4096, 8192, 16384, 32768]
+orchestrator.submit_next_level(handle, args, cfg)
 ```
 
-Process-wide env fallback (invalid values are silently ignored):
+Scene tests set the same keys under a nested `runtime_env` block in the
+per-case `config` dict — each value is a scalar or a four-entry list:
+
+```python
+"config": {
+    "runtime_env": {
+        "ring_task_window": [8192, 16384, 131072, 524288],
+        "ring_heap": [134217728, 268435456, 402653184, 536870912],
+        "ring_dep_pool": 256,  # scalar broadcasts to every ring
+    }
+}
+```
+
+Process-wide env fallback accepts either one scalar value or exactly four
+comma-separated per-ring values. Invalid env values are logged and ignored, then
+fall through to defaults. `PTO2_RING_HEAP` values are integer bytes:
 
 ```bash
+# Uniform, old behavior:
 PTO2_RING_TASK_WINDOW=1024
 PTO2_RING_HEAP=1048576
 PTO2_RING_DEP_POOL=1024
+
+# Per-ring, indexed by ring_id 0..3:
+PTO2_RING_TASK_WINDOW=8192,16384,131072,524288
+PTO2_RING_HEAP=134217728,268435456,402653184,536870912
+PTO2_RING_DEP_POOL=4096,8192,16384,32768
 ```
+
+Use `--enable-scope-stats` to confirm the effective values for a real run. The
+first line of `scope_stats/scope_stats.jsonl` includes `task_window_max`,
+`heap_max`, and `dep_pool_max`, indexed by `ring`.
 
 ### 7.3 Sizing Guidelines
 

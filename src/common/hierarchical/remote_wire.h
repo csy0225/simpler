@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "../task_interface/call_config.h"
-#include "../task_interface/tensor_arg.h"
+#include "../task_interface/tensor.h"
 #include "types.h"
 
 namespace remote_l3 {
@@ -76,7 +76,7 @@ enum class RemoteRegistryTarget : uint32_t {
 struct FrameHeader {
     FrameType frame_type{FrameType::HELLO};
     uint64_t session_id{0};
-    int32_t endpoint_id{-1};
+    int32_t worker_id{-1};
     uint64_t sequence{0};
     uint32_t payload_bytes{0};
     uint32_t flags{0};
@@ -89,7 +89,7 @@ struct DecodedFrame {
 
 struct HelloPayload {
     uint64_t session_id{0};
-    int32_t endpoint_id{-1};
+    int32_t worker_id{-1};
     uint32_t protocol_version{PROTOCOL_VERSION};
     std::string comm_profile;
     uint64_t feature_flags{0};
@@ -97,7 +97,7 @@ struct HelloPayload {
 };
 
 struct RemoteTaskArgsWire {
-    std::vector<ContinuousTensor> tensor_metadata;
+    std::vector<Tensor> tensor_metadata;
     std::vector<RemoteTensorSidecar> remote_desc;
     std::vector<uint64_t> scalars;
     std::vector<uint8_t> inline_payload;
@@ -131,7 +131,7 @@ struct ControlReplyPayload {
 };
 
 struct ExportBufferRequest {
-    int32_t owner_endpoint_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t offset{0};
@@ -141,14 +141,14 @@ struct ExportBufferRequest {
 };
 
 struct ImportBufferRequest {
-    int32_t importer_endpoint_id{-1};
+    int32_t importer_worker_id{-1};
     uint32_t requested_access_flags{0};
     RemoteBufferExport export_desc{};
 };
 
 struct ReleaseImportRequest {
-    int32_t importer_endpoint_id{-1};
-    int32_t owner_endpoint_id{-1};
+    int32_t importer_worker_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t import_id{0};
@@ -164,8 +164,8 @@ HelloPayload decode_hello(const uint8_t *data, size_t size);
 std::vector<uint8_t> encode_call_config(const CallConfig &config);
 CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset);
 
-std::vector<uint8_t> encode_continuous_tensor(const ContinuousTensor &tensor);
-ContinuousTensor decode_continuous_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task);
+std::vector<uint8_t> encode_tensor(const Tensor &tensor);
+Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task);
 
 std::vector<uint8_t> encode_remote_tensor_desc(const RemoteTensorDesc &desc);
 RemoteTensorDesc decode_remote_tensor_desc(const uint8_t *data, size_t size, size_t &offset);

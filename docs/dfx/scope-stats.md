@@ -24,7 +24,9 @@ resulting `scope_stats/scope_stats.jsonl` into an HTML report.
 Pass the flag to any T&R example or scene test:
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-scope-stats
+CASE=...
+NAME=...
+python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
 ```
 
 The flag is bit 4 of `enable_profiling_flag`; on a T&R run it turns on
@@ -37,6 +39,35 @@ The run writes `scope_stats/scope_stats.jsonl` under the per-task
 output prefix. It is NDJSON: line 1 is run metadata, every subsequent
 line is one scope sample. See [§3](#3-output-scope_statsjsonl) for the
 schema.
+
+The metadata line is also the quickest way to verify per-ring runtime sizing.
+For example, after running with:
+
+```bash
+CASE=...
+NAME=...
+PTO2_RING_TASK_WINDOW=8192,16384,131072,524288 \
+PTO2_RING_HEAP=134217728,268435456,402653184,536870912 \
+PTO2_RING_DEP_POOL=4096,8192,16384,32768 \
+python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
+```
+
+inspect the first line:
+
+```bash
+python - <<'PY' path/to/output_prefix/scope_stats/scope_stats.jsonl
+import json, sys
+with open(sys.argv[1]) as f:
+    meta = json.loads(f.readline())
+print("task_window_max =", meta["task_window_max"])
+print("heap_max        =", meta["heap_max"])
+print("dep_pool_max    =", meta["dep_pool_max"])
+PY
+```
+
+The three arrays are indexed by `ring` (`0..3`) and should match the effective
+runtime configuration. Per-sample `ring` values show which scope-depth rings
+were actually touched by the run; they are scope records, not task counts.
 
 ### Step 3 — Visualize with `scope_stats_plot.py`
 
@@ -76,12 +107,13 @@ meaning, peak, and capacity use; `Max use` shows the selected risk metric,
 peak, capacity, use, peak scope, and peak site. For TensorMap, `Max use` also
 shows `Peak context ring_depth`, which is the scope/ring_depth context where
 the global TensorMap peak was observed. `task_window`, `heap`, and `dep_pool`
-put `High water` / `Live at exit` in the main resource-pressure chart, and put
-`Scope alloc` in a separate chart below it so small allocation changes stay
-readable. `tensormap` shows one global live-entry curve. Charts include
-scope-index ticks on x and observed-usage ticks on y. Percentages are rendered
-with two decimal places. The x-axis uses readable integer scope steps; the
-y-range is `peak * 1.1`, while y-grid ticks use readable integer or
+put `High water` / `Live at exit` in the main resource-pressure chart, and
+render the per-scope allocation curve in a separate chart below it so small
+allocation changes stay readable. `tensormap` shows one global live-entry
+curve. Charts include scope-index ticks on x and observed-usage ticks on y.
+Percentages are rendered with two decimal places. The x-axis uses readable
+integer scope steps; the y-range is `peak * 1.1`, while y-grid ticks use
+readable integer or
 human-friendly steps. Hovering a point shows a highlighted dot plus its metric,
 scope index, y value, and source site. Clicking any chart opens a larger modal
 view of that chart; closing the modal releases the cloned SVG.
@@ -277,7 +309,7 @@ render `used/cap` without a second device→host query.
 | PMU | platform only | all runtimes | reads hardware registers |
 | L2 swimlane | platform only | all runtimes | reads AICore ring buffers |
 | dep_gen | platform only | all runtimes | traces `submit_task` |
-| tensor dump | platform only | all runtimes | dumps tensor data |
+| args dump | platform only | all runtimes | dumps argument data |
 | **scope stats** | **platform API + runtime call sites** | **T&R only** | runtime extracts values, platform tracks peaks |
 
 ### 4.4 Symbol resolution
@@ -299,7 +331,7 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
   set kernel_args fields             runtime: scope_stats_set_ring_capacity()
   launch kernel                      runtime: scope_stats_set_tensormap_capacity()
       │                                  │
-  poll thread:                       on PTO2_SCOPE begin/end:
+  collector shard(s):                on PTO2_SCOPE begin/end:
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;

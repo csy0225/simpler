@@ -36,7 +36,7 @@ Legacy per-task submit (`kernel_id + worker_type`) cannot express atomic co-disp
 
 Design must preserve the current main runtime architecture:
 
-1. Executor threading split (orchestrator thread vs scheduler threads), and post-orchestrator transition (`transition_requested_` + `reassign_cores_for_all_threads()`).
+1. Executor threading split (orchestrator thread vs scheduler threads); the orchestrator thread exits after the task graph is built while scheduler threads dispatch to completion.
 2. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
 
 ## 5. Terminology
@@ -128,7 +128,7 @@ Queueing key is normalized resource shape (not raw slot label).
 1. Fanin release/readiness remains dependency-correct and graph-level.
 2. Two-stage completion:
    - `on_subtask_complete(task_id, subslot)`
-   - `on_mixed_task_complete(task_id)` only when `completed_subtasks == total_required_subtasks`
+   - `on_task_complete(task_id)` only when `completed_subtasks == total_required_subtasks`
 3. Downstream release is triggered once per mixed task completion, not once per subslot.
 
 ## 9. Executor Ownership and Numbering
@@ -146,10 +146,8 @@ This project-defined flattened numbering is kept unchanged.
 ### 9.2 Cluster Ownership
 
 1. One cluster must be owned by one scheduler domain/thread at a time.
-2. No split-cluster ownership in either:
-   - initial `assign_cores_to_threads()`
-   - post-orchestrator `reassign_cores_for_all_threads()`
-3. Lane occupancy bookkeeping must remain consistent with ownership after reassignment.
+2. No split-cluster ownership in `assign_cores_to_threads()`.
+3. Lane occupancy bookkeeping must remain consistent with ownership.
 
 ## 10. Functional Requirements
 

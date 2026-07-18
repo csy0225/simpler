@@ -19,6 +19,10 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <limits>
+#include <vector>
+#include "pto_runtime2.h"
+#include "pto_runtime_status.h"
 #include "pto_shared_memory.h"
 
 namespace {
@@ -83,11 +87,55 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
+    // Stall sub-classification fields start cleared; task_id/core are -1 (no S1
+    // locator) so a stale read never points at a real task/core.
+    EXPECT_EQ(hdr->sched_stall_detail.load(), PTO2_STALL_DETAIL_NONE);
+    EXPECT_EQ(hdr->sched_stall_completed.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_total.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_cnt_running.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_cnt_ready.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_cnt_waiting.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_orch_done.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_task_id.load(), -1);
+    EXPECT_EQ(hdr->sched_stall_core.load(), -1);
+
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &fc = hdr->rings[r].fc;
         EXPECT_EQ(fc.current_task_index.load(), 0);
         EXPECT_EQ(fc.last_task_alive.load(), 0);
     }
+}
+
+// =============================================================================
+// Stall sub-classification (pure decision, no scheduler state)
+// =============================================================================
+
+TEST(StallClassificationTest, PriorityRunningOverEverything) {
+    // RUNNING dominates regardless of ready/waiting/orch_done.
+    EXPECT_EQ(classify_stall_detail(2, 5, 7, 0), PTO2_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(classify_stall_detail(1, 0, 0, 1), PTO2_STALL_DETAIL_RUNNING_STALLED);
+}
+
+TEST(StallClassificationTest, PriorityReadyThenWaiting) {
+    EXPECT_EQ(classify_stall_detail(0, 3, 4, 0), PTO2_STALL_DETAIL_READY_IDLE);
+    EXPECT_EQ(classify_stall_detail(0, 0, 4, 1), PTO2_STALL_DETAIL_DEP_DEADLOCK);
+}
+
+TEST(StallClassificationTest, AllZeroSplitsOnOrchDone) {
+    // No running/ready/waiting: orchestrator-not-done is starvation; done is the
+    // accounting/corruption 'unknown' bucket.
+    EXPECT_EQ(classify_stall_detail(0, 0, 0, 0), PTO2_STALL_DETAIL_ORCH_STARVATION);
+    EXPECT_EQ(classify_stall_detail(0, 0, 0, 1), PTO2_STALL_DETAIL_UNKNOWN);
+}
+
+TEST(StallClassificationTest, NamesAreStableAndDistinct) {
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_NONE), "none");
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_RUNNING_STALLED), "S1:running-stalled");
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_READY_IDLE), "S3:ready-but-all-idle");
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_DEP_DEADLOCK), "S4:dependency-deadlock");
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_ORCH_STARVATION), "S5:orchestrator-starvation");
+    EXPECT_STREQ(stall_detail_name(PTO2_STALL_DETAIL_UNKNOWN), "unknown:accounting/corruption");
+    EXPECT_STREQ(stall_detail_name(12345), "invalid");
 }
 
 TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
@@ -158,6 +206,84 @@ TEST(SharedMemoryCalcSize, PerRingDifferentSizes) {
 
     uint64_t uniform_size = PTO2SharedMemoryHandle::calculate_size(128);
     EXPECT_GT(size, uniform_size);
+}
+
+TEST(SharedMemoryLayout, InitPerRingWritesHeaderValues) {
+    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
+    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {10 * 1024, 20 * 1024, 30 * 1024, 40 * 1024};
+    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
+
+    DeviceArena arena;
+    const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
+    const size_t off_buffer = arena.reserve(static_cast<size_t>(sm_size), PTO2_ALIGN_SIZE);
+    ASSERT_NE(arena.commit(), nullptr);
+
+    auto *handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(off_handle));
+    std::memset(handle, 0, sizeof(*handle));
+    void *buffer = arena.region_ptr(off_buffer);
+    std::memset(buffer, 0, static_cast<size_t>(sm_size));
+    ASSERT_TRUE(handle->init_per_ring(buffer, sm_size, ws, heaps));
+
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        EXPECT_EQ(handle->header->rings[r].task_window_size, ws[r]);
+        EXPECT_EQ(handle->header->rings[r].heap_size, heaps[r]);
+        EXPECT_EQ(handle->header->rings[r].task_window_mask, static_cast<int32_t>(ws[r] - 1));
+    }
+}
+
+TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
+    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
+    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {10 * 1024, 20 * 1024, 30 * 1024, 40 * 1024};
+    int32_t dep_caps[PTO2_MAX_RING_DEPTH] = {4, 8, 16, 32};
+    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
+    uint64_t total_heap = 0;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        total_heap += heaps[r];
+    }
+
+    DeviceArena runtime_arena;
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(runtime_arena, ws, heaps, dep_caps);
+    ASSERT_NE(runtime_arena.commit(DeviceArena::kDefaultBaseAlign), nullptr);
+
+    DeviceArena sm_arena;
+    const size_t sm_off = sm_arena.reserve(static_cast<size_t>(sm_size), PTO2_ALIGN_SIZE);
+    ASSERT_NE(sm_arena.commit(), nullptr);
+    void *sm = sm_arena.region_ptr(sm_off);
+    std::memset(sm, 0, static_cast<size_t>(sm_size));
+
+    std::vector<char> gm(static_cast<size_t>(total_heap));
+    PTO2Runtime *rt =
+        runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
+    ASSERT_NE(rt, nullptr);
+    runtime_wire_arena_pointers(runtime_arena, layout, rt);
+
+    EXPECT_EQ(rt->gm_heap_size, total_heap);
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        EXPECT_EQ(layout.sizing.task_window_sizes[r], ws[r]);
+        EXPECT_EQ(layout.sizing.heap_sizes[r], heaps[r]);
+        EXPECT_EQ(layout.sizing.dep_pool_capacities[r], dep_caps[r]);
+        EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.window_size(), static_cast<int32_t>(ws[r]));
+        EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.heap_capacity(), heaps[r]);
+        EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
+        EXPECT_EQ(rt->scheduler.ring_sched_states[r].dep_pool.capacity, dep_caps[r]);
+    }
+}
+
+TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {
+    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
+    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {std::numeric_limits<uint64_t>::max(), 1, 0, 0};
+    int32_t dep_caps[PTO2_MAX_RING_DEPTH] = {4, 8, 16, 32};
+
+    DeviceArena runtime_arena;
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(runtime_arena, ws, heaps, dep_caps);
+    ASSERT_NE(runtime_arena.commit(DeviceArena::kDefaultBaseAlign), nullptr);
+
+    char sm = 0;
+    char gm = 0;
+    EXPECT_EQ(runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, &sm, 0, &gm, heaps), nullptr);
+
+    PTO2OrchestratorState orch{};
+    EXPECT_FALSE(orch.init_data_from_layout(layout.offsets.orch, runtime_arena, &sm, &gm, heaps, ws));
 }
 
 // =============================================================================

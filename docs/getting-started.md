@@ -11,53 +11,75 @@ The pto-isa dependency will be automatically cloned when you first run an exampl
 
 ## PTO ISA Headers
 
-The pto-isa repository provides header files needed for kernel compilation on the `a2a3` (hardware) platform.
+The pto-isa repository provides header files needed for kernel compilation on
+the `a2a3` hardware platform and for examples that use PTO ISA intrinsics.
+The selected PTO-ISA revision is controlled by the repo-root `pto_isa.pin`
+file.
 
-The test framework automatically handles PTO_ISA_ROOT setup:
+The test framework automatically handles PTO-ISA setup:
 
-1. Checks if `PTO_ISA_ROOT` is already set
-2. If not, clones pto-isa to `build/pto-isa` on first run
-3. Passes the resolved path to the kernel compiler
+1. Reads the required commit from `pto_isa.pin`.
+2. Reuses `build/pto-isa` as-is when it already sits at exactly the pinned
+   commit.
+3. Otherwise (missing, wrong revision, or a dirty working tree) re-clones
+   `build/pto-isa` fresh over HTTPS directly at the pinned commit, rather than
+   `git checkout`-ing over the existing checkout — a checkout aborts on local
+   modifications and would strand the clone at the wrong revision.
+4. Passes that managed checkout to the kernel/runtime compilers.
 
 **Automatic Setup (Recommended):**
-Just run your example - pto-isa will be cloned automatically on first run:
+
+Just run your example. PTO-ISA will be cloned automatically on first run:
 
 ```bash
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim
-```
-
-By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
-
-```bash
-pytest examples --platform a2a3sim --clone-protocol https
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py \
+  -p a2a3sim
 ```
 
 **Manual Setup** (if auto-setup fails or you prefer manual control):
 
 ```bash
 mkdir -p build
-git clone --branch main git@github.com:hw-native-sys/pto-isa.git build/pto-isa
-
-# Or use HTTPS
 git clone --branch main https://github.com/hw-native-sys/pto-isa.git build/pto-isa
-
-# Set environment variable (optional - auto-detected if in standard location)
-export PTO_ISA_ROOT=$(pwd)/build/pto-isa
 ```
 
-**Using a Different Location:**
+Manual setup still uses the standard managed location. Before it builds
+runtimes or compiles kernels, `simpler` verifies that checkout is at the commit
+in `pto_isa.pin`; if it isn't (or the working tree is dirty), it re-clones the
+repository fresh at the pinned commit.
+
+**Revision selection and compatibility checks:**
+
+To use a different PTO-ISA revision, update `pto_isa.pin` to the desired
+40-character commit SHA. This makes the selected revision visible in the repo
+diff and applies the same revision to install-time runtime builds and run-time
+kernel compilation.
+
+For a2a3 onboard runtimes, builds record the actual PTO-ISA git HEAD used for
+each runtime in `build/lib/pto_isa_build.json`. This JSON is artifact
+provenance, not a second configuration source. If the metadata says a
+pre-built runtime was built for an older pin, or a partial rebuild did not
+record that runtime, lookup fails with a stale-binary diagnostic and asks you
+to reinstall or rebuild:
 
 ```bash
-export PTO_ISA_ROOT=/path/to/your/pto-isa
+cat build/lib/pto_isa_build.json
 ```
+
+Existing installs that do not have `build/lib/pto_isa_build.json` continue to
+work; they simply skip this stale-artifact check.
 
 **Troubleshooting:**
 
-- If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
-- If clone fails due to network: Try again or clone manually
-- If SSH clone fails (e.g., in CI): Use `--clone-protocol https` or clone manually with HTTPS
+- If git is not available: install git, or clone PTO-ISA manually into
+  `build/pto-isa` on a machine that can access GitHub.
+- If clone fails due to network: try again or manually clone with HTTPS into
+  `build/pto-isa`.
+- If runtime lookup reports stale PTO-ISA binaries: rerun `pip install` so
+  `build/lib` is rebuilt for the current `pto_isa.pin`.
 
-Note: For the simulation platform (`a2a3sim`), PTO ISA headers are optional and only needed if your kernels use PTO ISA intrinsics.
+Note: for simulation platforms, PTO ISA headers are optional and only needed if
+your kernels use PTO ISA intrinsics.
 
 ## Prerequisites
 

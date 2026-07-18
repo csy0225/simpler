@@ -16,6 +16,8 @@ on every run. The dlopen counter to assert is `host_dlopen_count`,
 not `aicpu_dlopen_count` (which stays 0 — AICPU never sees the orch SO).
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -26,6 +28,23 @@ from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 _VECTOR_KERNELS = "../vector_example/kernels"
 _SLOT_PRIMARY = 0
 _SLOT_SECONDARY = 1
+_ORCH_SO_MAP_TOKEN = "/tmp/orch_so_"
+
+
+def _count_live_orch_so_mappings():
+    try:
+        lines = Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        pytest.skip(f"/proc/self/maps unavailable: {exc}")
+
+    paths = set()
+    for line in lines:
+        if _ORCH_SO_MAP_TOKEN not in line:
+            continue
+        parts = line.split(None, 5)
+        if len(parts) == 6:
+            paths.add(parts[5])
+    return len(paths)
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -117,8 +136,8 @@ class TestPreparedCallableHbg(SceneTestCase):
         config = self._build_config(config_dict)
         chip_worker = self._chip_worker(worker)
 
-        chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
 
         for _ in range(2):
             test_args = self.generate_args(params)
@@ -143,7 +162,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     # ------------------------------------------------------------------
     # host_dlopen_count assertions (hbg path).
     #
-    # hbg increments host_dlopen_count on every register_callable_host_orch
+    # hbg increments host_dlopen_count on every record_host_orch_callable
     # invocation (i.e. each private slot prepare), independent of how many
     # times run is invoked afterwards. AICPU never dlopens the orch
     # SO on this variant, so aicpu_dlopen_count stays at 0.
@@ -173,7 +192,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -195,9 +214,9 @@ class TestPreparedCallableHbg(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
-            chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -219,13 +238,40 @@ class TestPreparedCallableHbg(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
+
+    def test_failed_double_prepare_closes_unpublished_host_handle(self, st_platform, st_worker):
+        if not st_platform.endswith("sim"):
+            pytest.skip("unpublished host dlopen guard is validated on sim")
+
+        callable_obj, _config, _case = self._setup_dlopen_count_test(st_worker, st_platform)
+        baseline_count = st_worker.host_dlopen_count
+        baseline_maps = _count_live_orch_so_mappings()
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
+        try:
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            after_first_maps = _count_live_orch_so_mappings()
+            assert st_worker.host_dlopen_count - baseline_count == 1
+            assert after_first_maps == baseline_maps + 1
+
+            with pytest.raises(RuntimeError):
+                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+
+            assert st_worker.host_dlopen_count - baseline_count == 1
+            assert _count_live_orch_so_mappings() == after_first_maps
+        finally:
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
+
+        assert _count_live_orch_so_mappings() == baseline_maps
 
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         """prepare+run+unregister+prepare+run -> host_dlopen delta == 2.
@@ -237,7 +283,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
@@ -247,7 +293,7 @@ class TestPreparedCallableHbg(SceneTestCase):
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the host dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2, (

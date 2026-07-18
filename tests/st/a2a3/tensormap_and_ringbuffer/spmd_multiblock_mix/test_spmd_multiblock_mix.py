@@ -36,9 +36,31 @@ class TestSpmdMultiblockMix(SceneTestCase):
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "name": "SPMD_MIX_AIC", "source": "kernels/aic/kernel_spmd_mix.cpp", "core_type": "aic"},
-            {"func_id": 1, "name": "SPMD_MIX_AIV0", "source": "kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
-            {"func_id": 2, "name": "SPMD_MIX_AIV1", "source": "kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
+            {
+                "func_id": 0,
+                "name": "SPMD_MIX_AIC",
+                "source": "kernels/aic/kernel_spmd_mix.cpp",
+                "core_type": "aic",
+                # Cooperative MIX (AIC+AIV0+AIV1 share one args[]). Each subtask
+                # declares the shared output it uses (slot 0, INOUT); the dump
+                # records that tensor once per declaring subtask, each under its
+                # own func_id.
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "name": "SPMD_MIX_AIV0",
+                "source": "kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "name": "SPMD_MIX_AIV1",
+                "source": "kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
         ],
     }
 

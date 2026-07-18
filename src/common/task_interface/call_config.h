@@ -12,12 +12,11 @@
 /**
  * CallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
  * (block_dim, aicpu_thread_num), per-task runtime-environment overrides
- * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`) plus the five parallel diagnostics
- * sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane),
- * `enable_dump_tensor`, `enable_pmu`, `enable_dep_gen`, and
- * `enable_scope_stats`. All five require `output_prefix` because they each
- * write sibling artifacts into that directory
- * (`l2_swimlane_records.json` / `tensor_dump/` / `pmu.csv` / `deps.json` /
+ * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a per-ring array) plus the five parallel
+ * diagnostics sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane), `enable_dump_tensor`,
+ * `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All five require `output_prefix` because they each write
+ * sibling artifacts into that directory
+ * (`l2_swimlane_records.json` / `args_dump/` / `pmu.csv` / `deps.json` /
  * `scope_stats/scope_stats.jsonl`).
  *
  * `block_dim == 0` is a sentinel for "auto" — DeviceRunner resolves it at
@@ -36,7 +35,7 @@
  * across compilers (sizeof(bool) is implementation-defined).
  *
  * `output_prefix` is a NUL-terminated directory path under which all
- * diagnostic artifacts (l2_swimlane_records.json / tensor_dump/ / pmu.csv /
+ * diagnostic artifacts (l2_swimlane_records.json / args_dump/ / pmu.csv /
  * deps.json / scope_stats/scope_stats.jsonl) are written. The caller is
  * responsible for filling it whenever any diagnostic flag is enabled — `validate()` enforces
  * this contract at every submit/run entry point so the runtime never has to
@@ -49,33 +48,61 @@
 #include <cstring>
 #include <stdexcept>
 
+inline constexpr int RUNTIME_ENV_RING_COUNT = 4;
+inline constexpr int RUNTIME_ENV_FIELD_GROUPS = 3;  // ring_task_window, ring_heap, ring_dep_pool
+inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT = RUNTIME_ENV_FIELD_GROUPS * RUNTIME_ENV_RING_COUNT;
+
 #pragma pack(push, 1)
 // Per-task runtime-environment overrides — the programmatic equivalent of the
 // `PTO2_RING_*` env vars, grouped under their own sub-struct so they read as a
 // distinct configuration tier from the top-level execution knobs (block_dim,
 // aicpu_thread_num). Consumed by tensormap_and_ringbuffer only; other runtimes
-// ignore them. 0 = unset; precedence: field > PTO2_RING_* env var >
-// compile-time default. ring_heap is bytes per ring.
+// ignore them.
+//
+// Each resource is a per-scope-depth-ring array (index 0..3). A 0 entry is
+// unset and falls through to the next precedence tier: per-ring entry >
+// PTO2_RING_* env var > compile-time default. ring_heap is bytes per ring.
+// The Python/scene-test layer accepts a scalar and broadcasts it to every ring
+// before populating these arrays, so a one-value "size all rings the same"
+// request arrives here as [v, v, v, v].
 struct RuntimeEnv {
-    uint64_t ring_task_window = 0;
-    uint64_t ring_heap = 0;
-    uint64_t ring_dep_pool = 0;
+    uint64_t ring_task_window[RUNTIME_ENV_RING_COUNT] = {};
+    uint64_t ring_heap[RUNTIME_ENV_RING_COUNT] = {};
+    uint64_t ring_dep_pool[RUNTIME_ENV_RING_COUNT] = {};
 
-    bool any() const noexcept { return ring_task_window != 0 || ring_heap != 0 || ring_dep_pool != 0; }
+    bool any() const noexcept {
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            if (ring_task_window[i] != 0 || ring_heap[i] != 0 || ring_dep_pool[i] != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Throws if a ring sizing override violates the ring buffer's constraints.
     void validate() const {
         auto pow2 = [](uint64_t v) {
             return (v & (v - 1)) == 0;
         };
-        if (ring_task_window != 0 && (ring_task_window < 4 || !pow2(ring_task_window))) {
-            throw std::invalid_argument("RuntimeEnv: ring_task_window must be a power of 2 >= 4");
-        }
-        if (ring_heap != 0 && (ring_heap < 1024 || !pow2(ring_heap))) {
-            throw std::invalid_argument("RuntimeEnv: ring_heap must be a power of 2 >= 1024 (bytes per ring)");
-        }
-        if (ring_dep_pool != 0 && (ring_dep_pool < 4 || ring_dep_pool > INT32_MAX)) {
-            throw std::invalid_argument("RuntimeEnv: ring_dep_pool must be in [4, INT32_MAX]");
+        auto validate_task_window = [&](uint64_t value) {
+            if (value != 0 && (value < 4 || value > INT32_MAX || !pow2(value))) {
+                throw std::invalid_argument("RuntimeEnv: ring_task_window must be a power of 2 in [4, INT32_MAX]");
+            }
+        };
+        auto validate_heap = [&](uint64_t value) {
+            if (value != 0 && value < 1024) {
+                throw std::invalid_argument("RuntimeEnv: ring_heap must be >= 1024 (bytes per ring)");
+            }
+        };
+        auto validate_dep_pool = [&](uint64_t value) {
+            if (value != 0 && (value < 4 || value > INT32_MAX)) {
+                throw std::invalid_argument("RuntimeEnv: ring_dep_pool must be in [4, INT32_MAX]");
+            }
+        };
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            validate_task_window(ring_task_window[i]);
+            validate_heap(ring_heap[i]);
+            validate_dep_pool(ring_dep_pool[i]);
         }
     }
 };
@@ -114,5 +141,8 @@ struct CallConfig {
     }
 };
 #pragma pack(pop)
-static_assert(sizeof(RuntimeEnv) == 3 * sizeof(uint64_t), "RuntimeEnv wire layout drift");
-static_assert(sizeof(CallConfig) == 7 * sizeof(int32_t) + 3 * sizeof(uint64_t) + 1024, "CallConfig wire layout drift");
+static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
+static_assert(
+    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    "CallConfig wire layout drift"
+);

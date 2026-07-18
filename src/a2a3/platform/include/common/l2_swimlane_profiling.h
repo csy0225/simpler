@@ -158,16 +158,25 @@ static_assert(sizeof(L2SwimlaneAicpuTaskRecord) == 32, "L2SwimlaneAicpuTaskRecor
  *   reg_task_id, giving a clean 1:1 join even when multiple dispatches
  *   of the same task land on the same core.
  *
- * Layout: 24B identity/timing + 4B reg_task_id + 4B pad → 32B (half a
- * cache line). Two records pack into one cache line so AICore's per-task
- * store is at most a single line commit + dcci.
+ * Layout: 24B identity/timing + 4B reg_task_id + 4B receive_to_start delta →
+ * 32B (half a cache line). Two records pack into one cache line so AICore's
+ * per-task store is at most a single line commit + dcci.
+ *
+ * receive_to_start_cycles isolates the AICore-side dcci+ack cost from the
+ * AICPU→AICore NoC propagation. AICore captures receive_time right after
+ * `read_reg(DATA_MAIN_BASE)` returns the new task_id (before dcci+ack), and
+ * start_time after them. Host derives:
+ *   - receive_time  = start_time - receive_to_start_cycles
+ *   - propagation   = receive_time - dispatch_ts (AICPU view)
+ *   - local_setup   = receive_to_start_cycles    (dcci + ack)
+ * Delta fits in 32 bits at any platform clock (50 MHz @ 32-bit ≈ 85 s).
  */
 struct L2SwimlaneAicoreTaskRecord {
-    uint64_t start_time;      // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;        // Task end timestamp
-    uint64_t task_token_raw;  // PTO2TaskId::raw — identity (NOT join key)
-    uint32_t reg_task_id;     // Per-core dispatch token — host join key vs AICPU stream
-    uint32_t _pad;
+    uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
+    uint64_t end_time;                 // Post-kernel timestamp
+    uint64_t task_token_raw;           // PTO2TaskId::raw — identity (NOT join key)
+    uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
+    uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(L2SwimlaneAicoreTaskRecord) == 32, "L2SwimlaneAicoreTaskRecord must be 32B");
@@ -467,23 +476,49 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
 //   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
 //   the per-submit envelope answers "which submit was slow".
 
-/** Discriminator for the SCHED phase records (the orch side has no kind). */
+/** Discriminator for the SCHED phase records (the orch side has no kind).
+ *
+ * Three role classes, but they share one enum so the on-device record carries
+ * a single discriminator byte:
+ *
+ *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
+ *     Complete, Dispatch, Release, Wire, Dummy, EarlyDispatch.
+ *     Every iter is a sequence of zero-or-more outer bars + optional gap.
+ *
+ *   INNER (no anchor advance; Perfetto auto-nests by time containment):
+ *     Resolve. Only parents are Complete and Dummy — those are the two
+ *     FIN-observation sites that call on_task_complete.
+ *
+ *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
+ *     DummyTask. One zero-width marker per dummy so the DAG node is visually
+ *     present on its handling AICPU's lane; the surrounding Dummy outer bar
+ *     (sched lane) carries the actual drain time, and Resolve inside that
+ *     bar carries the consumer-release work.
+ */
 enum class L2SwimlaneSchedPhaseKind : uint32_t {
-    Complete = 0,  // Process completed tasks (fanin traversal)
-    Dispatch = 1,  // Dispatch ready tasks to idle cores
-    // Surfaced for loop iterations that produce no Complete/Dispatch bar but
-    // still do real work — otherwise hidden inside the "idle" stretch.
-    Poll = 2,     // Completion poll scanned running cores but retired nothing
-    Release = 3,  // Deferred-release drain (on_task_release fanout/refcount work)
-    // Nested child kinds — rendered inside their parent Complete/Dispatch bar
-    // (Perfetto stacks time-contained events on the same lane).
-    Fanout = 4,  // on_mixed_task_complete: fanin release + consumer doorbells
-    Scan = 5,    // one check_running_cores pass — tasks_processed = cores' MMIO COND read
-    // Speculative early-dispatch (Hook 1): building + publishing a flagged
-    // producer's consumer's gated blocks. Its own bar so a long staging pass is
-    // NOT mislabeled Poll — it runs on the producer's owner thread and the
-    // payload-build cost is real (~us/subtask), so it must be visible directly.
-    Prestage = 6,  // try_speculative_prestage — tasks_processed = blocks staged
+    // Outer
+    Complete = 0,       // check_running_cores_for_completion: observe FINs +
+                        // run on_task_complete inline. tasks_processed = FIN'd
+                        // subtasks + sub-block retires this iter.
+    Dispatch = 1,       // dispatch_ready_tasks: publish ready tasks to AICore.
+                        // tasks_processed = subtasks published this iter.
+    Release = 2,        // Deferred-release drain (on_task_release work).
+                        // tasks_processed = slots released this iter.
+    Wire = 3,           // drain_wiring_queue: pop wired tasks into ready queues.
+                        // tasks_processed = wired count.
+    Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
+                        // popped this iter. tasks_processed = dummy_got count.
+    EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
+                        // of a flagged producer's consumer's gated blocks.
+                        // tasks_processed = blocks staged this pass.
+    // Inner (parent: Complete | Dummy)
+    Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
+                  // push newly-ready successors, ring doorbells for
+                  // early-dispatch hits. tasks_processed = # consumers visited.
+    // Separate-lane (Worker View pid=4 AICPU_N)
+    DummyTask = 7,  // Per-dummy identity marker (zero-width). tasks_processed
+                    // = task_token_raw low 32 bits so deps.json flow arrows
+                    // can land on it.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
@@ -500,27 +535,22 @@ constexpr int L2SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * (zero for Complete). Kept named, not "extra1"/"extra2", so the device-side
  * commit and the host-side JSON emit don't drift on which extra means which.
  *
- * Queue-depth snapshots (local_depth_*, shared_depth_*) record the per-shape
- * scheduler queue occupancy at phase boundaries. They surface the
- * dep-release-then-discovery latency that head OH alone can't distinguish from
- * register-write latency: a phase whose start sees `local_depth=N, shared=0`
- * and end sees `local_depth=N-K` shows that K tasks were popped from this
- * thread's private buffer (invisible to peer threads) — peers must spin until
- * those tasks overflow into shared. Filled with 0 below SCHED_PHASES.
+ * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
+ * queue occupancy at phase boundaries. They surface the dep-release-then-
+ * discovery latency that head OH alone can't distinguish from register-write
+ * latency. Filled with 0 below SCHED_PHASES.
  */
 struct L2SwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;                                        // Phase start timestamp
-    uint64_t end_time;                                          // Phase end timestamp
-    uint32_t loop_iter;                                         // Scheduler-loop iteration number on this thread
-    L2SwimlaneSchedPhaseKind kind;                              // Complete or Dispatch
-    uint32_t tasks_processed;                                   // Tasks processed in this phase batch
-    uint32_t pop_hit;                                           // SCHED_DISPATCH delta since last emit (0 for Complete)
-    uint32_t pop_miss;                                          // SCHED_DISPATCH delta since last emit (0 for Complete)
-    int16_t local_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // this thread's PTO2LocalReadyBuffer.count
-    int16_t local_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
+    uint64_t start_time;            // Phase start timestamp
+    uint64_t end_time;              // Phase end timestamp
+    uint32_t loop_iter;             // Scheduler-loop iteration number on this thread
+    L2SwimlaneSchedPhaseKind kind;  // see enum above
+    uint32_t tasks_processed;       // Tasks processed in this phase batch
+    uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
+    uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
     int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
-    uint32_t _pad;  // 64B alignment padding
+    uint32_t _pad[4];  // 64B alignment padding
 };
 static_assert(sizeof(L2SwimlaneAicpuSchedPhaseRecord) == 64, "L2SwimlaneAicpuSchedPhaseRecord layout drift");
 

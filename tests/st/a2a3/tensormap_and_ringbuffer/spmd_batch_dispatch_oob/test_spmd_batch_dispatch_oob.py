@@ -42,9 +42,24 @@ class TestSpmdBatchDispatchOob(SceneTestCase):
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "source": "kernels/aic/kernel_write.cpp", "core_type": "aic"},
-            {"func_id": 1, "source": "kernels/aiv/kernel_write.cpp", "core_type": "aiv"},
-            {"func_id": 2, "source": "kernels/aiv/kernel_write.cpp", "core_type": "aiv"},
+            {
+                "func_id": 0,
+                "source": "kernels/aic/kernel_write.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "source": "kernels/aiv/kernel_write.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "source": "kernels/aiv/kernel_write.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
         ],
     }
 

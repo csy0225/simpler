@@ -17,6 +17,7 @@
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
@@ -280,11 +281,14 @@ inline bool AicpuExecutor::try_dispatch_task(
     pending_task_ids_[core_id] = task_id;
 
     // AICore buffer rotation: count this dispatch and rotate before write_reg
-    // when crossing a BUFFER_SIZE boundary. The completion-before-dispatch
-    // invariant makes this race-free (all prior tasks on this core have FIN'd,
-    // so AICore has dcci'd their records out of the old buffer).
+    // when crossing a BUFFER_SIZE boundary. This runtime writes the swimlane
+    // record before FIN, so the completion-before-dispatch invariant already
+    // guarantees the old buffer's records are drained at rotation; the shared
+    // rotate still stashes the buffer for ACK-gated release, drained here by the
+    // next-rotation / run-end backstop (no ACK hook wired). `task_id` is passed
+    // as the (unused-for-hbg) gate token.
     if (l2_swimlane_enabled) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, static_cast<uint32_t>(task_id));
     }
 
     // Publish task data before AICore can observe the dispatched task_id.
@@ -1084,9 +1088,17 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 }
 
 int AicpuExecutor::run(Runtime *runtime) {
-    int thread_idx = thread_idx_++;
+    int affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
+            MAX_AICPU_THREADS, affinity_exec_idx
+        );
+        return -1;
+    }
 
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     const int *cur_thread_cores = core_assignments_[thread_idx];
 
@@ -1136,7 +1148,21 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // 1. Invalidate AICPU cache for Runtime address range.
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    //    Invalidate exactly the uploaded prefix (offsetof(tasks) + populated
+    //    tasks): the device buffer is allocated at that size (see
+    //    runtime_device_copy_size / init_runtime_args), so invalidating
+    //    sizeof(Runtime) would iterate cache lines past the allocation into
+    //    unrelated memory. A short invalidate is also sufficient — every run
+    //    reads only tasks[0..next_task_id) for its OWN next_task_id (get_task()
+    //    bounds-checks), and the H2D DMA wrote exactly that, so no run ever
+    //    observes a task line beyond its own prefix. cache_invalidate_range
+    //    rounds the end up to a 64-byte line, covering a partial trailing line.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+    const size_t runtime_prefix_bytes =
+        offsetof(Runtime, tasks) + static_cast<size_t>(runtime->get_task_count()) * sizeof(Task);
+#pragma GCC diagnostic pop
+    cache_invalidate_range(runtime, runtime_prefix_bytes);
     if (runtime->get_tensor_info_storage() != nullptr && runtime->get_tensor_info_storage_bytes() > 0) {
         cache_invalidate_range(
             runtime->get_tensor_info_storage(), static_cast<size_t>(runtime->get_tensor_info_storage_bytes())
@@ -1297,6 +1323,11 @@ void AicpuExecutor::diagnose_stuck_state(
 }
 
 // ===== Public Entry Point =====
+
+// host_build_graph resolves orchestration on the host during prepare, so it has
+// no device-side registration: it deliberately does NOT export
+// simpler_aicpu_register_callable (only the TMARB runtime does). The host's
+// register launch is gated on the device-orch path and never targets hbg.
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point

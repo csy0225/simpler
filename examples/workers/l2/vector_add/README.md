@@ -92,9 +92,9 @@ does host→device DMA.
 
 ```python
 args = ChipStorageTaskArgs()
-args.add_tensor(ContinuousTensor.make(dev_a,   shape, DataType.FLOAT32))
-args.add_tensor(ContinuousTensor.make(dev_b,   shape, DataType.FLOAT32))
-args.add_tensor(ContinuousTensor.make(dev_out, shape, DataType.FLOAT32))
+args.add_tensor(Tensor.make(dev_a,   shape, DataType.FLOAT32))
+args.add_tensor(Tensor.make(dev_b,   shape, DataType.FLOAT32))
+args.add_tensor(Tensor.make(dev_out, shape, DataType.FLOAT32))
 
 worker.run(chip_handle, args, CallConfig())  # chip_handle = worker.register(chip_callable) before init()
 ```
@@ -138,7 +138,7 @@ you, plus:
 - Session-level compile cache (kernel not recompiled per case)
 - Parametrized `CASES` and auto-golden comparison
 - Parallel device dispatch via pytest-xdist
-- Integration with `--enable-l2-swimlane`, `--rounds`, `--dump-tensor`
+- Integration with `--enable-l2-swimlane`, `--rounds`, `--dump-args`
 
 Use the raw API when you're **learning** or **embedding** the runtime in a
 larger Python program; use `@scene_test` for shippable test code.

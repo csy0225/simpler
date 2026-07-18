@@ -85,24 +85,47 @@ void l2_swimlane_aicpu_init(int worker_count);
  *
  *   1. Maintain the per-core AICPU-side dispatch count.
  *   2. Rotate the AICore buffer when the count is about to cross a
- *      PLATFORM_AICORE_BUFFER_SIZE boundary — enqueue the just-filled buffer
- *      to the ready queue and pop the next one from free_queue.
+ *      PLATFORM_AICORE_BUFFER_SIZE boundary — publish the next buffer from
+ *      free_queue to AICore and STASH the just-filled buffer for deferred,
+ *      ACK-gated release (see l2_swimlane_aicpu_on_aicore_ack).
  *   3. Bump the AICore pool's `total_record_count` so host reconcile
  *      (total == collected + dropped) stays accurate at all levels —
  *      including AICORE_TIMING (level=1), where `complete_task` is bypassed.
  *
- * Race safety: rotation runs BEFORE the dispatch register write. The runtime's
- * completion-before-dispatch invariant (AICore per core is single-threaded
- * and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
- * FIN'd — and dcci'd out — every record in the old buffer by then. No
- * AICore-side signal is needed; AICPU has full dispatch visibility itself.
+ * Race safety: rotation runs BEFORE the dispatch register write. The
+ * completion-before-dispatch invariant proves prior tasks FIN'd, but
+ * tensormap_and_ringbuffer writes FIN before the swimlane record, so the old
+ * buffer's tail record may not have drained at rotation time. The old buffer is
+ * therefore not enqueued here; it is released once AICore ACKs the boundary
+ * dispatch (whose token is `reg_task_id`). host_build_graph writes the record
+ * before FIN so it has no such window and need not wire the ACK hook.
  *
  * No-op if l2_swimlane is disabled or `core_id` is out of range.
  *
- * @param core_id     Core index this dispatch targets
- * @param thread_idx  Owning AICPU thread (target ready-queue for rotation)
+ * @param core_id      Core index this dispatch targets
+ * @param thread_idx   Owning AICPU thread (target ready-queue for rotation)
+ * @param reg_task_id  Per-core dispatch token of this dispatch; when it is the
+ *                     boundary dispatch it becomes the ACK gate for releasing
+ *                     the just-filled buffer
  */
-void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx);
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id);
+
+/**
+ * Post-completion hook: release an ACK-gated AICore buffer.
+ *
+ * Called from the completion path on every matched AICore COND event (ACK or
+ * FIN). When a rotation has stashed the previous buffer with a gate equal to
+ * `reg_task_id`, that event proves AICore reached at least the new buffer's
+ * first-task ACK — hence passed the old buffer's last record dcci+dsb — so the
+ * stashed buffer is enqueued to the ready queue. No-op when nothing is stashed
+ * or the token does not match the gate. Only tensormap_and_ringbuffer wires
+ * this; host_build_graph relies on the next-rotation / run-end backstop.
+ *
+ * @param core_id      Core index the COND event was observed on
+ * @param thread_idx   Owning AICPU thread (target ready-queue)
+ * @param reg_task_id  Task token extracted from the observed COND value
+ */
+void l2_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_task_id);
 
 /**
  * Commit an AICPU-side timing record for one completed task.
@@ -155,8 +178,7 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
  *                                 to the L2Swimlane base
  * @param num_sched_phase_threads  Number of sched-phase pools to prime
  * @param num_orch_phase_threads   Number of orch-phase pools to prime
- *                                 (typically 1; in orch_to_sched mode =
- *                                 num_aicpu_threads)
+ *                                 (typically 1)
  */
 void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads, int num_orch_phase_threads);
 
@@ -167,11 +189,9 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * pool. Silently drops records when the buffer is full or the pool was not
  * primed (init failed for this thread).
  *
- * Queue-depth snapshots distinguish "task hidden in T0's local_buf" from
- * "shared queue has it but peers spin on the wrong shape" — the former shows
- * `local_depth > 0, shared_depth == 0` for the owning thread while peers see
- * `shared_depth == 0` until overflow. Pass nullptr for any of the four arrays
- * when not capturing (the record's corresponding slot is zero-filled).
+ * Queue-depth snapshots record the per-shape shared ready-queue occupancy at
+ * phase boundaries. Pass nullptr for either array when not capturing (the
+ * record's corresponding slot is zero-filled).
  *
  * @param thread_idx       Scheduler thread index
  * @param kind             Complete or Dispatch
@@ -181,16 +201,12 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * @param tasks_processed  Tasks processed in this phase batch
  * @param pop_hit          Dispatch delta since last emit (0 for Complete)
  * @param pop_miss         Dispatch delta since last emit (0 for Complete)
- * @param local_at_start   Per-shape PTO2LocalReadyBuffer.count at phase start (size L2SWIMLANE_NUM_QUEUE_SHAPES; may be
- * nullptr)
  * @param shared_at_start  Per-shape sched.ready_queues[shape].size() at phase start (may be nullptr)
- * @param local_at_end     Per-shape PTO2LocalReadyBuffer.count at phase end (may be nullptr)
  * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *local_at_start = nullptr,
-    const int16_t *shared_at_start = nullptr, const int16_t *local_at_end = nullptr,
+    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *shared_at_start = nullptr,
     const int16_t *shared_at_end = nullptr
 );
 
@@ -200,8 +216,7 @@ void l2_swimlane_aicpu_record_sched_phase(
  * Must be called once from the orchestrator thread before any
  * l2_swimlane_aicpu_record_orch_phase() calls.
  *
- * @param thread_idx Thread index for the orchestrator (typically num_sched_threads;
- *                   in orch_to_sched mode each scheduler thread sets its own)
+ * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
  */
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
 

@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "utils/device_arena.h"
+#include "scheduler/scheduler_types.h"
 #include "scheduler/pto_scheduler.h"
 
 class SchedulerStateTest : public ::testing::Test {
@@ -170,32 +171,185 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
     sched.on_scope_end(ptrs, N);
 
     for (int i = 0; i < N; i++) {
-        EXPECT_EQ(slots[i].fanout_refcount.load(), 1);
+        // on_scope_end releases the owning-scope ref via release_producer_scope,
+        // which adds PTO2_FANOUT_SCOPE_BIT (bit31) to fanout_refcount.
+        EXPECT_EQ(slots[i].fanout_refcount.load(), PTO2_FANOUT_SCOPE_BIT);
     }
 }
 
 // =============================================================================
-// get_ready_tasks_batch: local buffer first
+// get_ready_tasks_batch: drains the shared ready queue
 // =============================================================================
 
-TEST_F(SchedulerStateTest, GetReadyTasksBatchLocalFirst) {
+TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     alignas(64) PTO2TaskSlotState slot_a, slot_b;
-    init_slot(slot_a, PTO2_TASK_PENDING, 0, 1);
+    // fanin_count = 1 so a single release_fanin_and_check_ready call drives each
+    // slot to ready (new_refcount 0->1 == fanin_count) and enqueues it.
+    init_slot(slot_a, PTO2_TASK_PENDING, 1, 1);
     init_slot(slot_b, PTO2_TASK_PENDING, 1, 1);
 
-    PTO2TaskSlotState *local_buf_storage[4];
-    PTO2LocalReadyBuffer local_buf;
-    local_buf.reset(local_buf_storage, 4);
-    local_buf.try_push(&slot_a);
-
-    // Use src API to route slot_b into the global ready queue
-    sched.release_fanin_and_check_ready(slot_b);
+    // Route both slots into the global ready queue via the src API.
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_a));
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_b));
 
     PTO2TaskSlotState *out[4];
-    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, local_buf, out, 4);
+    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, out, 4);
 
     EXPECT_EQ(count, 2);
-    // Local buffer drains first (LIFO), so slot_a comes first
+    // Shared queue is FIFO, so slot_a (pushed first) comes first.
     EXPECT_EQ(out[0], &slot_a);
     EXPECT_EQ(out[1], &slot_b);
+}
+
+TEST(CoreTrackerTest, MixPendingRejectsPartiallyRunningCluster) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset + 1);  // AIV0 running, AIC/AIV1 idle
+    tracker.clear_pending_occupied(cluster_offset + 1);
+
+    EXPECT_TRUE(tracker.is_aic_core_idle(cluster_offset));
+    EXPECT_FALSE(tracker.is_aiv0_core_idle(cluster_offset));
+    EXPECT_TRUE(tracker.is_aiv1_core_idle(cluster_offset));
+
+    const bool would_place_aic_pending = !tracker.is_aic_core_idle(cluster_offset);
+    const bool would_place_aiv0_pending = !tracker.is_aiv0_core_idle(cluster_offset);
+    const bool would_place_aiv1_pending = !tracker.is_aiv1_core_idle(cluster_offset);
+    EXPECT_FALSE(would_place_aic_pending);
+    EXPECT_TRUE(would_place_aiv0_pending);
+    EXPECT_FALSE(would_place_aiv1_pending);
+
+    auto idle = tracker.get_idle_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_FALSE(idle.has_value());
+
+    auto pending = tracker.get_pending_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_FALSE(pending.has_value()) << "Pending admission here would split one MIX block across running AIC/AIV1 "
+                                      << "placement and pending AIV0 placement.";
+}
+
+TEST(CoreTrackerTest, MixPendingAcceptsFullyRunningClusterWithFreePendingSlots) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset);
+    tracker.change_core_state(cluster_offset + 1);
+    tracker.change_core_state(cluster_offset + 2);
+    tracker.clear_pending_occupied(cluster_offset);
+    tracker.clear_pending_occupied(cluster_offset + 1);
+    tracker.clear_pending_occupied(cluster_offset + 2);
+
+    auto pending = tracker.get_pending_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_TRUE(pending.has_value());
+    EXPECT_EQ(pending.count(), 1);
+}
+
+TEST(CoreTrackerTest, MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset);
+    tracker.change_core_state(cluster_offset + 1);
+    tracker.change_core_state(cluster_offset + 2);
+    tracker.set_pending_occupied(cluster_offset + 1);
+
+    auto pending = tracker.get_pending_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_FALSE(pending.has_value());
+}
+
+TEST(CoreTrackerTest, MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    auto idle = tracker.get_idle_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_TRUE(idle.has_value());
+    EXPECT_EQ(idle.count(), 1);
+
+    auto pending = tracker.get_pending_core_offset_states(PTO2ResourceShape::MIX);
+    EXPECT_FALSE(pending.has_value());
+}
+
+TEST(CoreTrackerTest, MixClassifyIgnoresUnusedBusyCoreForRunningPlacement) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset + 2);  // AIV1 running, unused by this 1c1v task
+
+    auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::RUNNING);
+}
+
+TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset);
+    tracker.change_core_state(cluster_offset + 1);
+    tracker.set_pending_occupied(cluster_offset + 2);  // Unused AIV1 must not block this 1c1v task
+
+    auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
+}
+
+TEST(CoreTrackerTest, MixClassifyRejectsMixedUsedCores) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset + 1);  // AIV0 running while AIC is idle
+
+    auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
+}
+
+TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr int32_t cluster_offset = 0;
+    tracker.change_core_state(cluster_offset);
+    tracker.change_core_state(cluster_offset + 1);
+    tracker.set_pending_occupied(cluster_offset + 1);
+
+    auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
+}
+
+TEST(CoreTrackerTest, MixRunningClusterHelpersUseActiveMask) {
+    CoreTracker tracker;
+    tracker.init(2);
+    tracker.set_cluster(0, 0, 1, 2);
+    tracker.set_cluster(1, 3, 4, 5);
+
+    tracker.change_core_state(2);
+    tracker.change_core_state(5);
+
+    constexpr uint8_t used_mask = PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0;
+
+    EXPECT_EQ(tracker.get_idle_core_offset_states(PTO2ResourceShape::MIX).count(), 0);
+    EXPECT_EQ(tracker.count_mix_running_clusters(used_mask), 2);
+    EXPECT_EQ(tracker.get_mix_running_cluster_offset_states(used_mask).count(), 2);
+}
+
+TEST(CoreTrackerTest, MixRunningClusterHelpersRejectOccupiedUsedPendingSlot) {
+    CoreTracker tracker;
+    tracker.init(1);
+    tracker.set_cluster(0, 0, 1, 2);
+
+    constexpr uint8_t used_mask = PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0;
+    tracker.set_pending_occupied(1);
+
+    EXPECT_EQ(tracker.count_mix_running_clusters(used_mask), 0);
 }

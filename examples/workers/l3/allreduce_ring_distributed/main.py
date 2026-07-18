@@ -28,6 +28,10 @@ Compared to mesh ``allreduce_distributed/`` (O(P) full-vector remote reads per
 rank), ring moves one chunk per round.  P=4 is the primary schedule width;
 P=2 is supported for regression.
 
+Scratch layout: P equal chunk slots followed by a 2(P-1) x kMax signal
+matrix (per-round notify/wait barriers).  Peers read directly from
+each other's chunk slots via CommRemotePtr — no separate exchange buffer.
+
 Run:
     python examples/workers/l3/allreduce_ring_distributed/main.py -p a2a3sim -d 0-3
 
@@ -53,10 +57,10 @@ from simpler.task_interface import (  # noqa: E402
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -73,19 +77,19 @@ ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 CHUNK_MAX = ALLREDUCE_COUNT // 2  # largest chunk (P=2)
-# Float region: (nranks+1)*chunk at runtime; SCRATCH_NBYTES sized for max chunk.
-SCRATCH_FLOAT_ELEMS_MAX = (K_MAX_SUPPORTED_RANKS + 1) * CHUNK_MAX
+# Float region: P*chunk at runtime; SCRATCH_NBYTES sized for max chunk (no exchange).
+SCRATCH_FLOAT_ELEMS_MAX = K_MAX_SUPPORTED_RANKS * CHUNK_MAX
 # Signal tail: one int32 row per RS/AG round (2*(P-1) rounds), bounded by kMaxSupportedRanks.
 SIGNAL_TAIL_NBYTES = 2 * (K_MAX_SUPPORTED_RANKS - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
 SCRATCH_NBYTES = SCRATCH_FLOAT_ELEMS_MAX * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
 
 
 def scratch_float_elems(nranks: int) -> int:
-    """Float slots in the HCCL window for this rank count: P chunk slots + 1 exchange."""
+    """Float slots in the HCCL window for this rank count: P equal chunk slots."""
     if ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must divide nranks={nranks}")
     chunk = ALLREDUCE_COUNT // nranks
-    return (nranks + 1) * chunk
+    return nranks * chunk
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -103,7 +107,7 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the AIV ring allreduce kernel + its C++ orchestration shim.
 
     The orchestration forwards three Tensor args (input / output / scratch)
@@ -112,7 +116,7 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     # The kernel resolves CommContext from "platform_comm/comm_context.h",
@@ -153,7 +157,6 @@ def expected_output(nranks: int) -> list[float]:
 def run(
     device_ids: list[int],
     platform: str = "a2a3",
-    pto_isa_commit: str | None = None,
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
@@ -181,7 +184,7 @@ def run(
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print("[ring-allreduce] compiling kernels...")
-    chip_callable = build_chip_callable(platform, pto_isa_commit)
+    chip_callable = build_chip_callable(platform)
 
     worker = Worker(
         level=3,
@@ -226,7 +229,7 @@ def run(
                     # host tensor — so wrap it manually with child_memory=True
                     # to skip the runtime's H2D path.
                     chip_args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
                             shapes=(float_elems,),
                             dtype=DataType.FLOAT32,
@@ -270,10 +273,9 @@ def main() -> int:
         default="0-3",
         help="Device range, e.g. '0-3' (recommended) or '0-1'. 2 to 16 chips; COUNT must divide nranks.",
     )
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
                 t.running_done = true;
                 t.running_freed = true;
             } else if (pending_gated) {
-                // Case 3.3: running FIN, pending is a SPECULATIVE GATED task. The
+                // Case 3.3: running FIN, pending is a EARLY-DISPATCH GATED task. The
                 // Case 3.1 "wait for the pending's ack" shortcut assumes the AICore
                 // immediately runs the pending task; a gated task instead spins on
                 // its doorbell and never acks until its producer completes — and
@@ -85,7 +85,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
+    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if PTO2_PROFILING
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -132,7 +132,7 @@ void SchedulerContext::complete_slot_task(
         if (cond_count > 0) {
             // Publish "this task is deferred" before on_subtask_complete so the
             // acq_rel fetch_add inside on_subtask_complete makes the flag
-            // visible to whichever subtask sees mixed_complete=true (which may
+            // visible to whichever subtask sees task_complete=true (which may
             // be this thread or a later one).
             slot_state.any_subtask_deferred.store(true, std::memory_order_release);
 
@@ -147,17 +147,17 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+    bool task_complete = sched_->on_subtask_complete(slot_state);
 
 #if PTO2_PROFILING
     // Sub-block retire that did not finish the slot: record it so the poll
     // iteration becomes visible on the scheduler lane (the SPMD harvest tail).
-    if (!mixed_complete && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+    if (!task_complete && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         l2_swimlane.phase_subretire_count++;
     }
 #endif
 
-    if (mixed_complete && slot_state.payload != nullptr &&
+    if (task_complete && slot_state.payload != nullptr &&
         slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
@@ -168,7 +168,7 @@ void SchedulerContext::complete_slot_task(
         defer_completion_to_consumer = true;
     }
 
-    if (mixed_complete && !defer_completion_to_consumer) {
+    if (task_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
         if (is_dump_args_enabled()) {
             dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -183,25 +183,41 @@ void SchedulerContext::complete_slot_task(
         }
 #endif
 #if PTO2_PROFILING
-        // Time the fanout (fanin release + consumer doorbells) so it renders as
-        // a child bar nested inside this iteration's Complete bar — surfacing how
-        // much of a long complete is the 50-consumer walk + doorbell vs scan.
-        uint64_t fanout_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+        // Time Resolve (walk the consumer list, decrement each consumer's
+        // fanin, push the newly-ready ones, ring doorbells for early-dispatch
+        // hits) so it renders as a child bar nested inside this iteration's
+        // Complete bar. The 1 µs floor below filters out the ~88% of tasks
+        // with 1-2 consumers (~500 ns Resolve) so only the long broadcast /
+        // reduction walks stand out on the lane.
+        uint64_t resolve_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
+        // [[maybe_unused]] silences -Werror=unused-but-set-variable on the
+        // profiling-flags-smoke build path where PTO2_PROFILING is OFF and
+        // the Resolve emit below is excluded.
+        [[maybe_unused]] uint32_t consumers_resolved = 0;
 #if PTO2_SCHED_PROFILING
         // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
-        // by the otc_* log lines). Its return value is unused.
-        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+        // by the otc_* log lines). It returns CompletionStats whose
+        // `fanout_edges` is the consumer-walk count.
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
 #else
-        sched_->on_mixed_task_complete(slot_state, local_bufs);
+        consumers_resolved = sched_->on_task_complete(slot_state);
 #endif
 #if PTO2_PROFILING
-        if (fanout_t0 != 0) {
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Fanout, fanout_t0, get_sys_cnt_aicpu(),
-                l2_swimlane.sched_loop_count, /*tasks_processed=*/0
-            );
+        if (resolve_t0 != 0) {
+            uint64_t resolve_t1 = get_sys_cnt_aicpu();
+            // Filter: drop Resolve bars under 1 µs so the lane shows only
+            // resolves that did meaningful work (high consumer counts or
+            // doorbells). 50 cycles @ 50 MHz = 1 µs (PLATFORM_PROF_SYS_CNT_FREQ
+            // is the device sys-cnt frequency).
+            constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;  // 1 µs
+            if (resolve_t1 - resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Resolve, resolve_t0, resolve_t1, l2_swimlane.sched_loop_count,
+                    consumers_resolved
+                );
+            }
         }
         l2_swimlane.phase_complete_count++;
 #endif
@@ -278,19 +294,10 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
 
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-    PTO2LocalReadyBuffer *local_bufs
+    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
-#endif
-#if PTO2_PROFILING
-    // Time this whole pass and count cores whose MMIO COND we actually read
-    // (skip-gated cores excluded) — emit a Scan bar so the per-pass MMIO cost
-    // and effective re-poll cadence are visible directly.
-    bool scan_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
-    uint64_t scan_t0 = scan_record ? get_sys_cnt_aicpu() : 0;
-    uint32_t scan_cores = 0;
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
@@ -299,17 +306,17 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
 
-        // Skip gated speculative cores. A STAGED task is parked on this core
+        // Skip gated early-dispatch cores. A STAGED task is parked on this core
         // waiting for its doorbell — it physically cannot ACK/FIN yet, so
         // reading its COND (MMIO, and the core is hot-spinning on its own SPR)
         // every poll is pure waste that drags out the completion phase. The
-        // doorbell (try_speculative_release) flips spec_state to DISPATCHED, at
+        // doorbell (try_early_dispatch_release) flips early_dispatch_state to DISPATCHED, at
         // which point the core becomes pollable again and its FIN is caught.
         // Cheap cacheable load; no MMIO. Pending slot is empty while gated.
         {
             PTO2TaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) {
+                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
                 continue;
             }
         }
@@ -317,9 +324,6 @@ void SchedulerContext::check_running_cores_for_completion(
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
-#if PTO2_PROFILING
-        scan_cores++;  // counts cores whose MMIO COND we actually read this pass
-#endif
         uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
         // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
         // rmb() pins any AICore-published cacheable reads downstream of the
@@ -335,17 +339,28 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        // A pending task is "gated" when it is a speculative pre-stage still
+        // A pending task is "gated" when it is a early-dispatch pre-stage still
         // waiting on its doorbell (STAGED): it will not ack on the producer's FIN,
         // so the Case 3.1 wait-for-pending-ack shortcut would deadlock. Detect it
         // so decide_slot_transition completes the running FIN and promotes it.
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING);
+             core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) ==
+                 PTO2_EARLY_DISPATCH_STAGING);
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
         if (!t.matched) continue;
+
+#if PTO2_PROFILING
+        // Release an ACK-gated AICore swimlane buffer if this matched ACK/FIN is
+        // the one a rotation is waiting on: it proves the core advanced past the
+        // just-rotated buffer's tail record (FIN precedes the record write on
+        // this runtime, so rotation could not release the buffer itself).
+        if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
+            l2_swimlane_aicpu_on_aicore_ack(core_id, thread_idx, static_cast<uint32_t>(reg_task_id));
+        }
+#endif
 
 #if PTO2_SCHED_PROFILING
         if (l2_swimlane.l2_swimlane_enabled && (t.running_done || t.pending_done)) {
@@ -372,7 +387,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.pending_done) {
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if PTO2_PROFILING
                 ,
                 core.pending_dispatch_timestamp, finish_ts
@@ -383,7 +398,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_done) {
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if PTO2_PROFILING
                 ,
                 core.running_dispatch_timestamp, finish_ts
@@ -425,14 +440,6 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
-#if PTO2_PROFILING
-    if (scan_record && scan_cores > 0) {
-        l2_swimlane_aicpu_record_sched_phase(
-            thread_idx, L2SwimlaneSchedPhaseKind::Scan, scan_t0, get_sys_cnt_aicpu(),
-            sched_l2_swimlane_[thread_idx].sched_loop_count, scan_cores
-        );
-    }
-#endif
 }
 
 // =============================================================================
@@ -464,10 +471,14 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
-        total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        if (shape == PTO2ResourceShape::MIX) {
+            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+        } else {
+            total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        }
     }
     return total;
 }
@@ -482,10 +493,13 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    uint8_t core_mask = slot_state->active_mask.core_mask();
 
     for (int32_t t = 0;
          t < active_sched_threads_ && slot_state->next_block_idx.load(std::memory_order_relaxed) < block_num; t++) {
-        auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
+        auto valid = (shape == PTO2ResourceShape::MIX) ?
+                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
+                         core_trackers_[t].get_idle_core_offset_states(shape);
         int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
         int32_t remaining = slot_state->logical_block_num - start;
         int32_t claim = std::min(valid.count(), remaining);
@@ -509,6 +523,14 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
             publish_subtask_to_core(handles[i], dispatch_ts);
         }
     }
+
+    // The drain path IS this sync_start producer's dispatch, so it must bump its
+    // consumers' dispatch_fanin like the normal dispatch path
+    // (scheduler_dispatch.cpp, post-publish) -- otherwise a consumer whose only
+    // flagged producer is a sync_start (drain-dispatched) task never becomes an
+    // early-dispatch candidate. Idempotent via propagate's dispatch_propagated
+    // once-guard; the internal gate no-ops for an unflagged producer.
+    sched_->propagate_dispatch_fanin(*slot_state);
 
     // All blocks dispatched -- clear drain state.
     // Release fence ensures tracker mutations are visible to threads that
@@ -595,7 +617,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape);
+    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
 
     if (available < block_num) {
         // Insufficient resources -- reset drain fields so threads can resume

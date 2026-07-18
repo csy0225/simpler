@@ -5,7 +5,7 @@
 ```text
 pto-runtime/
 ├── src/
-│   ├── common/task_interface/            # Cross-architecture shared headers (data_type.h, tensor_arg.h, task_args.h)
+│   ├── common/task_interface/            # Cross-architecture shared headers (data_type.h, tensor.h, task_args.h)
 │   └── {arch}/                         # Architecture-specific code (a2a3, a5)
 │       ├── platform/                   # Platform-specific implementations
 │       │   ├── include/                # Shared headers (host/, aicpu/, aicore/, common/)
@@ -47,7 +47,7 @@ pto-runtime/
 │   ├── elf_parser.py                  # Authoritative copy
 │   ├── platform_info.py               # Platform/runtime discovery
 │   ├── environment.py                 # PROJECT_ROOT resolver (wheel vs source tree)
-│   ├── pto_isa.py                     # PTO_ISA_ROOT discovery
+│   ├── pto_isa.py                     # pinned PTO-ISA checkout management
 │   ├── build_runtimes.py              # Pre-build all runtime variants (invoked by pip install)
 │   └── _assets/                       # (wheel only) src/ + build/lib/ shipped with wheel
 │
@@ -185,7 +185,11 @@ This builds the nanobind `_task_interface` extension **and** pre-builds all runt
 | Nanobind bindings (`python/bindings/`) | Re-run `pip install --no-build-isolation -e .` (no rebuild-on-import; `editable.rebuild = false`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
-| Pinned pto-isa commit (CI `PTO_ISA_COMMIT`) | Re-run `pip install` — onboard a2a3 `host_runtime.so` embeds pto-isa SDMA headers, so a commit bump must rebuild it. Pin the build to the same commit the tests use via `--config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha>` (issue #1067). |
+| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard, so a pin bump invalidates stale runtime objects automatically. |
+
+A `pto_isa.pin` bump changes the SDMA headers embedded by
+`host_runtime.so`. Install-time runtime builds and run-time kernel compilation
+both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
 ### Runtime binary lookup
 

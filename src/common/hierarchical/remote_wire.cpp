@@ -211,7 +211,7 @@ void validate_desc_against_inline_payload(const RemoteTensorDesc &desc, size_t i
         "remote_wire: RemoteTensorDesc offset+nbytes overflows"
     );
     if (desc.address_space == RemoteAddressSpace::HOST_INLINE) {
-        ensure(desc.owner_endpoint_id == 0, "remote_wire: HOST_INLINE owner_endpoint_id must be zero");
+        ensure(desc.owner_worker_id == 0, "remote_wire: HOST_INLINE owner_worker_id must be zero");
         ensure(desc.buffer_id == 0, "remote_wire: HOST_INLINE buffer_id must be zero");
         ensure(desc.remote_addr == 0, "remote_wire: HOST_INLINE remote_addr must be zero");
         ensure(desc.rkey_or_token == 0, "remote_wire: HOST_INLINE rkey_or_token must be zero");
@@ -225,7 +225,7 @@ void validate_desc_against_inline_payload(const RemoteTensorDesc &desc, size_t i
     } else {
         ensure(desc.inline_payload_offset == 0, "remote_wire: non-HOST_INLINE inline offset must be zero");
         ensure(desc.inline_payload_len == 0, "remote_wire: non-HOST_INLINE inline length must be zero");
-        ensure(desc.owner_endpoint_id >= 0, "remote_wire: remote descriptor owner endpoint must be non-negative");
+        ensure(desc.owner_worker_id >= 0, "remote_wire: remote descriptor owner worker must be non-negative");
         ensure(desc.buffer_id != 0, "remote_wire: remote descriptor buffer_id must be non-zero");
         ensure(desc.generation != 0, "remote_wire: remote descriptor generation must be non-zero");
     }
@@ -242,7 +242,7 @@ std::vector<uint8_t> encode_frame(const FrameHeader &header, const std::vector<u
     put_u32(out, PROTOCOL_VERSION);
     put_u32(out, static_cast<uint32_t>(header.frame_type));
     put_u64(out, header.session_id);
-    put_i32(out, header.endpoint_id);
+    put_i32(out, header.worker_id);
     put_u64(out, header.sequence);
     put_u32(out, static_cast<uint32_t>(payload.size()));
     put_u32(out, header.flags);
@@ -261,7 +261,7 @@ DecodedFrame decode_frame(const uint8_t *data, size_t size) {
     DecodedFrame frame;
     frame.header.frame_type = static_cast<FrameType>(raw_type);
     frame.header.session_id = get_u64(data, size, offset);
-    frame.header.endpoint_id = get_i32(data, size, offset);
+    frame.header.worker_id = get_i32(data, size, offset);
     frame.header.sequence = get_u64(data, size, offset);
     frame.header.payload_bytes = get_u32(data, size, offset);
     frame.header.flags = get_u32(data, size, offset);
@@ -276,11 +276,11 @@ DecodedFrame decode_frame(const std::vector<uint8_t> &data) { return decode_fram
 
 std::vector<uint8_t> encode_hello(const HelloPayload &payload) {
     ensure(payload.session_id != 0, "remote_wire: HELLO session_id must be non-zero");
-    ensure(payload.endpoint_id >= 0, "remote_wire: HELLO endpoint_id must be non-negative");
+    ensure(payload.worker_id >= 0, "remote_wire: HELLO worker_id must be non-negative");
     ensure(payload.protocol_version == PROTOCOL_VERSION, "remote_wire: HELLO protocol version mismatch");
     std::vector<uint8_t> out;
     put_u64(out, payload.session_id);
-    put_i32(out, payload.endpoint_id);
+    put_i32(out, payload.worker_id);
     put_u32(out, payload.protocol_version);
     put_string(out, payload.comm_profile, MAX_STRING_BYTES, "HELLO.comm_profile");
     put_u64(out, payload.feature_flags);
@@ -293,8 +293,8 @@ HelloPayload decode_hello(const uint8_t *data, size_t size) {
     HelloPayload payload;
     payload.session_id = get_u64(data, size, offset);
     ensure(payload.session_id != 0, "remote_wire: HELLO session_id must be non-zero");
-    payload.endpoint_id = get_i32(data, size, offset);
-    ensure(payload.endpoint_id >= 0, "remote_wire: HELLO endpoint_id must be non-negative");
+    payload.worker_id = get_i32(data, size, offset);
+    ensure(payload.worker_id >= 0, "remote_wire: HELLO worker_id must be non-negative");
     payload.protocol_version = get_u32(data, size, offset);
     ensure(payload.protocol_version == PROTOCOL_VERSION, "remote_wire: HELLO protocol version mismatch");
     payload.comm_profile = get_string(data, size, offset, MAX_STRING_BYTES, "HELLO.comm_profile");
@@ -336,9 +336,20 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
     return config;
 }
 
-std::vector<uint8_t> encode_continuous_tensor(const ContinuousTensor &tensor) {
+// Wire format carries only the contiguous-defining fields (addr, shapes, ndims,
+// dtype, child_memory +
+// 7 reserved bytes). The unified Tensor's derived state (strides / start_offset
+// / is_contiguous) is recomputed as row-major on decode. The wire is therefore
+// contiguous-only: a strided Tensor would be silently flattened. Guard against
+// that here so the loss is loud, not silent — strided views only round-trip
+// over the local fork/shm mailbox blob, never this remote wire.
+std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
+    ensure(
+        tensor.is_contiguous && tensor.start_offset == 0,
+        "remote_wire: only contiguous, zero-offset tensors are supported on the wire"
+    );
     std::vector<uint8_t> out;
-    put_u64(out, tensor.data);
+    put_u64(out, tensor.buffer.addr);
     for (uint32_t shape : tensor.shapes)
         put_u32(out, shape);
     put_u32(out, tensor.ndims);
@@ -349,29 +360,32 @@ std::vector<uint8_t> encode_continuous_tensor(const ContinuousTensor &tensor) {
     return out;
 }
 
-ContinuousTensor decode_continuous_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task) {
-    ContinuousTensor tensor{};
-    tensor.data = get_u64(data, size, offset);
-    if (remote_task) ensure(tensor.data == 0, "remote_wire: remote TASK tensor data must be zero");
-    for (uint32_t &shape : tensor.shapes)
+Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task) {
+    uint64_t addr = get_u64(data, size, offset);
+    if (remote_task) ensure(addr == 0, "remote_wire: remote TASK tensor data must be zero");
+    uint32_t shapes[MAX_TENSOR_DIMS];
+    for (uint32_t &shape : shapes)
         shape = get_u32(data, size, offset);
-    tensor.ndims = get_u32(data, size, offset);
-    ensure(tensor.ndims <= CONTINUOUS_TENSOR_MAX_DIMS, "remote_wire: tensor ndims exceeds maximum");
+    uint32_t ndims = get_u32(data, size, offset);
+    ensure(ndims > 0 && ndims <= MAX_TENSOR_DIMS, "remote_wire: tensor ndims out of range");
     uint32_t dtype = get_u32(data, size, offset);
     ensure(valid_dtype(dtype), "remote_wire: unknown tensor dtype");
-    tensor.dtype = static_cast<DataType>(dtype);
-    tensor.child_memory = get_u8(data, size, offset);
-    ensure(tensor.child_memory == 0 || tensor.child_memory == 1, "remote_wire: tensor child_memory must be 0 or 1");
+    uint8_t child_memory = get_u8(data, size, offset);
+    ensure(child_memory == 0 || child_memory == 1, "remote_wire: tensor child_memory must be 0 or 1");
     for (int i = 0; i < 7; ++i) {
-        ensure(get_u8(data, size, offset) == 0, "remote_wire: ContinuousTensor reserved bytes must be zero");
+        ensure(get_u8(data, size, offset) == 0, "remote_wire: Tensor reserved bytes must be zero");
     }
-    return tensor;
+    // Reconstruct a contiguous external Tensor (owner=invalid, row-major strides).
+    return make_tensor_external(
+        reinterpret_cast<void *>(addr), shapes, ndims, static_cast<DataType>(dtype), /*manual_dep=*/false,
+        /*version=*/0, child_memory
+    );
 }
 
 std::vector<uint8_t> encode_remote_tensor_desc(const RemoteTensorDesc &desc) {
     std::vector<uint8_t> out;
     put_u32(out, static_cast<uint32_t>(desc.address_space));
-    put_i32(out, desc.owner_endpoint_id);
+    put_i32(out, desc.owner_worker_id);
     put_u64(out, desc.buffer_id);
     put_u64(out, desc.offset);
     put_u64(out, desc.nbytes);
@@ -389,7 +403,7 @@ RemoteTensorDesc decode_remote_tensor_desc(const uint8_t *data, size_t size, siz
     ensure(valid_address_space(raw_space), "remote_wire: unknown RemoteTensorDesc address_space");
     RemoteTensorDesc desc{};
     desc.address_space = static_cast<RemoteAddressSpace>(raw_space);
-    desc.owner_endpoint_id = get_i32(data, size, offset);
+    desc.owner_worker_id = get_i32(data, size, offset);
     desc.buffer_id = get_u64(data, size, offset);
     desc.offset = get_u64(data, size, offset);
     desc.nbytes = get_u64(data, size, offset);
@@ -414,8 +428,8 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
     put_u32(out, static_cast<uint32_t>(args.tensor_metadata.size()));
     put_u32(out, static_cast<uint32_t>(args.scalars.size()));
     for (const auto &tensor : args.tensor_metadata) {
-        ensure(tensor.data == 0, "remote_wire: remote TASK tensor data must be zero");
-        auto encoded = encode_continuous_tensor(tensor);
+        ensure(tensor.buffer.addr == 0, "remote_wire: remote TASK tensor data must be zero");
+        auto encoded = encode_tensor(tensor);
         put_bytes(out, encoded.data(), encoded.size());
     }
     for (size_t i = 0; i < args.tensor_metadata.size(); ++i) {
@@ -445,7 +459,7 @@ RemoteTaskArgsWire decode_remote_task_args(const uint8_t *data, size_t size) {
     RemoteTaskArgsWire args;
     args.tensor_metadata.reserve(tensor_count);
     for (uint32_t i = 0; i < tensor_count; ++i)
-        args.tensor_metadata.push_back(decode_continuous_tensor(data, size, offset, true));
+        args.tensor_metadata.push_back(decode_tensor(data, size, offset, true));
 
     args.remote_desc.reserve(tensor_count);
     for (uint32_t i = 0; i < tensor_count; ++i) {
@@ -581,7 +595,7 @@ std::vector<uint8_t> encode_digest_callable_command(
 }
 
 std::vector<uint8_t> encode_export_buffer_request(const ExportBufferRequest &request) {
-    ensure(request.owner_endpoint_id >= 0, "remote_wire: EXPORT_BUFFER owner endpoint must be non-negative");
+    ensure(request.owner_worker_id >= 0, "remote_wire: EXPORT_BUFFER owner worker must be non-negative");
     ensure(request.buffer_id != 0, "remote_wire: EXPORT_BUFFER buffer_id must be non-zero");
     ensure(request.generation != 0, "remote_wire: EXPORT_BUFFER generation must be non-zero");
     ensure(request.nbytes != 0, "remote_wire: EXPORT_BUFFER nbytes must be non-zero");
@@ -591,7 +605,7 @@ std::vector<uint8_t> encode_export_buffer_request(const ExportBufferRequest &req
     );
     validate_access_flags(request.access_flags, "EXPORT_BUFFER access_flags");
     std::vector<uint8_t> out;
-    put_i32(out, request.owner_endpoint_id);
+    put_i32(out, request.owner_worker_id);
     put_u64(out, request.buffer_id);
     put_u64(out, request.generation);
     put_u64(out, request.offset);
@@ -605,7 +619,7 @@ std::vector<uint8_t> encode_export_buffer_request(const ExportBufferRequest &req
 ExportBufferRequest decode_export_buffer_request(const uint8_t *data, size_t size) {
     size_t offset = 0;
     ExportBufferRequest request;
-    request.owner_endpoint_id = get_i32(data, size, offset);
+    request.owner_worker_id = get_i32(data, size, offset);
     request.buffer_id = get_u64(data, size, offset);
     request.generation = get_u64(data, size, offset);
     request.offset = get_u64(data, size, offset);
@@ -615,7 +629,7 @@ ExportBufferRequest decode_export_buffer_request(const uint8_t *data, size_t siz
         get_string(data, size, offset, MAX_TRANSPORT_PROFILE_BYTES, "EXPORT_BUFFER.transport_profile");
     ensure(get_u32(data, size, offset) == 0, "remote_wire: EXPORT_BUFFER reserved field must be zero");
     ensure(offset == size, "remote_wire: trailing bytes after EXPORT_BUFFER");
-    ensure(request.owner_endpoint_id >= 0, "remote_wire: EXPORT_BUFFER owner endpoint must be non-negative");
+    ensure(request.owner_worker_id >= 0, "remote_wire: EXPORT_BUFFER owner worker must be non-negative");
     ensure(request.buffer_id != 0, "remote_wire: EXPORT_BUFFER buffer_id must be non-zero");
     ensure(request.generation != 0, "remote_wire: EXPORT_BUFFER generation must be non-zero");
     ensure(request.nbytes != 0, "remote_wire: EXPORT_BUFFER nbytes must be non-zero");
@@ -628,7 +642,7 @@ ExportBufferRequest decode_export_buffer_request(const uint8_t *data, size_t siz
 }
 
 std::vector<uint8_t> encode_export_buffer_result(const RemoteBufferExport &result) {
-    ensure(result.owner_endpoint_id >= 0, "remote_wire: export result owner endpoint must be non-negative");
+    ensure(result.owner_worker_id >= 0, "remote_wire: export result owner worker must be non-negative");
     ensure(result.buffer_id != 0, "remote_wire: export result buffer_id must be non-zero");
     ensure(result.generation != 0, "remote_wire: export result generation must be non-zero");
     ensure(result.nbytes != 0, "remote_wire: export result nbytes must be non-zero");
@@ -636,7 +650,7 @@ std::vector<uint8_t> encode_export_buffer_result(const RemoteBufferExport &resul
     ensure(valid_import_address_space(result.address_space), "remote_wire: export result address_space is invalid");
     validate_access_flags(result.access_flags, "export result access_flags");
     std::vector<uint8_t> out;
-    put_i32(out, result.owner_endpoint_id);
+    put_i32(out, result.owner_worker_id);
     put_u64(out, result.buffer_id);
     put_u64(out, result.generation);
     put_u32(out, static_cast<uint32_t>(result.address_space));
@@ -656,7 +670,7 @@ std::vector<uint8_t> encode_export_buffer_result(const RemoteBufferExport &resul
 RemoteBufferExport decode_export_buffer_result(const uint8_t *data, size_t size) {
     size_t offset = 0;
     RemoteBufferExport result;
-    result.owner_endpoint_id = get_i32(data, size, offset);
+    result.owner_worker_id = get_i32(data, size, offset);
     result.buffer_id = get_u64(data, size, offset);
     result.generation = get_u64(data, size, offset);
     uint32_t raw_space = get_u32(data, size, offset);
@@ -675,7 +689,7 @@ RemoteBufferExport decode_export_buffer_result(const uint8_t *data, size_t size)
         get_blob(data, size, offset, MAX_TRANSPORT_DESCRIPTOR_BYTES, "export result transport_descriptor");
     ensure(get_u32(data, size, offset) == 0, "remote_wire: export result reserved field must be zero");
     ensure(offset == size, "remote_wire: trailing bytes after export result");
-    ensure(result.owner_endpoint_id >= 0, "remote_wire: export result owner endpoint must be non-negative");
+    ensure(result.owner_worker_id >= 0, "remote_wire: export result owner worker must be non-negative");
     ensure(result.buffer_id != 0, "remote_wire: export result buffer_id must be non-zero");
     ensure(result.generation != 0, "remote_wire: export result generation must be non-zero");
     ensure(result.nbytes != 0, "remote_wire: export result nbytes must be non-zero");
@@ -686,14 +700,14 @@ RemoteBufferExport decode_export_buffer_result(const uint8_t *data, size_t size)
 }
 
 std::vector<uint8_t> encode_import_buffer_request(const ImportBufferRequest &request) {
-    ensure(request.importer_endpoint_id >= 0, "remote_wire: IMPORT_BUFFER importer endpoint must be non-negative");
+    ensure(request.importer_worker_id >= 0, "remote_wire: IMPORT_BUFFER importer worker must be non-negative");
     validate_access_flags(request.requested_access_flags, "IMPORT_BUFFER requested_access_flags");
     ensure(
         (request.requested_access_flags & ~request.export_desc.access_flags) == 0,
         "remote_wire: IMPORT_BUFFER requested access is not a subset of export access"
     );
     std::vector<uint8_t> out;
-    put_i32(out, request.importer_endpoint_id);
+    put_i32(out, request.importer_worker_id);
     put_u32(out, request.requested_access_flags);
     auto encoded_export = encode_export_buffer_result(request.export_desc);
     put_bytes(out, encoded_export.data(), encoded_export.size());
@@ -704,14 +718,14 @@ std::vector<uint8_t> encode_import_buffer_request(const ImportBufferRequest &req
 ImportBufferRequest decode_import_buffer_request(const uint8_t *data, size_t size) {
     size_t offset = 0;
     ImportBufferRequest request;
-    request.importer_endpoint_id = get_i32(data, size, offset);
+    request.importer_worker_id = get_i32(data, size, offset);
     request.requested_access_flags = get_u32(data, size, offset);
     ensure(size >= offset + 4, "remote_wire: IMPORT_BUFFER payload is truncated");
     request.export_desc = decode_export_buffer_result(data + offset, size - offset - 4);
     offset = size - 4;
     ensure(get_u32(data, size, offset) == 0, "remote_wire: IMPORT_BUFFER reserved field must be zero");
     ensure(offset == size, "remote_wire: trailing bytes after IMPORT_BUFFER");
-    ensure(request.importer_endpoint_id >= 0, "remote_wire: IMPORT_BUFFER importer endpoint must be non-negative");
+    ensure(request.importer_worker_id >= 0, "remote_wire: IMPORT_BUFFER importer worker must be non-negative");
     validate_access_flags(request.requested_access_flags, "IMPORT_BUFFER requested_access_flags");
     ensure(
         (request.requested_access_flags & ~request.export_desc.access_flags) == 0,
@@ -721,16 +735,16 @@ ImportBufferRequest decode_import_buffer_request(const uint8_t *data, size_t siz
 }
 
 std::vector<uint8_t> encode_import_buffer_result(const RemoteBufferHandle &result) {
-    ensure(result.endpoint_id >= 0, "remote_wire: import result importer endpoint must be non-negative");
-    ensure(result.owner_endpoint_id >= 0, "remote_wire: import result owner endpoint must be non-negative");
+    ensure(result.worker_id >= 0, "remote_wire: import result importer worker must be non-negative");
+    ensure(result.owner_worker_id >= 0, "remote_wire: import result owner worker must be non-negative");
     ensure(result.buffer_id != 0, "remote_wire: import result buffer_id must be non-zero");
     ensure(result.generation != 0, "remote_wire: import result generation must be non-zero");
     ensure(result.import_id != 0, "remote_wire: import result import_id must be non-zero");
     ensure(valid_import_address_space(result.address_space), "remote_wire: import result address_space is invalid");
     validate_access_flags(result.access_flags, "import result access_flags");
     std::vector<uint8_t> out;
-    put_i32(out, result.endpoint_id);
-    put_i32(out, result.owner_endpoint_id);
+    put_i32(out, result.worker_id);
+    put_i32(out, result.owner_worker_id);
     put_u64(out, result.buffer_id);
     put_u64(out, result.generation);
     put_u64(out, result.import_id);
@@ -751,8 +765,8 @@ std::vector<uint8_t> encode_import_buffer_result(const RemoteBufferHandle &resul
 RemoteBufferHandle decode_import_buffer_result(const uint8_t *data, size_t size) {
     size_t offset = 0;
     RemoteBufferHandle result;
-    result.endpoint_id = get_i32(data, size, offset);
-    result.owner_endpoint_id = get_i32(data, size, offset);
+    result.worker_id = get_i32(data, size, offset);
+    result.owner_worker_id = get_i32(data, size, offset);
     result.buffer_id = get_u64(data, size, offset);
     result.generation = get_u64(data, size, offset);
     result.import_id = get_u64(data, size, offset);
@@ -769,8 +783,8 @@ RemoteBufferHandle decode_import_buffer_result(const uint8_t *data, size_t size)
     (void)get_blob(data, size, offset, MAX_TRANSPORT_DESCRIPTOR_BYTES, "import result import_descriptor");
     ensure(get_u32(data, size, offset) == 0, "remote_wire: import result reserved field must be zero");
     ensure(offset == size, "remote_wire: trailing bytes after import result");
-    ensure(result.endpoint_id >= 0, "remote_wire: import result importer endpoint must be non-negative");
-    ensure(result.owner_endpoint_id >= 0, "remote_wire: import result owner endpoint must be non-negative");
+    ensure(result.worker_id >= 0, "remote_wire: import result importer worker must be non-negative");
+    ensure(result.owner_worker_id >= 0, "remote_wire: import result owner worker must be non-negative");
     ensure(result.buffer_id != 0, "remote_wire: import result buffer_id must be non-zero");
     ensure(result.generation != 0, "remote_wire: import result generation must be non-zero");
     ensure(result.import_id != 0, "remote_wire: import result import_id must be non-zero");
@@ -780,14 +794,14 @@ RemoteBufferHandle decode_import_buffer_result(const uint8_t *data, size_t size)
 }
 
 std::vector<uint8_t> encode_release_import_request(const ReleaseImportRequest &request) {
-    ensure(request.importer_endpoint_id >= 0, "remote_wire: RELEASE_IMPORT importer endpoint must be non-negative");
-    ensure(request.owner_endpoint_id >= 0, "remote_wire: RELEASE_IMPORT owner endpoint must be non-negative");
+    ensure(request.importer_worker_id >= 0, "remote_wire: RELEASE_IMPORT importer worker must be non-negative");
+    ensure(request.owner_worker_id >= 0, "remote_wire: RELEASE_IMPORT owner worker must be non-negative");
     ensure(request.buffer_id != 0, "remote_wire: RELEASE_IMPORT buffer_id must be non-zero");
     ensure(request.generation != 0, "remote_wire: RELEASE_IMPORT generation must be non-zero");
     ensure(request.import_id != 0, "remote_wire: RELEASE_IMPORT import_id must be non-zero");
     std::vector<uint8_t> out;
-    put_i32(out, request.importer_endpoint_id);
-    put_i32(out, request.owner_endpoint_id);
+    put_i32(out, request.importer_worker_id);
+    put_i32(out, request.owner_worker_id);
     put_u64(out, request.buffer_id);
     put_u64(out, request.generation);
     put_u64(out, request.import_id);
@@ -798,15 +812,15 @@ std::vector<uint8_t> encode_release_import_request(const ReleaseImportRequest &r
 ReleaseImportRequest decode_release_import_request(const uint8_t *data, size_t size) {
     size_t offset = 0;
     ReleaseImportRequest request;
-    request.importer_endpoint_id = get_i32(data, size, offset);
-    request.owner_endpoint_id = get_i32(data, size, offset);
+    request.importer_worker_id = get_i32(data, size, offset);
+    request.owner_worker_id = get_i32(data, size, offset);
     request.buffer_id = get_u64(data, size, offset);
     request.generation = get_u64(data, size, offset);
     request.import_id = get_u64(data, size, offset);
     ensure(get_u32(data, size, offset) == 0, "remote_wire: RELEASE_IMPORT reserved field must be zero");
     ensure(offset == size, "remote_wire: trailing bytes after RELEASE_IMPORT");
-    ensure(request.importer_endpoint_id >= 0, "remote_wire: RELEASE_IMPORT importer endpoint must be non-negative");
-    ensure(request.owner_endpoint_id >= 0, "remote_wire: RELEASE_IMPORT owner endpoint must be non-negative");
+    ensure(request.importer_worker_id >= 0, "remote_wire: RELEASE_IMPORT importer worker must be non-negative");
+    ensure(request.owner_worker_id >= 0, "remote_wire: RELEASE_IMPORT owner worker must be non-negative");
     ensure(request.buffer_id != 0, "remote_wire: RELEASE_IMPORT buffer_id must be non-zero");
     ensure(request.generation != 0, "remote_wire: RELEASE_IMPORT generation must be non-zero");
     ensure(request.import_id != 0, "remote_wire: RELEASE_IMPORT import_id must be non-zero");

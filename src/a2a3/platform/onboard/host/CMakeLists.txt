@@ -32,42 +32,39 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
-# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: marker for an outstanding architectural
-# issue. The SDMA workspace init in comm_hccl.cpp pulls in pto-isa
-# headers and CANN-9.0-only aclnn symbols (aclnnShmemSdmaStarsQuery*),
-# even though it is logically orthogonal to HCCL comm bootstrap and only
-# needed by the sdma_async_completion_demo.
-#
-# Forced OFF: on this driver/CANN the ShmemSdmaStarsQuery AICPU kernel
-# (libcpu_kernels.so::RunCpuKernel) raises an AICPU exception (errorCode
-# 0x2a) during comm bootstrap, which faults the whole chip and cascades
-# every subsequent op to 507899/507018 (notably aclrtIpcMemImportByKey in
-# domain_alloc_via_ipc). The workspace is orthogonal to comm bootstrap and
-# leaving workSpace == 0 is the supported fallback (sync TLOAD/TSTORE and
-# the IPC window path do not need it), so disabling it unblocks multi-rank
-# comm. Re-enable once ShmemSdmaStarsQuery is fixed for the async-SDMA demo.
+# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: gates the optional PTO-ISA async-SDMA
+# workspace init in comm_hccl.cpp, which is logically orthogonal to HCCL comm
+# bootstrap and only needed by the sdma_async_completion_demo. Its Init()
+# issues an AICPU aclnnShmemSdmaStarsQuery inside domain_alloc_via_ipc; on this
+# driver/CANN that AICPU op faults (aclrtSynchronizeStream 507018) and poisons
+# the subsequent cross-card ImportByKey (507899). It is OFF here: comm domain
+# alloc must not depend on the demo-only SDMA workspace. When ON, PTO_ISA_ROOT
+# and CANN 9.0+ are hard build/runtime preconditions.
 set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-if(NOT DEFINED ENV{PTO_ISA_ROOT})
-    message(FATAL_ERROR
-        "a2a3 onboard host_runtime requires PTO_ISA_ROOT "
-        "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is forced ON; needs pto-isa headers + CANN 9.0+)")
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    if(NOT DEFINED ENV{PTO_ISA_ROOT})
+        message(FATAL_ERROR
+            "a2a3 onboard host_runtime requires PTO_ISA_ROOT "
+            "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is ON; needs pto-isa headers + CANN 9.0+)")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 endif()
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
 )
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
@@ -80,6 +77,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -118,6 +116,25 @@ target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a2a3")
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+endif()
+
+set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
+    "PTO-ISA commit used for host_runtime cache key")
+
+# Bake the resolved pto-isa commit into the compile command. pto-isa headers
+# (e.g. kSdmaMaxChan in sdma_workspace_manager.hpp) are compiled into this .so,
+# but a pto-isa update leaves the runtime repo HEAD — and the pto-isa header
+# mtimes — untouched, so a plain reinstall serves a stale object from ccache.
+# This define perturbs the ccache key so a pto-isa bump forces a real recompile.
+# It is intentionally unused in code (cache-bust only). See issue #1139.
+# RuntimeBuilder passes the current pto_isa.pin for a2a3 onboard, regardless
+# of SIMPLER_ENABLE_PTO_SDMA_WORKSPACE. If that workspace is ever turned off,
+# a pto-isa bump still forces a rebuild of a target that no longer embeds
+# pto-isa. That over-invalidation only costs a rebuild and never serves stale
+# objects, so erring wide is intentional (see _resolve_build_pto_isa_commit).
+if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
 endif()
 
 # Include directories - always include local headers

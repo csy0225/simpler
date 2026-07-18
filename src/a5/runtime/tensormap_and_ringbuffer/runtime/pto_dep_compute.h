@@ -49,7 +49,6 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
-#include "tensor_arg.h"  // TensorArgType
 
 /**
  * View struct for inputs to compute_task_fanin / register_task_outputs.
@@ -93,7 +92,7 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
             continue;
         }
 
-        const Tensor *tensor = inputs.tensors[i].ptr;
+        const Tensor *tensor = &inputs.tensors[i].ref();
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
@@ -145,12 +144,36 @@ register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            const Tensor *tensor = inputs.tensors[i].ptr;
+            const Tensor *tensor = &inputs.tensors[i].ref();
             if (!tensor->manual_dep) {
                 tensor_map.insert(*tensor, task_id);
             }
         }
     }
+}
+
+/**
+ * Count the tensormap entries register_task_outputs() will insert for this task.
+ *
+ * Mirrors register_task_outputs()'s selection exactly (INOUT / OUTPUT_EXISTING,
+ * excluding manual_dep), so the returned value is the precise number of
+ * new_entry() calls that step makes. The orchestrator uses it to reserve pool
+ * capacity before inserting. Returns 0 in a manual scope (no registration).
+ */
+inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual_scope) {
+    if (in_manual_scope) {
+        return 0;
+    }
+    int32_t needed = 0;
+    for (int32_t i = 0; i < inputs.tensor_count; i++) {
+        TensorArgType ptype = inputs.arg_types[i];
+        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+            if (!inputs.tensors[i].ref().manual_dep) {
+                needed++;
+            }
+        }
+    }
+    return needed;
 }
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_

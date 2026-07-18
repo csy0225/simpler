@@ -100,9 +100,15 @@
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
 
-// get_tensor_data/set_tensor_data spin wait timeout in cycles.
-// ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
-constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
+// get_tensor_data/set_tensor_data spin-wait timeout, expressed in time. The cycle
+// count (PTO2_TENSOR_DATA_TIMEOUT_CYCLES) is derived from this in pto_runtime2.cpp
+// — its only user — by scaling with the platform counter frequency, like
+// SCHEDULER_TIMEOUT_CYCLES, so it reaps at the same wall-clock on every arch (a
+// fixed raw cycle count would be 15 s on a5 at 1 GHz but 300 s on a2a3 at 50 MHz).
+// PLATFORM_PROF_SYS_CNT_FREQ is deliberately NOT pulled into this header: it is
+// included by orchestrations that define that constant locally, so doing so caused
+// a redefinition conflict. See issue #1189.
+constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
 
 // =============================================================================
 // Task States
@@ -160,7 +166,7 @@ struct PTO2FaninPool;      // Forward declaration
 struct PTO2FaninSpillEntry {
     PTO2TaskSlotState *slot_state;
 };
-static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
+static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
 
 /**
  * Dependency list entry (singly-linked list node)
@@ -207,12 +213,12 @@ struct PTO2TaskDescriptor {
  * by bulk tensor and scalar data. Small fanins stay fully inline; larger
  * fanins spill into a per-ring ring buffer slice.
  */
-// Speculative early-dispatch claim states for PTO2TaskPayload::spec_state.
-enum PTO2SpecState : uint8_t {
-    PTO2_SPEC_NONE = 0,       // not pre-staged
-    PTO2_SPEC_STAGING = 1,    // Hook 1 claimed it; staging in progress
-    PTO2_SPEC_STAGED = 2,     // staged on a core, gated; staged_* fields valid
-    PTO2_SPEC_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
+// Early-dispatch claim states for PTO2TaskPayload::early_dispatch_state.
+enum PTO2EarlyDispatchState : uint8_t {
+    PTO2_EARLY_DISPATCH_NONE = 0,       // not pre-staged
+    PTO2_EARLY_DISPATCH_STAGING = 1,    // Hook 1 claimed it; staging in progress
+    PTO2_EARLY_DISPATCH_STAGED = 2,     // staged on a core, gated; staged_* fields valid
+    PTO2_EARLY_DISPATCH_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
 };
 
 // A pre-staged consumer occupies one core per gated subtask block. WHICH cores
@@ -222,7 +228,7 @@ enum PTO2SpecState : uint8_t {
 // chip's core count (RUNTIME_MAX_WORKER = 72; no two-level pre-dispatch means
 // gated cores in flight <= core count), NOT by block_num — so a wide SPMD
 // consumer can pre-stage all its idle cores. 2 words = 128 bits >= 72.
-inline constexpr int PTO2_SPEC_CORE_MASK_WORDS = 2;
+inline constexpr int PTO2_EARLY_DISPATCH_CORE_MASK_WORDS = 2;
 
 struct PTO2TaskPayload {
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
@@ -232,11 +238,11 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // Speculative early-dispatch metadata (AICPU-side only). Ordered by descending
+    // Early-dispatch metadata (AICPU-side only). Ordered by descending
     // alignment (8B mask, 4B fanin, then 1B flags) so the block packs with no
     // internal padding. Kept here after the fanin array (not moved up front): on
     // cache line 8 it shares only with the rarely-touched fanin tail, whereas in
-    // line 0 the spec atomics (written during staging) would false-share with
+    // line 0 the early-dispatch atomics (written during staging) would false-share with
     // tensor_count/scalar_count (read by build_payload at dispatch). Fits in the 40B
     // between the fanin array (offset 536) and the 64B-aligned tensors[] (offset
     // 576), so sizeof and tensors[] are unchanged.
@@ -244,14 +250,13 @@ struct PTO2TaskPayload {
     // Bitmask of global core_ids this consumer is pre-staged (gated) on. Set with
     // atomic fetch_or by concurrent stagers; read by release. (Re)initialized in
     // PTO2TaskPayload::init before the slot can be staged again.
-    std::atomic<uint64_t> staged_core_mask[PTO2_SPEC_CORE_MASK_WORDS]{};
+    std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
     // seeded at wiring with producers already complete, then a flagged producer's
     // DISPATCH bumps each consumer's dispatch_fanin. dispatch_fanin ==
     // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
-    // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queue).
+    // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queues[shape]).
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: flagged-dispatched + pre-completed producers
-    bool allow_early_resolve{false};         // codegen hint copied from Arg in PTO2TaskPayload::init
     // Lock-free claim state shared by the stagers (Hook 1, possibly several AICPU
     // threads concurrently) and the completion-path release: 0=NONE, 1=STAGING,
     // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
@@ -260,10 +265,8 @@ struct PTO2TaskPayload {
     // Release does STAGING->DISPATCHED then rings the mask; a thread that stages a
     // block AFTER release flipped DISPATCHED rings that block's doorbell itself
     // (self-ring), so no doorbell is ever missed.
-    std::atomic<uint8_t> spec_state{0};
+    std::atomic<uint8_t> early_dispatch_state{0};
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
-    std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
-    uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -276,7 +279,7 @@ struct PTO2TaskPayload {
     /**
      * Prefetch (for write) the regions init() is about to fill so the stores land
      * in warm cache. tensor_count/scalar_count come from the Arg — the payload's
-     * own counts are not set until init(). Warms the early-dispatch spec block at
+     * own counts are not set until init(). Warms the early-dispatch block at
      * offset 536 (cache line 8) too. A member fn lowers to the same prefetch
      * instructions as a free function (`this` is just a register), no cache impact.
      */
@@ -291,7 +294,7 @@ struct PTO2TaskPayload {
         __builtin_prefetch(this, 1, 3);
         __builtin_prefetch(reinterpret_cast<const char *>(this) + 64, 1, 3);
         __builtin_prefetch(reinterpret_cast<const char *>(this) + 128, 1, 3);
-        __builtin_prefetch(reinterpret_cast<const char *>(this) + 512, 1, 3);  // spec fields (cache line 8)
+        __builtin_prefetch(reinterpret_cast<const char *>(this) + 512, 1, 3);  // early-dispatch fields (cache line 8)
     }
 
     /**
@@ -304,17 +307,19 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    void init(
+        const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
+    ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
             if (args.tag(i) != TensorArgType::OUTPUT) {
-                tensors[i].copy(*args.tensor(i).ptr);
+                tensors[i].copy(args.tensor(i).ref());
             } else {
-                tensors[i].init_from_create_info(
-                    *args.tensor(i).create_info,
+                init_tensor_from_create_info(
+                    tensors[i], args.tensor(i).create_info(),
                     reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
                     layout.buffer_sizes[i]
                 );
@@ -326,26 +331,22 @@ struct PTO2TaskPayload {
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
 
-        // Speculative early-dispatch metadata — the single init point for these
+        // Early-dispatch metadata — the single init point for these
         // fields. reset_for_reuse MUST NOT touch the payload (it runs on the
         // scheduler's advance-ring path and would pull this cold cache line across
         // structures); prepare_task only allocates/binds. prefetch() warms this
         // line (offset 512) so these writes land in warm cache.
         //
-        // spec_state / staged_core_mask / dispatch_fanin / spec_chain_* are all
-        // CONSUMER-side: a task with allow_early_resolve == false still has them
-        // touched when one of ITS producers is flagged (propagate_dispatch_fanin
-        // bumps dispatch_fanin and may CAS spec_state / set the auto-chain flag on
-        // any consumer, independent of the consumer's own hint). So they MUST be
-        // zeroed here unconditionally — no per-task allow_early_resolve gating.
-        allow_early_resolve = args.allow_early_resolve();
-        spec_state.store(PTO2_SPEC_NONE, std::memory_order_relaxed);
-        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
+        // early_dispatch_state / staged_core_mask / dispatch_fanin are all CONSUMER-side: a
+        // task whose own allow_early_resolve is false still has them touched when
+        // one of ITS producers is flagged (propagate_dispatch_fanin bumps
+        // dispatch_fanin and may CAS early_dispatch_state on any consumer, independent of the
+        // consumer's own hint). So they MUST be zeroed here unconditionally.
+        early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
         dispatch_fanin.store(0, std::memory_order_relaxed);
         dispatch_propagated.store(0, std::memory_order_relaxed);
-        spec_chain_active.store(0, std::memory_order_relaxed);
-        spec_chain_depth = 0;
     }
 };
 
@@ -376,10 +377,27 @@ static_assert(
  * - fanin_count set once at submission, read-only after (hot path for ready check)
  * - task_state, fanin_refcount, fanout_refcount updated atomically
  */
+
+// fanout_count / fanout_refcount bit encoding (both uint32):
+//   bits [30:0] = consumer references (count: # consumers; refcount: # released)
+//   bit  [31]   = the owning scope's reference (PTO2_FANOUT_SCOPE_BIT)
+// fanout_count is seeded to PTO2_FANOUT_SCOPE_BIT and ++'d per consumer, so it
+// ends as (SCOPE_BIT | num_consumers). release adds 1 (consumer completion) or
+// SCOPE_BIT (scope_end). CONSUMED iff fanout_refcount == fanout_count (every
+// consumer released AND scope bit set). Keeping the scope ref in a distinct bit
+// (rather than folding scope + consumers into one count) lets a consumer reach
+// fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
+// is still unset -- i.e. "all consumers done but scope still open" stays
+// distinguishable from "fully consumed". The heap/task deadlock detector keys
+// off exactly that complement: that condition with state==COMPLETED means the
+// head can only be released by scope_end, which a blocked orchestrator can
+// never reach -> provable deadlock.
+static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
+
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;              // 1 (owning scope) + number of consumers
+    uint32_t fanout_count;             // SCOPE_BIT (owning scope) | number of consumers
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
@@ -391,7 +409,7 @@ struct alignas(64) PTO2TaskSlotState {
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+    std::atomic<uint32_t> fanout_refcount;  // Dynamic: low bits = released consumers, bit31 = scope released
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -412,13 +430,18 @@ struct alignas(64) PTO2TaskSlotState {
     // sequenced before on_subtask_complete's acq_rel fetch_add and the read
     // after, so all earlier subtasks' writes are visible to the last subtask.
     std::atomic<bool> any_subtask_deferred{false};
-    uint8_t _async_pad{0};
+    // Codegen early-dispatch hint, copied from Arg at submit. Lives on slot_state
+    // (not payload) so the wiring fanin walk and the propagate_dispatch_fanin gate
+    // read it from the already-hot slot_state cache line instead of chasing the
+    // producer's cold payload. Repurposes the former padding byte, so the struct
+    // stays 64 bytes.
+    bool allow_early_resolve{false};
     int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
-    // Next block to dispatch. Atomic so concurrent speculative stagers can each
+    // Next block to dispatch. Atomic so concurrent early-dispatch stagers can each
     // claim a distinct block via CAS; normal dispatch (ready-queue serialized)
     // uses plain relaxed load/store. The two phases never overlap in time (staging
     // happens before release; normal dispatch of the remainder happens after).
@@ -455,17 +478,18 @@ struct alignas(64) PTO2TaskSlotState {
      */
     void reset_for_reuse() {
         fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = 1;
+        fanout_count = PTO2_FANOUT_SCOPE_BIT;  // bit31 = owning-scope ref; consumers ++ into low bits
         fanout_head = nullptr;
         fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-        // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin /
-        // spec_chain_*) are NOT reset here — this method skips the payload by
-        // contract. They are (re)initialized in PTO2TaskPayload::init on every
-        // submit, before the slot becomes visible to the scheduler.
+        allow_early_resolve = false;  // safe default; the normal submit path overwrites from Arg
+        // Note: payload early-dispatch fields (early_dispatch_state / staged_core_mask / dispatch_fanin)
+        // are NOT reset here — this method skips the payload by contract. They are
+        // (re)initialized in PTO2TaskPayload::init on every submit, before the slot
+        // becomes visible to the scheduler.
     }
 
     // === Per-task fanout spinlock ===

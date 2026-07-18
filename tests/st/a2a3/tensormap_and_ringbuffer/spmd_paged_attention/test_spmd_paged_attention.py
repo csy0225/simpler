@@ -37,12 +37,18 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "name": "PA_AIC",
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aic",
+                # Cooperative mix: AIC and AIV share one 9-tensor args[]. Each
+                # half declares the shared payload (task-level directions); the
+                # dump records each tensor once per declaring subtask, under its
+                # own func_id. Consumed only by the dump; dispatch ignores it.
+                "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
             },
             {
                 "func_id": 1,
                 "name": "PA_AIV",
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
             },
         ],
     }
@@ -74,6 +80,27 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "kv_head_num": 1,
                 "head_dim": 128,
                 "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            # Intra-core trace target only (--case SmallCase1; manual -> not in
+            # the default onboard CI sweep). batch=24 == the orchestration's
+            # hardcoded SPMD_BLOCK_NUM, so every hw block gets one logical block
+            # (fewer stalls in the AIC<->AIV handshake). Same q_tile=16 path as
+            # Case1; passes golden at context_len=8192.
+            "name": "SmallCase1",
+            "platforms": ["a2a3"],
+            "manual": True,
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {
+                "batch": 24,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
                 "context_len": 8192,
                 "max_model_len": 32768,
                 "dtype": "bfloat16",

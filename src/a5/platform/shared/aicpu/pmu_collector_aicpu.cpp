@@ -16,8 +16,9 @@
  * Buffer switching mirrors a2a3 pmu_collector_aicpu.cpp:
  *   - SPSC free_queue: Host pushes free PmuBuffers, AICPU pops when switching.
  *   - Per-thread ready_queue: AICPU enqueues full buffers for host collection.
- *   - On free_queue empty or ready_queue full: overwrite current buffer (data lost,
- *     same policy as a2a3 — avoids blocking the AICPU dispatch loop).
+ *   - Full buffers are published before AICPU tries to recover a replacement.
+ *     If recovery is delayed, later records are counted as dropped until host
+ *     replenishes free_queue.
  *
  * a5-specific: AICore reads PMU MMIO itself (via ld_dev) and writes the
  * snapshot into a per-core stable PmuAicoreRing
@@ -32,6 +33,7 @@
 #include <cstring>
 
 #include "aicpu/platform_regs.h"
+#include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -57,6 +59,8 @@ static PmuAicoreRing *s_pmu_aicore_rings[PLATFORM_MAX_CORES];
 // Per-core resolved PMU MMIO base address, keyed by logical core_id.
 // Populated by pmu_aicpu_init(); 0 means "no PMU for this core" (sim).
 static uint64_t s_pmu_reg_addrs[PLATFORM_MAX_CORES] = {0};
+
+static constexpr uint64_t kPmuQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
 
 extern "C" void set_platform_pmu_base(uint64_t pmu_data_base) { g_platform_pmu_base = pmu_data_base; }
 
@@ -106,21 +110,73 @@ static void pmu_stop(uint64_t reg_base, uint32_t saved_ctrl0, uint32_t saved_ctr
 // Internal: enqueue full buffer to per-thread ready_queue
 // ---------------------------------------------------------------------------
 
-static int enqueue_pmu_ready_buffer(int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq) {
-    uint32_t capacity = PLATFORM_PMU_READYQUEUE_SIZE;
-    uint32_t current_tail = s_pmu_header->queue_tails[thread_idx];
-    uint32_t current_head = s_pmu_header->queue_heads[thread_idx];
+struct PmuDeviceModule {
+    struct Context {
+        PmuDataHeader *header;
+        int thread_idx;
+        int core_id;
+    };
 
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    if (next_tail == current_head) {
-        return -1;  // Queue full
+    using DataHeader = PmuDataHeader;
+    using State = PmuBufferState;
+    using FreeQueue = PmuFreeQueue;
+    using Buffer = PmuBuffer;
+
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_PMU_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_PMU_SLOT_COUNT;
+    static constexpr uint64_t kBackpressureWaitCycles = kPmuQueueBackpressureWaitCycles;
+
+    static DataHeader *header(Context ctx) { return ctx.header; }
+    static int ready_thread(Context ctx) { return ctx.thread_idx; }
+    static FreeQueue *free_queue(State *state) { return &state->free_queue; }
+
+    static uint64_t current_ptr(State *state) { return state->current_buf_ptr; }
+    static void set_current_ptr(State *state, uint64_t ptr) { state->current_buf_ptr = ptr; }
+    static uint32_t current_seq(State *state) { return state->current_buf_seq; }
+    static void set_current_seq(State *state, uint32_t seq) { state->current_buf_seq = seq; }
+
+    static uint32_t count(Buffer *buffer) { return buffer->count; }
+    static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
+
+    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        ctx.header->queues[ctx.thread_idx][tail].core_index = static_cast<uint32_t>(ctx.core_id);
+        ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    s_pmu_header->queues[thread_idx][current_tail].core_index = core_index;
-    s_pmu_header->queues[thread_idx][current_tail].buffer_ptr = buffer_ptr;
-    s_pmu_header->queues[thread_idx][current_tail].buffer_seq = buffer_seq;
-    s_pmu_header->queue_tails[thread_idx] = next_tail;
-    return 0;
+    static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
+    static void on_pop_success(Context, State *, Buffer *) {}
+    static void on_current_cleared(Context, State *) {}
+    static void on_no_replacement(Context, State *) {}
+    static void on_null_free_slot(Context, State *) {}
+    static void on_enqueue_failed(Context ctx, State *, Buffer *) {
+        LOG_ERROR(
+            "Thread %d: Core %d failed to enqueue PMU buffer (ready_queue full), data lost!", ctx.thread_idx,
+            ctx.core_id
+        );
+    }
+    static void on_switch_complete(Context ctx, State *, Buffer *buffer) {
+        if (buffer != nullptr) {
+            LOG_INFO_V0(
+                "Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", ctx.thread_idx, ctx.core_id,
+                reinterpret_cast<uint64_t>(buffer)
+            );
+        }
+    }
+};
+
+using PmuEngine = profiling_device::DeviceProfilerEngine<PmuDeviceModule>;
+
+static PmuDeviceModule::Context pmu_context(int core_id, int thread_idx) {
+    return PmuDeviceModule::Context{s_pmu_header, thread_idx, core_id};
+}
+
+static int enqueue_pmu_ready_buffer(int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq) {
+    return PmuEngine::enqueue_ready(pmu_context(static_cast<int>(core_index), thread_idx), buffer_ptr, buffer_seq);
+}
+
+static PmuBuffer *try_pop_pmu_buffer(int core_id, PmuBufferState *state, uint32_t next_seq) {
+    return PmuEngine::pop_free(pmu_context(core_id, /*thread_idx=*/0), state, next_seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,51 +190,7 @@ static void pmu_switch_buffer(int core_id, int thread_idx) {
         return;
     }
 
-    PmuBuffer *full_buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
-    if (full_buf == nullptr) {
-        return;
-    }
-
-    // Check free_queue before committing the full buffer
-    rmb();
-    uint32_t head = state->free_queue.head;
-    uint32_t tail = state->free_queue.tail;
-
-    if (head == tail) {
-        // No replacement buffer available — overwrite current buffer to keep AICPU alive
-        LOG_WARN("Thread %d: Core %d no free PMU buffer, overwriting current buffer (data lost)", thread_idx, core_id);
-        state->dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    // Enqueue full buffer to ready_queue
-    uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_pmu_ready_buffer(thread_idx, static_cast<uint32_t>(core_id), state->current_buf_ptr, seq);
-    if (rc != 0) {
-        LOG_ERROR(
-            "Thread %d: Core %d failed to enqueue PMU buffer (ready_queue full), data lost!", thread_idx, core_id
-        );
-        state->dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    // Pop next buffer from free_queue
-    uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PMU_SLOT_COUNT];
-    rmb();
-    state->free_queue.head = head + 1;
-    state->current_buf_ptr = new_buf_ptr;
-    state->current_buf_seq = seq + 1;
-    wmb();
-
-    PmuBuffer *new_buf = reinterpret_cast<PmuBuffer *>(new_buf_ptr);
-    new_buf->count = 0;
-    wmb();
-
-    LOG_INFO_V0("Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
+    PmuEngine::switch_buffer(pmu_context(core_id, thread_idx), state);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,16 +256,8 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
         uint32_t tail = state->free_queue.tail;
 
         if (head != tail) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PMU_SLOT_COUNT];
-            rmb();
-            state->free_queue.head = head + 1;
-            state->current_buf_ptr = buf_ptr;
-            state->current_buf_seq = 0;
-            wmb();
-
-            PmuBuffer *buf = reinterpret_cast<PmuBuffer *>(buf_ptr);
-            buf->count = 0;
-
+            (void)try_pop_pmu_buffer(i, state, 0);
+            uint64_t buf_ptr = state->current_buf_ptr;
             LOG_DEBUG("Core %d: popped initial PMU buffer (addr=0x%lx)", i, buf_ptr);
         } else {
             LOG_ERROR("Core %d: PMU free_queue is empty during init!", i);
@@ -288,7 +292,6 @@ void pmu_aicpu_complete_record(
         return;
     }
     PmuRecord *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
-    cache_invalidate_range(slot, sizeof(PmuRecord));
 
     if (static_cast<uint32_t>(slot->task_id) != reg_task_id) {
         // AICore hasn't published this slot yet — hard invariant violation,
@@ -300,12 +303,18 @@ void pmu_aicpu_complete_record(
 
     rmb();
     uint64_t cur_ptr = state->current_buf_ptr;
+    PmuBuffer *buf = nullptr;
     if (cur_ptr == 0) {
-        state->dropped_record_count += 1;
-        wmb();
-        return;
+        buf = try_pop_pmu_buffer(core_id, state, state->current_buf_seq);
+        if (buf == nullptr) {
+            state->dropped_record_count += 1;
+            wmb();
+            return;
+        }
+        cur_ptr = state->current_buf_ptr;
+    } else {
+        buf = reinterpret_cast<PmuBuffer *>(cur_ptr);
     }
-    PmuBuffer *buf = reinterpret_cast<PmuBuffer *>(cur_ptr);
 
     // Switch buffer if full (internal — ring address is unchanged)
     if (buf->count >= static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
@@ -313,11 +322,16 @@ void pmu_aicpu_complete_record(
         rmb();
         cur_ptr = state->current_buf_ptr;
         if (cur_ptr == 0) {
-            state->dropped_record_count += 1;
-            wmb();
-            return;
+            buf = try_pop_pmu_buffer(core_id, state, state->current_buf_seq);
+            if (buf == nullptr) {
+                state->dropped_record_count += 1;
+                wmb();
+                return;
+            }
+            cur_ptr = state->current_buf_ptr;
+        } else {
+            buf = reinterpret_cast<PmuBuffer *>(cur_ptr);
         }
-        buf = reinterpret_cast<PmuBuffer *>(cur_ptr);
     }
 
     uint32_t idx = buf->count;

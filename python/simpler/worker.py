@@ -46,33 +46,39 @@ Usage::
     w4 = Worker(level=4, num_sub_workers=1)
     l3_handle = w4.register(my_l3_orch)
     verify_handle = w4.register(lambda args: verify())
-    w4.add_worker(l3)
+    l3_worker_id = w4.add_worker(l3)
     w4.init()
 
     def my_l4_orch(orch, args, config):
-        orch.submit_next_level(l3_handle, chip_args, config)
+        orch.submit_next_level(l3_handle, chip_args, config, worker=l3_worker_id)
         orch.submit_sub(verify_handle)
 
     w4.run(my_l4_orch)
     w4.close()
 """
 
+from __future__ import annotations
+
+import bisect
 import ctypes
+import importlib
+import json
 import os
+import re
 import signal
+import socket
 import struct
 import sys
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, Optional
+from typing import Any
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
-    RunTiming,
+    RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _mailbox_load_i32,
     _mailbox_store_i32,
@@ -85,10 +91,12 @@ from .callable_identity import (
     CallableHandle,
     _CallableIdentityState,
     build_chip_callable_descriptor,
+    build_python_import_descriptor,
     build_python_serialized_descriptor,
     compute_callable_hashid,
     hashid_to_digest,
     parse_python_callable_payload,
+    parse_python_import_target,
 )
 from .orchestrator import Orchestrator
 from .task_interface import (
@@ -101,6 +109,9 @@ from .task_interface import (
     ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
+    RemoteAddressSpace,
+    RemoteBufferExport,
+    RemoteBufferHandle,
     TaskArgs,
     _Worker,
 )
@@ -111,6 +122,10 @@ from .task_interface import (
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
+# L2 endpoint metadata currently reaches the parent through the canonical fatal
+# text emitted by the orchestration wrapper; keep this pattern in sync with the
+# wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
+_L3_L2_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +142,17 @@ _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
 # 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu, enable_dep_gen, enable_scope_stats) + 3 uint64 ring sizing
-# overrides (ring_task_window, ring_heap, ring_dep_pool) + 1024-byte
-# NUL-terminated output_prefix. Log config travels separately via
-# ChipWorker.init(log_level, log_info_v) — not on per-task wire.
-_CFG_FMT = struct.Struct("=iiiiiiiQQQ1024s")
+# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64 ring sizing
+# overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT: ring_task_window,
+# ring_heap, ring_dep_pool) + 1024-byte NUL-terminated output_prefix. Log config
+# travels separately via ChipWorker.init(log_level, log_info_v) — not on per-task wire.
+_RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
+_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
-# ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
+# Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
 _OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
-assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
+assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for Tensor.data"
 _OFF_TASK_CALLABLE_HASH = _OFF_ARGS
 _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
@@ -191,6 +207,42 @@ _CTRL_RELEASE_DOMAIN = 8
 _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
+_CTRL_PY_IMPORT_REGISTER = 12
+_CTRL_L3_L2_ORCH_COMM_INIT = 13
+# Host-buffer registration. MAP_HOST maps a named host-buffer shm
+# into every chip child *post-fork* and keeps it mapped so later runs can copy
+# through it; UNMAP_HOST drops one. The child also records the parent VA range
+# the shm stands in for, so the per-task blob's host pointers (raw parent VAs)
+# can be rewritten to the child's own mapping before the runtime dereferences
+# them. Unlike _CTRL_REGISTER (one-shot H2D then close), these mappings persist
+# for the buffer's registered lifetime — see docs/comm-domain.md.
+_CTRL_MAP_HOST = 14
+_CTRL_UNMAP_HOST = 15
+# Import one external ACL IPC key in each chip child and return the imported
+# device VA through a reply shm.  The import must run in the child that owns the
+# ACL context; importing in the parent would produce an unusable pointer.
+_CTRL_IMPORT_IPC = 16
+_IPC_KEY_BYTES = 256
+_IPC_REPLY_HEADER = struct.Struct("<I")
+_IPC_REPLY_RECORD = struct.Struct("<IQ")
+_IPC_REQUEST_NAME_LEN = struct.Struct("<H")
+_IPC_REQUEST_COUNT = struct.Struct("<I")
+_IPC_REQUEST_RECORD = struct.Struct("<I")
+
+# MAP_HOST payload: token (u64), parent_va (u64), nbytes (u64), then the
+# NUL-free host-buffer shm name as the trailing bytes. UNMAP_HOST payload is the
+# token alone.
+_HOST_BUF_MAP_HEADER = struct.Struct("<QQQ")
+_HOST_BUF_UNMAP = struct.Struct("<Q")
+
+# Wire layout of a Tensor inside a task-args blob, pinned by static_assert in
+# src/common/task_interface/tensor.h: each Tensor is 128 B and buffer.addr is its
+# first field (offset 0). The blob is [int32 T][int32 S][Tensor[T]][scalars], so
+# tensor i's host pointer lives at _OFF_TASK_ARGS_BLOB + 8 + i*128. The child
+# rewrites that u64 in place to redirect a registered host pointer at its own
+# mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
+_BLOB_TENSOR_STRIDE = 128
+_BLOB_HEADER_BYTES = 8
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -246,10 +298,340 @@ class _CallableRegistration:
     hashid: str
     digest: bytes
     payload_digest: bytes
-    payload: Optional[bytes] = None
+    payload: bytes | None = None
+    eligible_worker_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class RemoteCallable:
+    """Import-path descriptor for a parent-facing remote L3 callable."""
+
+    target: str
+
+    def __post_init__(self) -> None:
+        module, qualname = parse_python_import_target(self.target)
+        object.__setattr__(self, "target", f"{module}:{qualname}")
+
+    @property
+    def module(self) -> str:
+        return self.target.split(":", 1)[0]
+
+    @property
+    def qualname(self) -> str:
+        return self.target.split(":", 1)[1]
+
+
+@dataclass(frozen=True)
+class RemoteWorkerSpec:
+    endpoint: str
+    platform: str
+    runtime: str = "tensormap_and_ringbuffer"
+    device_ids: tuple[int, ...] = ()
+    num_sub_workers: int = 0
+    transport: str = "sim"
+    session_listen_host: str | None = None
+    allow_wildcard_session_bind: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.endpoint:
+            raise ValueError("RemoteWorkerSpec.endpoint must be non-empty")
+        if not self.platform:
+            raise ValueError("RemoteWorkerSpec.platform must be non-empty")
+        if self.session_listen_host is not None and not self.session_listen_host:
+            raise ValueError("RemoteWorkerSpec.session_listen_host must be non-empty when set")
+        object.__setattr__(self, "endpoint", str(self.endpoint))
+        object.__setattr__(self, "platform", str(self.platform))
+        object.__setattr__(self, "runtime", str(self.runtime))
+        object.__setattr__(self, "transport", str(self.transport))
+        object.__setattr__(
+            self,
+            "session_listen_host",
+            None if self.session_listen_host is None else str(self.session_listen_host),
+        )
+        object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
+        object.__setattr__(self, "device_ids", tuple(int(x) for x in self.device_ids))
+        object.__setattr__(self, "num_sub_workers", int(self.num_sub_workers))
+        if self.num_sub_workers < 0:
+            raise ValueError("RemoteWorkerSpec.num_sub_workers must be non-negative")
+
+
+@dataclass(frozen=True)
+class _RemoteSession:
+    worker_id: int
+    session_id: int
+    command_host: str
+    command_port: int
+    health_host: str
+    health_port: int
+    pid: int
 
 
 _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
+
+
+@dataclass
+class _HostBufEntry:
+    """Parent-side record for a born-shared post-fork host buffer.
+
+    The worker owns ``shm`` — a named buffer the chip children attach and
+    read/write through. The user builds a tensor over it (via the buffer
+    protocol on :class:`HostBuffer`), so the buffer *is* the shm: ``data_ptr ==
+    shm_base`` and no per-run copy is needed (the child reads and writes the same
+    physical pages the parent sees). ``shm_base`` caches the mapped address.
+    """
+
+    token: int
+    data_ptr: int
+    nbytes: int
+    shm: SharedMemory
+    shm_name: str
+    shm_base: int
+
+
+@dataclass(frozen=True, eq=False)
+class HostBuffer:
+    """Handle for a worker-allocated, born-shared host buffer (zero-copy).
+
+    Returned by ``Worker.create_host_buffer``. ``buffer`` is a ``memoryview``
+    over shared memory already attached into every chip child; wrap it with
+    ``torch.frombuffer`` / ``np.frombuffer`` to get a real tensor whose writes
+    land directly in the child-visible pages — no per-run copy. ``token`` /
+    ``data_ptr`` / ``nbytes`` identify the mapping; pass this handle back to
+    ``free_host_buffer`` to release it.
+
+    ``eq=False`` keeps object-identity equality/hash so the (unhashable)
+    ``memoryview`` field never blocks using the handle as a dict key or set
+    member.
+    """
+
+    token: int
+    data_ptr: int
+    nbytes: int
+    buffer: memoryview
+
+
+def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[int, int, int]]) -> None:
+    """Redirect registered host pointers in a task-args blob to child mappings.
+
+    ``ranges`` is ``(parent_lo, parent_hi, child_base)`` for each host buffer the
+    child has mapped via _CTRL_MAP_HOST. For every tensor whose ``buffer.addr``
+    (a parent VA) lands in a registered range, rewrite it in place to
+    ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
+    own mapping. Tensors outside every range (fork-inherited or child-allocated)
+    are left untouched. See _BLOB_TENSOR_STRIDE for the wire layout.
+    """
+    tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
+    if tensor_count <= 0:
+        return
+    base = blob_off + _BLOB_HEADER_BYTES
+    for i in range(tensor_count):
+        addr_off = base + i * _BLOB_TENSOR_STRIDE
+        addr = struct.unpack_from("<Q", buf, addr_off)[0]
+        for parent_lo, parent_hi, child_base in ranges:
+            if parent_lo <= addr < parent_hi:
+                struct.pack_into("<Q", buf, addr_off, child_base + (addr - parent_lo))
+                break
+
+
+def _normalize_ipc_device_key_map(device_key_map: dict[int, bytes]) -> dict[int, bytes]:
+    if not isinstance(device_key_map, dict) or not device_key_map:
+        raise ValueError("import_ipc_all requires a non-empty device_id -> 256-byte key map")
+    normalized: dict[int, bytes] = {}
+    for raw_device_id, raw_key in device_key_map.items():
+        if isinstance(raw_device_id, bool) or not isinstance(raw_device_id, int) or raw_device_id < 0:
+            raise TypeError(f"IPC device id must be a non-negative int, got {raw_device_id!r}")
+        try:
+            key = bytes(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"IPC key for device {raw_device_id} must be bytes-like") from exc
+        if len(key) != _IPC_KEY_BYTES:
+            raise ValueError(
+                f"IPC key for device {raw_device_id} must be exactly {_IPC_KEY_BYTES} bytes, got {len(key)}"
+            )
+        normalized[raw_device_id] = key
+    return normalized
+
+
+def _encode_ipc_import_payload(reply_name: str, device_key_map: dict[int, bytes]) -> bytes:
+    normalized = _normalize_ipc_device_key_map(device_key_map)
+    reply_name_bytes = reply_name.encode("utf-8")
+    if not reply_name_bytes or len(reply_name_bytes) > 0xFFFF:
+        raise ValueError("IPC reply shm name must be non-empty and fit in uint16")
+    payload = bytearray()
+    payload += _IPC_REQUEST_NAME_LEN.pack(len(reply_name_bytes))
+    payload += reply_name_bytes
+    payload += _IPC_REQUEST_COUNT.pack(len(normalized))
+    for device_id in sorted(normalized):
+        payload += _IPC_REQUEST_RECORD.pack(device_id)
+        payload += normalized[device_id]
+    return bytes(payload)
+
+
+def _decode_ipc_import_payload(payload: bytes) -> tuple[str, dict[int, bytes]]:
+    min_size = _IPC_REQUEST_NAME_LEN.size + _IPC_REQUEST_COUNT.size
+    if len(payload) < min_size:
+        raise RuntimeError(f"IPC import payload is truncated: {len(payload)} bytes")
+    offset = 0
+    (reply_name_len,) = _IPC_REQUEST_NAME_LEN.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_NAME_LEN.size
+    reply_name_end = offset + reply_name_len
+    if reply_name_len == 0 or reply_name_end + _IPC_REQUEST_COUNT.size > len(payload):
+        raise RuntimeError("IPC import payload has an invalid reply shm name length")
+    reply_name = payload[offset:reply_name_end].decode("utf-8")
+    offset = reply_name_end
+    (count,) = _IPC_REQUEST_COUNT.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_COUNT.size
+    expected_size = offset + count * (_IPC_REQUEST_RECORD.size + _IPC_KEY_BYTES)
+    if expected_size != len(payload):
+        raise RuntimeError(
+            f"IPC import payload size mismatch: expected {expected_size}, got {len(payload)}"
+        )
+    device_key_map: dict[int, bytes] = {}
+    for _ in range(count):
+        (device_id,) = _IPC_REQUEST_RECORD.unpack_from(payload, offset)
+        offset += _IPC_REQUEST_RECORD.size
+        if device_id in device_key_map:
+            raise RuntimeError(f"IPC import payload repeats device id {device_id}")
+        device_key_map[device_id] = payload[offset : offset + _IPC_KEY_BYTES]
+        offset += _IPC_KEY_BYTES
+    return reply_name, device_key_map
+
+
+def _handle_ctrl_import_ipc(buf: memoryview, device_id: int) -> None:
+    """Import this chip's external ACL IPC key and publish its peer VA.
+
+    Staged request payload:
+    ``<u16 reply-name-len><reply-name><u32 count><count * (u32 device, 256B key)>``.
+
+    Reply shm:
+    ``<u32 count><count * (u32 device, u64 imported-va)>``.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        if payload_size <= 0 or payload_size > staged.size:
+            raise RuntimeError(
+                f"IPC import payload size mismatch: payload={payload_size}, shm={staged.size}"
+            )
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    reply_name, device_key_map = _decode_ipc_import_payload(payload)
+    try:
+        key = device_key_map[device_id]
+    except KeyError as exc:
+        raise RuntimeError(f"IPC import has no key for device_id {device_id}") from exc
+
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtIpcMemImportByKey.restype = ctypes.c_int
+    acl.aclrtIpcMemImportByKey.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_uint64]
+    key_buffer = ctypes.create_string_buffer(key, _IPC_KEY_BYTES)
+    va = ctypes.c_void_p(0)
+    rc = acl.aclrtIpcMemImportByKey(ctypes.byref(va), key_buffer, ctypes.c_uint64(0x1))
+    if rc != 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey rc={rc} device_id={device_id}")
+    va_int = int(va.value or 0)
+    if va_int <= 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey returned null VA for device_id={device_id}")
+
+    reply = SharedMemory(name=reply_name)
+    try:
+        reply_buf = reply.buf
+        assert reply_buf is not None
+        (reply_count,) = _IPC_REPLY_HEADER.unpack_from(reply_buf, 0)
+        found = False
+        for index in range(reply_count):
+            record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+            reply_device_id, _ = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+            if reply_device_id == device_id:
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, va_int)
+                found = True
+                break
+        if not found:
+            raise RuntimeError(f"IPC reply shm has no slot for device_id={device_id}")
+    finally:
+        reply.close()
+
+
+def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
+    """Decode the staged-payload shm name a broadcast_control_all left at _OFF_ARGS."""
+    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
+    nul = raw.find(b"\x00")
+    return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _shm_base_addr(shm: SharedMemory) -> int:
+    """Mapped base address of ``shm``. The mapping outlives the temporary buffer
+    view, so the address stays valid until ``shm.close()``."""
+    view = shm.buf
+    assert view is not None
+    exporter = ctypes.c_char.from_buffer(view)
+    addr = ctypes.addressof(exporter)
+    del exporter
+    return addr
+
+
+def _rebuild_host_buf_ranges(
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]], host_buf_ranges: list[tuple[int, int, int]]
+) -> None:
+    host_buf_ranges.clear()
+    for _shm, lo, hi, base in host_buf_table.values():
+        host_buf_ranges.append((lo, hi, base))
+
+
+def _handle_ctrl_map_host(
+    buf: memoryview,
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]],
+    host_buf_ranges: list[tuple[int, int, int]],
+) -> None:
+    """Child handler for _CTRL_MAP_HOST: persist a host-buffer mapping.
+
+    The staged payload is ``token, parent_va, nbytes`` followed by the host
+    buffer's shm name. Map that shm and remember the parent VA range it stands
+    in for so the per-task blob rewrite can redirect host pointers to this base.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    token, parent_va, nbytes = _HOST_BUF_MAP_HEADER.unpack_from(payload, 0)
+    host_shm_name = payload[_HOST_BUF_MAP_HEADER.size :].decode("utf-8")
+    prior = host_buf_table.pop(token, None)
+    if prior is not None:
+        prior[0].close()
+    # Rebuild ranges in a finally so a raise from SharedMemory / _shm_base_addr
+    # cannot leave the just-popped prior mapping's stale range in host_buf_ranges.
+    try:
+        host_shm = SharedMemory(name=host_shm_name)
+        host_buf_table[token] = (host_shm, parent_va, parent_va + nbytes, _shm_base_addr(host_shm))
+    finally:
+        _rebuild_host_buf_ranges(host_buf_table, host_buf_ranges)
+
+
+def _handle_ctrl_unmap_host(
+    buf: memoryview,
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]],
+    host_buf_ranges: list[tuple[int, int, int]],
+) -> None:
+    """Child handler for _CTRL_UNMAP_HOST: drop a host-buffer mapping by token."""
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        token = _HOST_BUF_UNMAP.unpack_from(bytes(staged_buf[:payload_size]), 0)[0]
+    finally:
+        staged.close()
+    entry = host_buf_table.pop(token, None)
+    if entry is not None:
+        entry[0].close()
+        _rebuild_host_buf_ranges(host_buf_table, host_buf_ranges)
 
 
 def _allocate_local_slot(registry: dict[int, Any]) -> int:
@@ -287,7 +669,7 @@ def _remove_local_identity(
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     digest: bytes,
-) -> tuple[Optional[int], bool]:
+) -> tuple[int | None, bool]:
     slot = identity_table.get(digest)
     if slot is None:
         return None, False
@@ -304,14 +686,15 @@ def _remove_local_identity(
 def _make_local_identity_tables(
     snapshot: list[_IdentitySnapshotEntry],
     *,
-    callable_kind: Optional[str] = None,
-    target_namespace: Optional[str] = None,
+    callable_kind: str | tuple[str, ...] | None = None,
+    target_namespace: str | None = None,
 ) -> tuple[dict[int, Any], dict[bytes, int], dict[bytes, int]]:
     registry: dict[int, Any] = {}
     identity_table: dict[bytes, int] = {}
     identity_refs: dict[bytes, int] = {}
+    callable_kinds = (callable_kind,) if isinstance(callable_kind, str) else callable_kind
     for digest, target, ref_count, kind, namespace in snapshot:
-        if callable_kind is not None and kind != callable_kind:
+        if callable_kinds is not None and kind not in callable_kinds:
             continue
         if target_namespace is not None and namespace != target_namespace:
             continue
@@ -338,7 +721,7 @@ def _pack_py_callable_payload(target) -> bytes:
     )
 
 
-def _chip_descriptor_context(worker: "Worker") -> tuple[str, str]:
+def _chip_descriptor_context(worker: Worker) -> tuple[str, str]:
     platform = str(worker._config.get("platform", ""))
     runtime = str(worker._config.get("runtime", ""))
     if platform or runtime:
@@ -357,8 +740,31 @@ def _chip_descriptor_context(worker: "Worker") -> tuple[str, str]:
     return first
 
 
-def _build_callable_registration(worker: "Worker", target) -> _CallableRegistration:
+def _build_callable_registration(worker: Worker, target, *, workers: list[int] | None = None) -> _CallableRegistration:
+    if isinstance(target, RemoteCallable):
+        if workers is None or len(workers) == 0:
+            raise ValueError("Worker.register(RemoteCallable): workers must be an explicit non-empty list")
+        worker_ids = tuple(int(w) for w in workers)
+        if any(w < 0 for w in worker_ids):
+            raise ValueError("Worker.register(RemoteCallable): worker ids must be non-negative")
+        if len(set(worker_ids)) != len(worker_ids):
+            raise ValueError("Worker.register(RemoteCallable): workers must not contain duplicates")
+        descriptor = build_python_import_descriptor(target.module, target.qualname)
+        hashid = compute_callable_hashid(descriptor)
+        return _CallableRegistration(
+            target=target,
+            kind="PYTHON_IMPORT",
+            target_namespace="REMOTE_TASK_DISPATCHER",
+            descriptor=descriptor,
+            hashid=hashid,
+            digest=hashid_to_digest(hashid),
+            payload_digest=descriptor,
+            payload=target.target.encode("utf-8"),
+            eligible_worker_ids=worker_ids,
+        )
     if isinstance(target, ChipCallable):
+        if workers is not None:
+            raise TypeError("Worker.register: workers= is only supported for RemoteCallable")
         platform, runtime = _chip_descriptor_context(worker)
         descriptor = build_chip_callable_descriptor(
             target=target,
@@ -376,6 +782,8 @@ def _build_callable_registration(worker: "Worker", target) -> _CallableRegistrat
             payload_digest=descriptor,
             payload=None,
         )
+    if workers is not None:
+        raise TypeError("Worker.register: workers= is only supported for RemoteCallable")
     if not callable(target):
         raise TypeError("Worker.register: non-ChipCallable target must be callable")
     payload = _pack_py_callable_payload(target)
@@ -444,6 +852,19 @@ def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
         shm.close()
 
 
+def _read_raw_payload_from_shm(shm_name: str, payload_size: int) -> bytes:
+    shm = SharedMemory(name=shm_name)
+    shm_buf = shm.buf
+    assert shm_buf is not None
+    try:
+        if payload_size <= 0 or payload_size > shm.size:
+            raise RuntimeError(f"raw control payload size mismatch: payload={payload_size}, shm={shm.size}")
+        return bytes(shm_buf[:payload_size])
+    finally:
+        shm_buf.release()
+        shm.close()
+
+
 def _read_chip_callable_from_shm(shm_name: str, payload_size: int) -> ChipCallable:
     shm = SharedMemory(name=shm_name)
     shm_buf = shm.buf
@@ -467,6 +888,16 @@ def _load_py_callable_from_payload(payload: bytes):
 
 def _load_py_callable_from_shm(shm_name: str):
     return _load_py_callable_from_payload(_read_py_callable_payload_from_shm(shm_name))
+
+
+def _load_py_import_target(target: str):
+    module_name, qualname = parse_python_import_target(target)
+    obj = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    if not callable(obj):
+        raise TypeError(f"python import target {target!r} is not callable")
+    return obj
 
 
 def _read_control_digest(buf) -> bytes:
@@ -505,6 +936,24 @@ def _handle_py_callable_control(
             identity_refs,
             digest,
             _load_py_callable_from_payload(payload),
+        )
+    elif sub_cmd == _CTRL_PY_IMPORT_REGISTER:
+        shm_name = _read_shm_name(buf, _OFF_ARGS)
+        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+        payload = _read_raw_payload_from_shm(shm_name, int(payload_size))
+        target = payload.decode("utf-8")
+        module, qualname = parse_python_import_target(target)
+        descriptor = build_python_import_descriptor(module, qualname)
+        _validate_descriptor_digest(expected=digest, descriptor=descriptor, context=f"{context} python import")
+        if digest in identity_table:
+            identity_refs[digest] = identity_refs.get(digest, 1) + 1
+            return
+        _install_local_identity(
+            registry,
+            identity_table,
+            identity_refs,
+            digest,
+            _load_py_import_target(target),
         )
     elif sub_cmd == _CTRL_PY_UNREGISTER:
         _remove_local_identity(registry, identity_table, identity_refs, digest)
@@ -565,10 +1014,10 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     Used by the Python-targeted child loops (sub_worker, nested L4+ child)
     where the destination of `args` is a Python callable that needs a
     typed TaskArgs object.  The chip-child loops that immediately forward
-    to C++ run use the zero-copy `run_prepared_from_blob` path
+    to C++ run use the zero-copy `run_from_blob` path
     instead — see those loops for the matching comment.
 
-    Delegates to the nanobind helper so the ContinuousTensor layout is
+    Delegates to the nanobind helper so the Tensor layout is
     parsed by C++ `read_blob` (single source of truth) instead of being
     reimplemented in Python.  The Python re-implementation that lived
     here previously dropped the `child_memory` byte (offset 33), which
@@ -647,7 +1096,7 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -709,7 +1158,7 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
     Idempotent: ``ChipWorker.comm_init`` itself caches the handle and returns
@@ -736,7 +1185,26 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
-def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
+    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    control_shm = SharedMemory(name=control_shm_name)
+    control_buf = control_shm.buf
+    assert control_buf is not None
+    exported = ctypes.c_char.from_buffer(control_buf)
+    success = False
+    try:
+        control_block_addr = ctypes.addressof(exported)
+        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
+        success = True
+    finally:
+        del exported
+        del control_buf
+        if not success:
+            control_shm.close()
+    return control_shm
+
+
+def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -752,7 +1220,7 @@ def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
-def _comm_base_handle(cw: "ChipWorker") -> int:
+def _comm_base_handle(cw: ChipWorker) -> int:
     """Return the cached base-communicator handle the chip allocated during bootstrap.
 
     The dynamic-allocate path requires an established base communicator (HCCL
@@ -765,22 +1233,13 @@ def _comm_base_handle(cw: "ChipWorker") -> int:
     return int(handle)
 
 
-def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id: int) -> None:
+def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
     if cid in prepared:
         return
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    if lazy:
-        # Reaching the lazy branch means _CTRL_PREPARE prewarm did not run
-        # for this cid before the first TASK_READY; the child still does
-        # the work, but the resulting H2D + dlopen cost lands on the
-        # first task's latency.  Log so the gap is visible in stderr.
-        sys.stderr.write(
-            f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
-        )
-        sys.stderr.flush()
-    cw._prepare_callable_at_slot(cid, callable_obj)
+    cw._register_callable_at_slot(cid, callable_obj)
     prepared.add(cid)
 
 
@@ -801,154 +1260,205 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
     `on_task_done_success`, if provided, is invoked after a successful
-    ``run_prepared_from_blob`` and before publishing TASK_DONE. It must
+    ``run_from_blob`` and before publishing TASK_DONE. It must
     return ``(code, msg)`` — typically ``(0, "")`` on success, or an
     error tuple if the hook itself failed (e.g. D2H staging error).
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot, prepares that slot once, then runs it. ``_CTRL_PREPARE``
-    is the explicit pre-warm path (parent pushes after init() to amortise the
-    first H2D upload); TASK_READY preserves the historical lazy-prepare safety
-    net when the digest mapping exists but prewarm was missed.
+    target-local slot and runs it. The slot must already be prepared via
+    ``_CTRL_PREPARE`` (the explicit registration path the parent pushes after
+    init() to stage the H2D upload + device-orch load); a TASK_READY for an
+    unprepared slot is a control-flow error and fails the task rather than
+    lazily preparing it.
     """
     prepared: set[int] = set()
-    while True:
-        state = _mailbox_load_i32(state_addr)
-        if state == _TASK_READY:
-            digest = _read_task_digest(buf)
-            cid = identity_table.get(digest)
-            cfg = _read_config_from_mailbox(buf)
+    l3_l2_control_shms: list[SharedMemory] = []
+    # Post-fork host buffers mapped into this child. `host_buf_table`
+    # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
+    # parent-VA → child-VA translation table the per-task blob rewrite consults,
+    # rebuilt from the table on every map/unmap.
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
+    host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
+    try:
+        while True:
+            state = _mailbox_load_i32(state_addr)
+            if state == _TASK_READY:
+                digest = _read_task_digest(buf)
+                cid = identity_table.get(digest)
+                cfg = _read_config_from_mailbox(buf)
 
-            code = 0
-            msg = ""
-            try:
-                if cid is None:
-                    raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
-                # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                # the blob layout is what `write_blob` already wrote, so re-parsing
-                # it in Python is N×40B of avoidable work and a permanent
-                # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                # is the source of truth.
-                cw._impl.run_prepared_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
-            except Exception as e:  # noqa: BLE001
-                code = 1
-                msg = _format_exc(f"chip_process dev={device_id}", e)
-
-            # On a successful kernel run, give the caller a chance to do
-            # post-run work (e.g. store_to_host D2H staging) before the
-            # parent sees TASK_DONE. The kernel's failure path skips the
-            # hook because the device output region is undefined and
-            # staging garbage would mask the real error in post-mortems.
-            if code == 0 and on_task_done_success is not None:
-                code, msg = on_task_done_success()
-
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _TASK_DONE)
-        elif state == _CONTROL_REQUEST:
-            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            code = 0
-            msg = ""
-            try:
-                if sub_cmd == _CTRL_MALLOC:
-                    size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    ptr = cw.malloc(size)
-                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
-                elif sub_cmd == _CTRL_FREE:
-                    ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    cw.free(ptr)
-                elif sub_cmd == _CTRL_COPY_TO:
-                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
-                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                    cw.copy_to(dst, src, n)
-                elif sub_cmd == _CTRL_COPY_FROM:
-                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
-                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                    cw.copy_from(dst, src, n)
-                elif sub_cmd == _CTRL_PREPARE:
-                    digest = _read_control_digest(buf)
-                    cid = identity_table.get(digest)
+                code = 0
+                msg = ""
+                try:
                     if cid is None:
+                        raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+                    # Run only consumes a prepared slot — it never lazily
+                    # prepares. The callable must have been staged via
+                    # _CTRL_PREPARE first; reaching TASK_READY without it is a
+                    # control-flow bug, so fail loudly instead of masking the
+                    # missing-prepare with a first-task latency spike.
+                    if cid not in prepared:
                         raise RuntimeError(
-                            f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
+                            f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
+                            f"(register via _CTRL_PREPARE first)"
                         )
-                    _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
-                elif sub_cmd == _CTRL_REGISTER:
-                    digest = _read_control_digest(buf)
-                    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                    nul = raw.find(b"\x00")
-                    shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
-                    shm = SharedMemory(name=shm_name)
-                    shm_buf = shm.buf
-                    assert shm_buf is not None
-                    try:
-                        if payload_size <= 0 or payload_size > shm.size:
+                    # Redirect any registered host pointer (a parent VA) in the
+                    # blob to this child's own mapping before the runtime reads it.
+                    # No-op when nothing is registered.
+                    if host_buf_ranges:
+                        _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
+                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
+                    # the blob layout is what `write_blob` already wrote, so re-parsing
+                    # it in Python is N×40B of avoidable work and a permanent
+                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
+                    # is the source of truth.
+                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id}", e)
+
+                # On a successful kernel run, give the caller a chance to do
+                # post-run work (e.g. store_to_host D2H staging) before the
+                # parent sees TASK_DONE. The kernel's failure path skips the
+                # hook because the device output region is undefined and
+                # staging garbage would mask the real error in post-mortems.
+                if code == 0 and on_task_done_success is not None:
+                    code, msg = on_task_done_success()
+
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+            elif state == _CONTROL_REQUEST:
+                sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                code = 0
+                msg = ""
+                try:
+                    if sub_cmd == _CTRL_MALLOC:
+                        size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        ptr = cw.malloc(size)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
+                    elif sub_cmd == _CTRL_FREE:
+                        ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        cw.free(ptr)
+                    elif sub_cmd == _CTRL_COPY_TO:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw.copy_to(dst, src, n)
+                    elif sub_cmd == _CTRL_COPY_FROM:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw.copy_from(dst, src, n)
+                    elif sub_cmd == _CTRL_PREPARE:
+                        digest = _read_control_digest(buf)
+                        cid = identity_table.get(digest)
+                        if cid is None:
                             raise RuntimeError(
-                                f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
+                                f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
-                        _validate_chip_payload_digest(
-                            callable_obj,
-                            digest,
-                            platform=chip_platform,
-                            runtime=chip_runtime,
-                            context=f"chip_process dev={device_id}",
-                        )
-                        if digest in identity_table:
-                            identity_refs[digest] = identity_refs.get(digest, 1) + 1
-                        else:
-                            cid = _install_local_identity(registry, identity_table, identity_refs, digest, callable_obj)
-                            # Self-heal when a prior unregister popped the local
-                            # identity table but failed before clearing device
-                            # prepared state for the reusable private slot.
-                            if int(cid) in prepared:
+                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                    elif sub_cmd == _CTRL_REGISTER:
+                        digest = _read_control_digest(buf)
+                        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        shm_name = _read_ctrl_staged_shm_name(buf)
+                        shm = SharedMemory(name=shm_name)
+                        shm_buf = shm.buf
+                        assert shm_buf is not None
+                        try:
+                            if payload_size <= 0 or payload_size > shm.size:
+                                raise RuntimeError(
+                                    f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
+                                )
+                            callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
+                            _validate_chip_payload_digest(
+                                callable_obj,
+                                digest,
+                                platform=chip_platform,
+                                runtime=chip_runtime,
+                                context=f"chip_process dev={device_id}",
+                            )
+                            if digest in identity_table:
+                                identity_refs[digest] = identity_refs.get(digest, 1) + 1
+                            else:
+                                cid = _install_local_identity(
+                                    registry, identity_table, identity_refs, digest, callable_obj
+                                )
+                                # Self-heal when a prior unregister popped the local
+                                # identity table but failed before clearing device
+                                # prepared state for the reusable private slot.
+                                if int(cid) in prepared:
+                                    try:
+                                        cw._unregister_slot(int(cid))
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    prepared.discard(int(cid))
+                                exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
-                                    cw._unregister_slot(int(cid))
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                prepared.discard(int(cid))
-                            exported = ctypes.c_char.from_buffer(shm_buf)
-                            try:
-                                addr = ctypes.addressof(exported)
-                                cw._impl.prepare_callable_from_blob(int(cid), addr)
-                            finally:
-                                del exported
-                            prepared.add(int(cid))
-                    finally:
-                        shm_buf.release()
-                        # Release the local mmap as soon as prepare returns;
-                        # prepare_callable has already H2D-copied the bytes to
-                        # device GM, so the child no longer needs the shm.
-                        shm.close()
-                elif sub_cmd == _CTRL_UNREGISTER:
-                    digest = _read_control_digest(buf)
-                    cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
-                    if removed and cid is not None:
-                        cw._unregister_slot(int(cid))
-                        prepared.discard(int(cid))
-                elif sub_cmd == _CTRL_ALLOC_DOMAIN:
-                    _handle_ctrl_alloc_domain(cw, buf)
-                elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                    _handle_ctrl_release_domain(cw, buf)
-                elif sub_cmd == _CTRL_COMM_INIT:
-                    _handle_ctrl_comm_init(cw, buf)
-                else:
-                    raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
+                                    addr = ctypes.addressof(exported)
+                                    cw._impl.register_callable_from_blob(int(cid), addr)
+                                finally:
+                                    del exported
+                                prepared.add(int(cid))
+                        finally:
+                            shm_buf.release()
+                            # Release the local mmap as soon as prepare returns;
+                            # register_callable has already H2D-copied the bytes to
+                            # device GM, so the child no longer needs the shm.
+                            shm.close()
+                    elif sub_cmd == _CTRL_UNREGISTER:
+                        digest = _read_control_digest(buf)
+                        cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
+                        if removed and cid is not None:
+                            cw._unregister_slot(int(cid))
+                            prepared.discard(int(cid))
+                    elif sub_cmd == _CTRL_ALLOC_DOMAIN:
+                        _handle_ctrl_alloc_domain(cw, buf)
+                    elif sub_cmd == _CTRL_RELEASE_DOMAIN:
+                        _handle_ctrl_release_domain(cw, buf)
+                    elif sub_cmd == _CTRL_COMM_INIT:
+                        _handle_ctrl_comm_init(cw, buf)
+                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
+                        l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
+                    elif sub_cmd == _CTRL_MAP_HOST:
+                        _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_UNMAP_HOST:
+                        _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_IMPORT_IPC:
+                        _handle_ctrl_import_ipc(buf, device_id)
+                    else:
+                        raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
+                        op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
+                        msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
+                    else:
+                        msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _SHUTDOWN:
+                break
+    finally:
+        if l3_l2_control_shms:
+            try:
+                cw.l3_l2_orch_comm_shutdown()
             except Exception as e:  # noqa: BLE001
-                code = 1
-                if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
-                    op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
-                    msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
-                else:
-                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _CONTROL_DONE)
-        elif state == _SHUTDOWN:
-            break
+                sys.stderr.write(
+                    f"[chip_process pid={os.getpid()} dev={device_id}] "
+                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+        for control_shm in reversed(l3_l2_control_shms):
+            try:
+                control_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for host_shm, _lo, _hi, _base in host_buf_table.values():
+            try:
+                host_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _chip_process_loop(
@@ -1013,7 +1523,7 @@ def _chip_process_loop(
         cw.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
+def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     (
         block_dim,
@@ -1023,11 +1533,12 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
         pmu,
         dep_gen,
         scope_stats,
-        ring_task_window,
-        ring_heap,
-        ring_dep_pool,
+        *ring_values,
         prefix_bytes,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
+    ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
+    ring_dep_pool = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
@@ -1049,7 +1560,7 @@ def _child_worker_loop(
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
-    inner_worker: "Worker",
+    inner_worker: Worker,
 ) -> None:
     """Runs in forked child process. Any-level Worker as child of its parent.
 
@@ -1090,9 +1601,7 @@ def _child_worker_loop(
                 if sub_cmd == _CTRL_REGISTER:
                     digest = _read_control_digest(buf)
                     payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                    nul = raw.find(b"\x00")
-                    shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+                    shm_name = _read_ctrl_staged_shm_name(buf)
                     callable_obj = _read_chip_callable_from_shm(shm_name, int(payload_size))
                     inner_registered = False
                     try:
@@ -1113,7 +1622,7 @@ def _child_worker_loop(
                     digest = _read_control_digest(buf)
                     inner_worker._unregister_child_digest(digest=digest)
                     _remove_local_identity(registry, identity_table, identity_refs, digest)
-                elif sub_cmd in (_CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER):
+                elif sub_cmd in (_CTRL_PY_REGISTER, _CTRL_PY_IMPORT_REGISTER, _CTRL_PY_UNREGISTER):
                     _handle_py_callable_control(
                         buf,
                         registry,
@@ -1134,7 +1643,7 @@ def _child_worker_loop(
                         if sub_cmd == _CTRL_UNREGISTER
                         else (
                             "py_register"
-                            if sub_cmd == _CTRL_PY_REGISTER
+                            if sub_cmd in (_CTRL_PY_REGISTER, _CTRL_PY_IMPORT_REGISTER)
                             else ("py_unregister" if sub_cmd == _CTRL_PY_UNREGISTER else f"ctrl={int(sub_cmd)}")
                         )
                     )
@@ -1185,17 +1694,18 @@ class Worker:
         # no quiescent-state guard is needed.
         self._registry_lock = threading.Lock()
         self._pending_unregister_cids: set[int] = set()
+        self._pending_remote_unregister_hashids: set[bytes] = set()
         self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
         self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
 
         # Level-2 internals
-        self._chip_worker: Optional[ChipWorker] = None
+        self._chip_worker: ChipWorker | None = None
 
         # Level-3+ internals
-        self._worker: Optional[_Worker] = None
-        self._orch: Optional[Orchestrator] = None
+        self._worker: _Worker | None = None
+        self._orch: Orchestrator | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
         self._sub_shms: list[SharedMemory] = []
@@ -1203,8 +1713,16 @@ class Worker:
 
         # L4+ next-level Worker children (added via add_worker before init)
         self._next_level_workers: list[Worker] = []
+        self._next_level_worker_ids: list[int] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
+        self._remote_worker_specs: list[RemoteWorkerSpec] = []
+        self._remote_worker_ids: list[int] = []
+        self._remote_sessions: list[_RemoteSession] = []
+        self._next_level_worker_id_count: int = 0
+        self._active_remote_slot_refs: list[RemoteBufferHandle] = []
+        self._pending_remote_buffer_frees: list[RemoteBufferHandle] = []
+        self._pending_remote_import_releases: list[RemoteBufferHandle] = []
 
         # Dynamic CommDomain allocations.  Keyed by user-facing name (unique
         # among live handles).  ``orch.allocate_domain`` adds entries here;
@@ -1226,6 +1744,28 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
+        self._l3_l2_orch_comm_ready: set[int] = set()
+        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
+        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
+        self._live_l3_l2_regions: list[Any] = []
+        self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
+
+        # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
+        # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
+        # a named shm into every chip child so memory created after the children
+        # were forked is still reachable by a later run — with no per-run copy.
+        self._host_buf_registry: dict[int, _HostBufEntry] = {}
+        # Immutable read snapshot for the lock-free per-submit lookup
+        # (``_find_host_buf_entry``): a ``(sorted_ptrs_tuple, registry_copy)`` pair
+        # rebuilt under ``_registry_lock`` on every create/free and rebound
+        # atomically. The reader loads it once, so the sorted keys and the dict it
+        # bisects into never mutate mid-lookup — no lock, no torn read, no
+        # IndexError from a concurrent free shrinking the list. Host buffers are
+        # distinct, non-overlapping allocations, so the unique candidate for an
+        # address is the entry with the greatest base <= addr.
+        self._host_buf_snapshot: tuple[tuple[int, ...], dict[int, _HostBufEntry]] = ((), {})
+        self._host_buf_token_counter: int = 0
+
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
 
@@ -1234,6 +1774,523 @@ class Worker:
         """
         tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
         return os.path.join("/tmp", tag)
+
+    def _allocate_next_level_worker_id(self) -> int:
+        worker_id = self._next_level_worker_id_count
+        self._next_level_worker_id_count += 1
+        return worker_id
+
+    def add_remote_worker(self, spec: RemoteWorkerSpec) -> int:
+        if self._initialized:
+            raise RuntimeError("Worker.add_remote_worker after init")
+        if self.level < 4:
+            raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
+        if not isinstance(spec, RemoteWorkerSpec):
+            raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
+        worker_id = self._allocate_next_level_worker_id()
+        self._remote_worker_specs.append(spec)
+        self._remote_worker_ids.append(worker_id)
+        return worker_id
+
+    @staticmethod
+    def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
+        if endpoint.count(":") != 1:
+            raise ValueError(f"RemoteWorkerSpec.endpoint must be host:port, got {endpoint!r}")
+        host, port_s = endpoint.rsplit(":", 1)
+        if not host:
+            raise ValueError("RemoteWorkerSpec.endpoint host must be non-empty")
+        port = int(port_s)
+        if port <= 0 or port > 65535:
+            raise ValueError(f"RemoteWorkerSpec.endpoint port out of range: {port}")
+        return host, port
+
+    @staticmethod
+    def _is_wildcard_session_host(host: str) -> bool:
+        return host in ("0.0.0.0", "::")
+
+    def _remote_session_timeout_s(self) -> float:
+        timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
+        if timeout_s <= 0:
+            raise ValueError("Worker remote_session_timeout_s must be positive")
+        return timeout_s
+
+    @staticmethod
+    def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        sock.sendall(struct.pack("<I", len(data)) + data)
+
+    @staticmethod
+    def _recv_remote_daemon_json(sock: socket.socket) -> dict[str, Any]:
+        size_data = bytearray()
+        while len(size_data) < 4:
+            chunk = sock.recv(4 - len(size_data))
+            if not chunk:
+                raise EOFError("remote daemon closed before reply length")
+            size_data.extend(chunk)
+        size = struct.unpack("<I", bytes(size_data))[0]
+        if size > 16 * 1024 * 1024:
+            raise RuntimeError("remote daemon reply exceeds maximum")
+        data = bytearray()
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise EOFError("remote daemon closed before full reply")
+            data.extend(chunk)
+        return json.loads(bytes(data).decode("utf-8"))
+
+    def _remote_dispatcher_entries_for_worker(self, worker_id: int) -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        with self._registry_lock:
+            states = list(self._identity_registry.values())
+        for state in states:
+            if state.target_namespace != "REMOTE_TASK_DISPATCHER":
+                continue
+            if worker_id not in state.eligible_worker_ids:
+                continue
+            if not isinstance(state.target, RemoteCallable):
+                raise RuntimeError(f"remote dispatcher hashid {state.hashid} does not carry a RemoteCallable target")
+            entries.append(
+                {
+                    "hashid": state.digest.hex(),
+                    "kind": state.kind,
+                    "target_registry": "REMOTE_TASK_DISPATCHER",
+                    "target": state.target.target,
+                }
+            )
+        return entries
+
+    def _build_remote_manifest(self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int) -> dict[str, Any]:
+        daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
+        listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
+        if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
+            raise ValueError("RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True")
+        return {
+            "session_id": int(session_id),
+            "parent_worker_level": int(self.level),
+            "remote_worker_level": 3,
+            "worker_id": int(worker_id),
+            "platform": spec.platform,
+            "runtime": spec.runtime,
+            "device_ids": list(spec.device_ids),
+            "num_sub_workers": int(spec.num_sub_workers),
+            "heap_ring_size": self._config.get("remote_heap_ring_size", None),
+            "transport": spec.transport,
+            "session_timeout_s": self._remote_session_timeout_s(),
+            "listen_host": listen_host,
+            "connect_host": daemon_host,
+            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
+            "inner_l3_worker": [],
+            "feature_flags": [],
+        }
+
+    def _open_remote_session(
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, timeout_s: float
+    ) -> _RemoteSession:
+        daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
+        manifest = self._build_remote_manifest(spec=spec, worker_id=worker_id, session_id=session_id)
+        with socket.create_connection((daemon_host, daemon_port), timeout=timeout_s) as sock:
+            sock.settimeout(timeout_s)
+            self._send_remote_daemon_json(sock, manifest)
+            reply = self._recv_remote_daemon_json(sock)
+        if not reply.get("ok", False):
+            raise RuntimeError(f"remote L3 session startup failed for worker {worker_id}: {reply.get('error')}")
+        return _RemoteSession(
+            worker_id=worker_id,
+            session_id=session_id,
+            command_host=str(reply["command_host"]),
+            command_port=int(reply["command_port"]),
+            health_host=str(reply["health_host"]),
+            health_port=int(reply["health_port"]),
+            pid=int(reply.get("pid", 0)),
+        )
+
+    def _close_remote_session(self, session: _RemoteSession, *, timeout_s: float = 1.0) -> None:
+        """Best-effort protocol shutdown for a remote L3 session."""
+
+        from .remote_l3_protocol import FrameHeader, FrameType, send_frame  # noqa: PLC0415
+
+        try:
+            with socket.create_connection((session.command_host, session.command_port), timeout=timeout_s) as sock:
+                sock.settimeout(timeout_s)
+                send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.worker_id, 0))
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _close_remote_sessions(self, sessions: list[_RemoteSession]) -> None:
+        for session in reversed(sessions):
+            self._close_remote_session(session)
+
+    def _require_remote_worker_started(self, worker_id: int) -> None:
+        if self.level < 4:
+            raise TypeError("remote memory APIs require a level >= 4 parent Worker")
+        if not self._initialized:
+            raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
+        if int(worker_id) not in set(self._remote_worker_ids):
+            raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
+        self._start_hierarchical()
+        if self._worker is None:
+            raise RuntimeError("remote memory APIs require a started hierarchical Worker")
+
+    @staticmethod
+    def _host_ptr_value(ptr: Any) -> int:
+        if isinstance(ptr, int):
+            return int(ptr)
+        if isinstance(ptr, ctypes.c_void_p):
+            if ptr.value is None:
+                raise ValueError("host_ptr must not be NULL")
+            return int(ptr.value)
+        data_ptr = getattr(ptr, "data_ptr", None)
+        if callable(data_ptr):
+            data_ptr_value: Any = data_ptr()
+            return int(data_ptr_value)
+        try:
+            return ctypes.addressof(ptr)
+        except TypeError:
+            pass
+        try:
+            return ctypes.addressof(ptr.contents)
+        except AttributeError as exc:
+            raise TypeError("host_ptr must be an integer address, ctypes object, or object with data_ptr()") from exc
+
+    def _require_live_remote_buffer(self, handle: RemoteBufferHandle) -> None:
+        if not isinstance(handle, RemoteBufferHandle):
+            raise TypeError("expected a RemoteBufferHandle returned by Worker.remote_malloc/import")
+        if handle.address_space == RemoteAddressSpace.HOST_INLINE:
+            raise ValueError("HOST_INLINE RemoteBufferHandle is not a remote allocation")
+        if handle.released:
+            raise RuntimeError("RemoteBufferHandle has already been released")
+        self._require_remote_worker_started(handle.worker_id)
+
+    @staticmethod
+    def _remote_access_flags(access: str | int) -> int:
+        if isinstance(access, str):
+            normalized = access.strip().lower().replace("_", "").replace("-", "")
+            if normalized in ("read", "r"):
+                return 1
+            if normalized in ("write", "w"):
+                return 2
+            if normalized in ("readwrite", "rw", "writeread", "wr"):
+                return 3
+            raise ValueError("remote buffer access must be 'read', 'write', or 'readwrite'")
+        flags = int(access)
+        if flags <= 0 or flags & ~0x3:
+            raise ValueError("remote buffer access flags must use read/write bits")
+        return flags
+
+    def _send_remote_free(self, handle: RemoteBufferHandle) -> None:
+        if handle.is_imported:
+            raise ValueError("remote_free is invalid for imported handles; use remote_release_import")
+        self._require_remote_worker_started(handle.worker_id)
+        assert self._worker is not None
+        self._worker.remote_free(handle.worker_id, handle._buffer_id, handle._generation)
+
+    def _send_remote_release_import(self, handle: RemoteBufferHandle) -> None:
+        if not handle.is_imported:
+            raise ValueError("remote_release_import expects an imported remote handle")
+        self._require_remote_worker_started(handle.worker_id)
+        assert self._worker is not None
+        self._worker.remote_release_import(
+            handle.worker_id,
+            handle.owner_worker_id,
+            handle._buffer_id,
+            handle._generation,
+            handle.import_id,
+        )
+
+    def _send_remote_release_import_fields(self, fields: Any) -> None:
+        worker_id = int(fields[0])
+        self._require_remote_worker_started(worker_id)
+        assert self._worker is not None
+        self._worker.remote_release_import(
+            worker_id,
+            int(fields[1]),
+            int(fields[2]),
+            int(fields[3]),
+            int(fields[4]),
+        )
+
+    def remote_malloc(self, *, worker: int, nbytes: int) -> RemoteBufferHandle:
+        worker_id = int(worker)
+        size = int(nbytes)
+        if size <= 0:
+            raise ValueError("Worker.remote_malloc nbytes must be positive")
+        self._require_remote_worker_started(worker_id)
+        assert self._worker is not None
+        fields = self._worker.remote_malloc(worker_id, size)
+        return RemoteBufferHandle._from_remote_allocation(
+            worker_id=int(fields[0]),
+            buffer_id=int(fields[1]),
+            generation=int(fields[2]),
+            address_space=RemoteAddressSpace(int(fields[3])),
+            nbytes=int(fields[4]),
+            remote_addr=int(fields[5]),
+            rkey_or_token=int(fields[6]),
+            ub_ldst_va=int(fields[7]),
+        )
+
+    def remote_free(self, handle: RemoteBufferHandle) -> None:
+        if not isinstance(handle, RemoteBufferHandle):
+            raise TypeError("expected a RemoteBufferHandle returned by Worker.remote_malloc/import")
+        if handle.address_space == RemoteAddressSpace.HOST_INLINE:
+            raise ValueError("HOST_INLINE RemoteBufferHandle is not a remote allocation")
+        if handle.is_imported:
+            raise ValueError("remote_free is invalid for imported handles; use remote_release_import")
+        if handle.released:
+            return
+        if handle._live_slot_refs > 0 or handle._live_import_refs > 0:
+            handle._mark_released()
+            if handle not in self._pending_remote_buffer_frees:
+                self._pending_remote_buffer_frees.append(handle)
+            return
+        self._send_remote_free(handle)
+        handle._mark_released()
+
+    def remote_copy_to(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
+        self._require_live_remote_buffer(handle)
+        if handle.is_imported:
+            raise ValueError("Worker.remote_copy_to expects an owner remote buffer handle")
+        size = int(nbytes)
+        start = int(offset)
+        if size < 0 or start < 0:
+            raise ValueError("Worker.remote_copy_to size and offset must be non-negative")
+        if start + size > handle.nbytes:
+            raise ValueError("Worker.remote_copy_to range exceeds RemoteBufferHandle.nbytes")
+        assert self._worker is not None
+        self._worker.remote_copy_to(
+            handle.worker_id,
+            handle._buffer_id,
+            handle._generation,
+            start,
+            self._host_ptr_value(host_ptr),
+            size,
+            handle.nbytes,
+        )
+
+    def remote_copy_from(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
+        self._require_live_remote_buffer(handle)
+        if handle.is_imported:
+            raise ValueError("Worker.remote_copy_from expects an owner remote buffer handle")
+        size = int(nbytes)
+        start = int(offset)
+        if size < 0 or start < 0:
+            raise ValueError("Worker.remote_copy_from size and offset must be non-negative")
+        if start + size > handle.nbytes:
+            raise ValueError("Worker.remote_copy_from range exceeds RemoteBufferHandle.nbytes")
+        assert self._worker is not None
+        self._worker.remote_copy_from(
+            self._host_ptr_value(host_ptr),
+            handle.worker_id,
+            handle._buffer_id,
+            handle._generation,
+            start,
+            size,
+            handle.nbytes,
+        )
+
+    def remote_export(
+        self,
+        handle: RemoteBufferHandle,
+        *,
+        offset: int = 0,
+        nbytes: int | None = None,
+        access: str | int = "readwrite",
+        transport_profile: str = "sim",
+    ) -> RemoteBufferExport:
+        self._require_live_remote_buffer(handle)
+        if handle.is_imported:
+            raise ValueError("Worker.remote_export expects an owner remote buffer handle")
+        start = int(offset)
+        size = handle.nbytes - start if nbytes is None else int(nbytes)
+        if start < 0 or size <= 0:
+            raise ValueError("Worker.remote_export offset must be non-negative and nbytes must be positive")
+        if start + size > handle.nbytes:
+            raise ValueError("Worker.remote_export range exceeds RemoteBufferHandle.nbytes")
+        flags = self._remote_access_flags(access)
+        if flags & ~handle.access_flags:
+            raise ValueError("Worker.remote_export requested access is not allowed by handle")
+        assert self._worker is not None
+        fields = self._worker.remote_export(
+            handle.owner_worker_id,
+            handle._buffer_id,
+            handle._generation,
+            handle._offset,
+            start,
+            size,
+            flags,
+            str(transport_profile),
+            handle.nbytes,
+        )
+        return RemoteBufferExport._from_remote_export(
+            owner_worker_id=int(fields[0]),
+            buffer_id=int(fields[1]),
+            generation=int(fields[2]),
+            address_space=RemoteAddressSpace(int(fields[3])),
+            offset=int(fields[4]),
+            nbytes=int(fields[5]),
+            export_id=int(fields[6]),
+            remote_addr=int(fields[7]),
+            rkey_or_token=int(fields[8]),
+            ub_ldst_va=int(fields[9]),
+            access_flags=int(fields[10]),
+            transport_profile=str(fields[11]),
+            transport_descriptor=bytes(fields[12]),
+            _owner_handle=handle,
+            worker_owner_id=self._owner_id,
+        )
+
+    def remote_import(
+        self, exported: RemoteBufferExport, *, worker: int, access: str | int | None = None
+    ) -> RemoteBufferHandle:
+        if not isinstance(exported, RemoteBufferExport):
+            raise TypeError("Worker.remote_import expects a RemoteBufferExport returned by remote_export")
+        if exported._worker_owner_id != self._owner_id:
+            raise ValueError("Worker.remote_import rejects forged or different Worker RemoteBufferExport values")
+        if exported._owner_handle is not None and exported._owner_handle.released:
+            raise ValueError("Worker.remote_import rejects stale RemoteBufferExport values for released buffers")
+        importer_worker_id = int(worker)
+        self._require_remote_worker_started(importer_worker_id)
+        flags = exported._access_flags if access is None else self._remote_access_flags(access)
+        if flags & ~exported._access_flags:
+            raise ValueError("Worker.remote_import requested access is not a subset of export access")
+        assert self._worker is not None
+        owner_handle = exported._owner_handle
+        if owner_handle is not None:
+            owner_handle._acquire_import_ref()
+        fields: Any | None = None
+        try:
+            fields = self._worker.remote_import(
+                importer_worker_id,
+                exported._owner_worker_id,
+                exported._buffer_id,
+                exported._generation,
+                int(exported._address_space),
+                exported._offset,
+                exported._nbytes,
+                exported._export_id,
+                exported._remote_addr,
+                exported._rkey_or_token,
+                exported._ub_ldst_va,
+                exported._access_flags,
+                exported._transport_profile,
+                exported._transport_descriptor,
+                flags,
+            )
+            return RemoteBufferHandle._from_imported_mapping(
+                worker_id=int(fields[0]),
+                owner_worker_id=int(fields[1]),
+                buffer_id=int(fields[2]),
+                generation=int(fields[3]),
+                import_id=int(fields[4]),
+                address_space=RemoteAddressSpace(int(fields[5])),
+                nbytes=int(fields[6]),
+                offset=int(fields[7]),
+                remote_addr=int(fields[8]),
+                rkey_or_token=int(fields[9]),
+                ub_ldst_va=int(fields[10]),
+                access_flags=int(fields[11]),
+                owner_handle_ref=owner_handle,
+            )
+        except BaseException:
+            if fields is not None:
+                try:
+                    self._send_remote_release_import_fields(fields)
+                except Exception:  # noqa: BLE001
+                    pass
+            if owner_handle is not None:
+                owner_handle._release_import_ref()
+            raise
+
+    def remote_release_import(self, handle: RemoteBufferHandle) -> None:
+        if not isinstance(handle, RemoteBufferHandle):
+            raise TypeError("expected a RemoteBufferHandle returned by Worker.remote_import")
+        if not handle.is_imported:
+            raise ValueError("Worker.remote_release_import expects an imported remote handle")
+        if handle.released:
+            return
+        if handle._live_slot_refs > 0:
+            handle._mark_released()
+            if handle not in self._pending_remote_import_releases:
+                self._pending_remote_import_releases.append(handle)
+            return
+        self._send_remote_release_import(handle)
+        if handle._owner_handle_ref is not None:
+            handle._owner_handle_ref._release_import_ref()
+            handle._owner_handle_ref = None
+        handle._mark_released()
+        self._flush_pending_remote_frees()
+
+    def _capture_remote_sidecar_refs(self, remote_sidecar: Any) -> list[RemoteBufferHandle]:
+        captured: list[RemoteBufferHandle] = []
+        if remote_sidecar is None:
+            return captured
+        try:
+            for tensor_sidecar in getattr(remote_sidecar, "tensors", ()):
+                if tensor_sidecar is None or not getattr(tensor_sidecar, "present", False):
+                    continue
+                handle = getattr(tensor_sidecar, "handle", None)
+                if handle is None:
+                    continue
+                if not isinstance(handle, RemoteBufferHandle):
+                    raise TypeError("remote sidecar handle must be a RemoteBufferHandle")
+                handle._acquire_slot_ref()
+                captured.append(handle)
+        except BaseException:
+            self._release_remote_slot_refs(captured)
+            raise
+        return captured
+
+    def _adopt_remote_slot_refs(self, handles: list[RemoteBufferHandle]) -> None:
+        self._active_remote_slot_refs.extend(handles)
+
+    def _release_remote_slot_refs(self, handles: list[RemoteBufferHandle]) -> None:
+        for handle in handles:
+            handle._release_slot_ref()
+
+    def _release_active_remote_slot_refs(self) -> None:
+        refs = self._active_remote_slot_refs
+        self._active_remote_slot_refs = []
+        self._release_remote_slot_refs(refs)
+
+    def _flush_pending_remote_frees(self) -> None:
+        errors: list[str] = []
+        pending_imports = self._pending_remote_import_releases
+        self._pending_remote_import_releases = []
+        remaining_imports: list[RemoteBufferHandle] = []
+        for handle in pending_imports:
+            if handle._live_slot_refs > 0:
+                remaining_imports.append(handle)
+                continue
+            try:
+                self._send_remote_release_import(handle)
+            except Exception as exc:  # noqa: BLE001
+                remaining_imports.append(handle)
+                errors.append(f"release_import worker_id={handle.worker_id} import_id={handle.import_id}: {exc}")
+                continue
+            if handle._owner_handle_ref is not None:
+                handle._owner_handle_ref._release_import_ref()
+                handle._owner_handle_ref = None
+        self._pending_remote_import_releases.extend(remaining_imports)
+
+        pending = self._pending_remote_buffer_frees
+        self._pending_remote_buffer_frees = []
+        remaining: list[RemoteBufferHandle] = []
+        for handle in pending:
+            if handle._live_slot_refs > 0 or handle._live_import_refs > 0:
+                remaining.append(handle)
+                continue
+            try:
+                self._send_remote_free(handle)
+            except Exception as exc:  # noqa: BLE001
+                remaining.append(handle)
+                errors.append(f"free worker_id={handle.worker_id} buffer_id={handle._buffer_id}: {exc}")
+                continue
+        self._pending_remote_buffer_frees.extend(remaining)
+        if errors:
+            sys.stderr.write(
+                "Worker._flush_pending_remote_frees(): deferred remote buffer cleanup after control error. "
+                f"First error: {errors[0]}\n"
+            )
+            sys.stderr.flush()
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -1260,10 +2317,13 @@ class Worker:
                 raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {reg.hashid}")
             if state.descriptor != reg.descriptor or state.kind != reg.kind:
                 raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {reg.hashid}")
+            if state.eligible_worker_ids != reg.eligible_worker_ids:
+                raise RuntimeError(f"REMOTE_CALLABLE_ENDPOINT_SCOPE_MISMATCH: {reg.hashid}")
             state.ref_count += 1
             return self._make_handle_locked(state), False
 
-        slot_id = self._allocate_cid()
+        is_remote = reg.target_namespace == "REMOTE_TASK_DISPATCHER"
+        slot_id = -1 if is_remote else self._allocate_cid()
         state = _CallableIdentityState(
             hashid=reg.hashid,
             digest=reg.digest,
@@ -1274,9 +2334,11 @@ class Worker:
             slot_id=slot_id,
             target=reg.target,
             ref_count=1,
+            eligible_worker_ids=reg.eligible_worker_ids,
         )
         self._identity_registry[reg.digest] = state
-        self._callable_registry[slot_id] = reg.target
+        if not is_remote:
+            self._callable_registry[slot_id] = reg.target
         return self._make_handle_locked(state), True
 
     def _rollback_handle_locked(self, handle: CallableHandle) -> None:
@@ -1289,14 +2351,15 @@ class Worker:
             return
         if state.slot_id in self._pending_unregister_cids:
             self._pending_unregister_cids.discard(state.slot_id)
-        self._callable_registry.pop(state.slot_id, None)
+        if state.slot_id >= 0:
+            self._callable_registry.pop(state.slot_id, None)
         self._identity_registry.pop(state.digest, None)
 
     def _resolve_handle_locked(
         self,
         handle: CallableHandle,
         *,
-        expected_namespace: Optional[str] = None,
+        expected_namespace: str | None = None,
     ) -> _CallableIdentityState:
         if not isinstance(handle, CallableHandle):
             raise TypeError("expected a CallableHandle returned by Worker.register")
@@ -1324,21 +2387,38 @@ class Worker:
         self,
         handle: CallableHandle,
         *,
-        expected_namespace: Optional[str] = None,
+        expected_namespace: str | None = None,
     ) -> _CallableIdentityState:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
-    def register(self, target) -> CallableHandle:
+    def register(self, target, *, workers: list[int] | None = None) -> CallableHandle:
         """Register a callable for dispatch and return an opaque handle.
 
         Integer execution slots remain private to the local target process.
         Submit APIs consume the returned handle and dispatch by its stable
         SHA-256 callable identity.
         """
+        if isinstance(target, RemoteCallable) and self.level < 4:
+            raise TypeError("Worker.register(RemoteCallable): remote L3 dispatch requires a level >= 4 parent")
         if self.level == 2 and not isinstance(target, ChipCallable):
             raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
-        reg = _build_callable_registration(self, target)
+        reg = _build_callable_registration(self, target, workers=workers)
+        if isinstance(target, RemoteCallable):
+            if not self._remote_worker_specs:
+                raise RuntimeError("Worker.register(RemoteCallable): add at least one remote worker first")
+            remote_worker_ids = set(self._remote_worker_ids)
+            for worker_id in reg.eligible_worker_ids:
+                if worker_id not in remote_worker_ids:
+                    raise ValueError(
+                        "Worker.register(RemoteCallable): workers must name remote worker ids returned by "
+                        "add_remote_worker"
+                    )
+            if not self._initialized:
+                with self._registry_lock:
+                    handle, _is_new = self._install_registration_locked(reg)
+                return handle
+            return self._post_start_register_remote(reg)
         if self.level >= 3:
             with self._hierarchical_start_cv:
                 while self._hierarchical_start_state == "starting":
@@ -1375,7 +2455,7 @@ class Worker:
             assert self._chip_worker is not None
             with self._registry_lock:
                 slot_id = self._identity_registry[handle.digest].slot_id
-            self._chip_worker._prepare_callable_at_slot(slot_id, target)
+            self._chip_worker._register_callable_at_slot(slot_id, target)
         return handle
 
     def _python_worker_types(self) -> list[WorkerType]:
@@ -1415,13 +2495,138 @@ class Worker:
             raise
         return handle
 
+    @staticmethod
+    def _format_remote_control_exception(worker_id: int, exc: BaseException) -> str:
+        return f"NEXT_LEVEL[{int(worker_id)}]: {type(exc).__name__}: {exc}"
+
+    def _post_start_register_remote(  # noqa: PLR0912 -- two-phase remote register/commit cleanup paths
+        self, reg: _CallableRegistration
+    ) -> CallableHandle:
+        assert reg.target_namespace == "REMOTE_TASK_DISPATCHER"
+        with self._registry_lock:
+            state = self._identity_registry.get(reg.digest)
+            if state is not None:
+                handle, _is_new = self._install_registration_locked(reg)
+                return handle
+
+        self._start_hierarchical()
+        if self._worker is None:
+            raise RuntimeError("Worker.register(RemoteCallable): hierarchical worker is not started")
+
+        prepared: list[int] = []
+        errors: list[str] = []
+        direct_error = False
+        payload = reg.payload if reg.payload is not None else b""
+        for worker_id in reg.eligible_worker_ids:
+            try:
+                result = self._worker.remote_prepare_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    payload,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                direct_error = True
+                break
+            if result.ok:
+                prepared.append(worker_id)
+            else:
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
+                break
+        if errors:
+            cleanup_errors = self._remote_abort_prepared(prepared, reg)
+            if cleanup_errors or direct_error:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(reg.digest)
+            raise RuntimeError(self._format_register_partial_failure(reg.digest, errors, cleanup_errors))
+
+        committed: list[int] = []
+        direct_error = False
+        for worker_id in reg.eligible_worker_ids:
+            try:
+                result = self._worker.remote_commit_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                direct_error = True
+                break
+            if result.ok:
+                committed.append(worker_id)
+            else:
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
+                break
+        if errors:
+            cleanup_errors = self._remote_abort_prepared(
+                [worker_id for worker_id in prepared if worker_id not in committed], reg
+            )
+            cleanup_errors.extend(self._remote_unregister_committed(committed, reg))
+            if cleanup_errors or direct_error:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(reg.digest)
+            raise RuntimeError(self._format_register_partial_failure(reg.digest, errors, cleanup_errors))
+
+        try:
+            with self._registry_lock:
+                handle, _is_new = self._install_registration_locked(reg)
+            return handle
+        except Exception:
+            cleanup_errors = self._remote_unregister_committed(committed, reg)
+            if cleanup_errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(reg.digest)
+            raise
+
+    def _remote_abort_prepared(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+        if self._worker is None:
+            return []
+        errors: list[str] = []
+        for worker_id in worker_ids:
+            try:
+                result = self._worker.remote_abort_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                continue
+            if not result.ok:
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
+        return errors
+
+    def _remote_unregister_committed(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+        if self._worker is None:
+            return []
+        errors: list[str] = []
+        for worker_id in worker_ids:
+            try:
+                result = self._worker.remote_unregister(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                continue
+            if not result.ok:
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
+        return errors
+
     def _broadcast_py_control_results(
         self,
         worker_types: list[WorkerType],
         sub_cmd: int,
         *,
-        digest: Optional[bytes] = None,
-        payload: Optional[bytes] = None,
+        digest: bytes | None = None,
+        payload: bytes | None = None,
     ) -> list[Any]:
         if not worker_types:
             return []
@@ -1441,9 +2646,7 @@ class Worker:
     @staticmethod
     def _control_errors(results: list[Any]) -> list[str]:
         return [
-            f"{result.worker_type}[{result.worker_index}]: {result.error_message}"
-            for result in results
-            if not result.ok
+            f"{result.worker_type}[{result.worker_id}]: {result.error_message}" for result in results if not result.ok
         ]
 
     def _broadcast_py_control(
@@ -1451,8 +2654,8 @@ class Worker:
         worker_types: list[WorkerType],
         sub_cmd: int,
         *,
-        digest: Optional[bytes] = None,
-        payload: Optional[bytes] = None,
+        digest: bytes | None = None,
+        payload: bytes | None = None,
         strict: bool,
     ) -> list[str]:
         errors = self._control_errors(
@@ -1487,7 +2690,9 @@ class Worker:
             "unregister unused callables before registering more"
         )
 
-    def _register_child_chip(self, target: ChipCallable, *, digest: bytes) -> None:
+    def _register_child_chip(  # noqa: PLR0912
+        self, target: ChipCallable, *, digest: bytes, publish_handle: bool = False
+    ) -> CallableHandle | None:
         """Install a cascaded ChipCallable on this child Worker by digest."""
         if not isinstance(target, ChipCallable):
             raise TypeError("_register_child_chip: target must be a ChipCallable")
@@ -1496,7 +2701,7 @@ class Worker:
             raise RuntimeError(
                 f"HASHID_DESCRIPTOR_MISMATCH: requested {_format_digest(digest)} but rebuilt {reg.hashid}"
             )
-        existing_slot: Optional[int] = None
+        existing_slot: int | None = None
         with self._registry_lock:
             state = self._identity_registry.get(reg.digest)
             if state is not None:
@@ -1531,7 +2736,13 @@ class Worker:
                         if state is not None:
                             state.ref_count -= 1
                     raise
-            return
+            if publish_handle:
+                with self._registry_lock:
+                    state = self._identity_registry.get(reg.digest)
+                    if state is None:
+                        raise RuntimeError(f"callable hash {_format_digest(reg.digest)} disappeared during register")
+                    return self._make_handle_locked(state)
+            return None
 
         if self.level >= 3 and self._initialized:
             try:
@@ -1542,6 +2753,83 @@ class Worker:
                         self._callable_registry.pop(slot_id, None)
                     self._identity_registry.pop(reg.digest, None)
                 raise
+        if publish_handle:
+            with self._registry_lock:
+                state = self._identity_registry.get(reg.digest)
+                if state is None:
+                    raise RuntimeError(f"callable hash {_format_digest(reg.digest)} disappeared during register")
+                return self._make_handle_locked(state)
+        return None
+
+    def _register_child_python_import(self, target_path: str, *, digest: bytes) -> CallableHandle:
+        module, qualname = parse_python_import_target(target_path)
+        descriptor = build_python_import_descriptor(module, qualname)
+        if digest != _descriptor_digest(descriptor):
+            raise RuntimeError(
+                f"HASHID_DESCRIPTOR_MISMATCH: requested {_format_digest(digest)} but rebuilt "
+                f"{compute_callable_hashid(descriptor)}"
+            )
+        if self.level < 3:
+            raise TypeError("_register_child_python_import requires level >= 3")
+        worker_types = self._python_worker_types()
+        if self._initialized and not worker_types:
+            raise RuntimeError("_register_child_python_import: no Python-capable child workers are configured")
+        target = _load_py_import_target(target_path)
+
+        with self._registry_lock:
+            state = self._identity_registry.get(digest)
+            if state is not None:
+                if state.slot_id in self._pending_unregister_cids:
+                    raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {_format_digest(digest)}")
+                if (
+                    state.descriptor != descriptor
+                    or state.kind != "PYTHON_IMPORT"
+                    or state.target_namespace != "LOCAL_PYTHON"
+                ):
+                    raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {_format_digest(digest)}")
+                state.ref_count += 1
+                handle = self._make_handle_locked(state)
+                is_new = False
+            else:
+                slot_id = self._allocate_cid()
+                state = _CallableIdentityState(
+                    hashid=_format_digest(digest),
+                    digest=digest,
+                    kind="PYTHON_IMPORT",
+                    target_namespace="LOCAL_PYTHON",
+                    descriptor=descriptor,
+                    payload_digest=descriptor,
+                    slot_id=slot_id,
+                    target=target,
+                    ref_count=1,
+                )
+                self._identity_registry[digest] = state
+                self._callable_registry[slot_id] = target
+                handle = self._make_handle_locked(state)
+                is_new = True
+
+        if self._initialized and getattr(self, "_hierarchical_started", False):
+            try:
+                results = self._broadcast_py_control_results(
+                    worker_types,
+                    _CTRL_PY_IMPORT_REGISTER,
+                    digest=digest,
+                    payload=target_path.encode("utf-8"),
+                )
+                errors = self._control_errors(results)
+                if errors:
+                    cleanup_errors = self._cleanup_control_successes(results, _CTRL_PY_UNREGISTER, digest)
+                    if cleanup_errors:
+                        with self._registry_lock:
+                            self._uncertain_hashids.add(digest)
+                    raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+            except Exception:
+                with self._registry_lock:
+                    self._rollback_handle_locked(handle)
+                raise
+        elif self._initialized and is_new and not getattr(self, "_hierarchical_started", False):
+            pass
+        return handle
 
     def _post_init_register(self, target: ChipCallable, digest: bytes, *, is_new: bool) -> None:
         """Broadcast a new ChipCallable to every NEXT_LEVEL child via C++.
@@ -1596,15 +2884,15 @@ class Worker:
             try:
                 cleanup = self._worker.control_digest_only(
                     self._worker_type_from_result(result.worker_type),
-                    int(result.worker_index),
+                    int(result.worker_id),
                     int(sub_cmd),
                     digest,
                     timeout_s=self._py_control_timeout_s,
                 )
                 if not cleanup.ok:
-                    errors.append(f"{cleanup.worker_type}[{cleanup.worker_index}]: {cleanup.error_message}")
+                    errors.append(f"{cleanup.worker_type}[{cleanup.worker_id}]: {cleanup.error_message}")
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {exc}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {exc}")
         return errors
 
     @staticmethod
@@ -1633,6 +2921,8 @@ class Worker:
                 return False
             with self._registry_lock:
                 handle_id, digest, state = self._coerce_handle_state(handle_or_slot)
+                if state.target_namespace == "REMOTE_TASK_DISPATCHER":
+                    return False
                 cid = state.slot_id
                 if cid in self._pending_unregister_cids:
                     raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
@@ -1663,6 +2953,9 @@ class Worker:
         Raises:
           KeyError: handle was never registered.
         """
+        if isinstance(handle_or_slot, CallableHandle) and handle_or_slot.target_namespace == "REMOTE_TASK_DISPATCHER":
+            self._unregister_remote_handle(handle_or_slot)
+            return
         if self._pre_start_unregister_if_needed(handle_or_slot):
             return
         target = None
@@ -1723,6 +3016,56 @@ class Worker:
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
+
+    def _unregister_remote_handle(self, handle: CallableHandle) -> None:
+        worker_ids: tuple[int, ...]
+        kind: str
+        digest: bytes
+        remove_state = False
+        with self._registry_lock:
+            _handle_id, digest, state = self._coerce_handle_state(handle)
+            if digest in self._pending_remote_unregister_hashids:
+                raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: remote callable handle already pending unregister")
+            self._live_handles.pop(handle._handle_id, None)
+            state.ref_count -= 1
+            if state.ref_count > 0:
+                return
+            self._pending_remote_unregister_hashids.add(digest)
+            worker_ids = state.eligible_worker_ids
+            kind = state.kind
+            remove_state = True
+
+        errors: list[str] = []
+        try:
+            if self._initialized:
+                self._start_hierarchical()
+                assert self._worker is not None
+                for worker_id in worker_ids:
+                    try:
+                        result = self._worker.remote_unregister(
+                            worker_id,
+                            "REMOTE_TASK_DISPATCHER",
+                            kind,
+                            digest,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(self._format_remote_control_exception(worker_id, exc))
+                        continue
+                    if not result.ok:
+                        errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
+                if errors:
+                    with self._registry_lock:
+                        self._uncertain_hashids.add(digest)
+                    sys.stderr.write(
+                        f"Worker.unregister(hash={_format_digest(digest)}): remote cleanup uncertain on "
+                        f"{len(errors)} remote workers. First error: {errors[0]}\n"
+                    )
+                    sys.stderr.flush()
+        finally:
+            with self._registry_lock:
+                if remove_state:
+                    self._identity_registry.pop(digest, None)
+                self._pending_remote_unregister_hashids.discard(digest)
 
     def _unregister_child_digest(self, *, digest: bytes) -> None:
         target = None
@@ -1813,12 +3156,12 @@ class Worker:
             )
             sys.stderr.flush()
 
-    def add_worker(self, worker: "Worker") -> None:
+    def add_worker(self, worker: Worker) -> int:
         """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
 
         The child Worker must NOT be init'd — init happens inside the forked
         child process (so the child's own children are forked in the right
-        process tree).
+        process tree). Returns this child's stable NEXT_LEVEL worker id.
         """
         if self.level < 4:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
@@ -1828,7 +3171,10 @@ class Worker:
             raise RuntimeError("Worker.add_worker() must be called before init()")
         if worker._initialized:
             raise RuntimeError("Child worker must not be initialized before add_worker()")
+        worker_id = self._allocate_next_level_worker_id()
         self._next_level_workers.append(worker)
+        self._next_level_worker_ids.append(worker_id)
+        return worker_id
 
     # ------------------------------------------------------------------
     # init — auto-discovery
@@ -1838,12 +3184,16 @@ class Worker:
         if self._initialized:
             raise RuntimeError("Worker already initialized")
 
-        if self.level == 2:
-            self._init_level2()
-        elif self.level >= 3:
-            self._init_hierarchical()
-        else:
-            raise ValueError(f"Worker: level {self.level} not supported")
+        try:
+            if self.level == 2:
+                self._init_level2()
+            elif self.level >= 3:
+                self._init_hierarchical()
+            else:
+                raise ValueError(f"Worker: level {self.level} not supported")
+        except BaseException:
+            self._cleanup_partial_init()
+            raise
 
         self._initialized = True
 
@@ -1865,7 +3215,7 @@ class Worker:
         assert self._chip_worker is not None
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
-                self._chip_worker._prepare_callable_at_slot(cid, target)
+                self._chip_worker._register_callable_at_slot(cid, target)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -1920,6 +3270,34 @@ class Worker:
         else:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
+        opened_remote_sessions: list[_RemoteSession] = []
+        try:
+            for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
+                session_id = uuid.uuid4().int & ((1 << 63) - 1)
+                if session_id == 0:
+                    session_id = 1
+                timeout_s = self._remote_session_timeout_s()
+                session = self._open_remote_session(
+                    spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
+                )
+                opened_remote_sessions.append(session)
+                assert self._worker is not None
+                self._worker.add_remote_l3_socket(
+                    worker_id,
+                    session_id,
+                    spec.transport,
+                    session.command_host,
+                    session.command_port,
+                    session.health_host,
+                    session.health_port,
+                    timeout_s,
+                )
+                self._remote_sessions.append(session)
+                opened_remote_sessions.pop()
+        except BaseException:
+            self._close_remote_sessions(opened_remote_sessions)
+            raise
+
         self._hierarchical_started = False
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
@@ -1954,7 +3332,7 @@ class Worker:
                     assert buf is not None
                     registry, identity_table, identity_refs = _make_local_identity_tables(
                         identity_snapshot,
-                        callable_kind="PYTHON_SERIALIZED",
+                        callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
                         target_namespace="LOCAL_PYTHON",
                     )
                     _sub_worker_loop(buf, registry, identity_table, identity_refs)
@@ -1981,10 +3359,10 @@ class Worker:
                                 callable_kind="CHIP_CALLABLE",
                                 target_namespace="LOCAL_CHIP",
                             ),
-                            chip_log_level,
-                            chip_log_info_v,
-                            str(self._config["platform"]),
-                            str(self._config["runtime"]),
+                            log_level=chip_log_level,
+                            log_info_v=chip_log_info_v,
+                            platform=str(self._config["platform"]),
+                            runtime=str(self._config["runtime"]),
                         )
                         os._exit(0)
                     else:
@@ -2022,7 +3400,7 @@ class Worker:
                     inner_worker.init()
                     registry, identity_table, identity_refs = _make_local_identity_tables(
                         identity_snapshot,
-                        callable_kind="PYTHON_SERIALIZED",
+                        callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
                         target_namespace="LOCAL_PYTHON",
                     )
                     _child_worker_loop(buf, registry, identity_table, identity_refs, inner_worker)
@@ -2042,8 +3420,11 @@ class Worker:
                     dw.add_next_level_worker(_mailbox_addr(shm))
 
             # Register Worker children as NEXT_LEVEL (L4+)
-            for shm in self._next_level_shms:
-                dw.add_next_level_worker(_mailbox_addr(shm))
+            if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
+                raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
+            for idx, shm in enumerate(self._next_level_shms):
+                worker_id = self._next_level_worker_ids[idx]
+                dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
 
             for shm in self._sub_shms:
                 dw.add_sub_worker(_mailbox_addr(shm))
@@ -2124,14 +3505,199 @@ class Worker:
         self._chip_shms.clear()
         self._next_level_shms.clear()
 
+    def _cleanup_partial_init(self) -> None:
+        """Best-effort cleanup for init() failures before the Worker is public-live."""
+
+        try:
+            self._release_active_remote_slot_refs()
+        except BaseException:  # noqa: BLE001
+            pass
+
+        remote_sessions = list(self._remote_sessions)
+        if self._worker is not None:
+            try:
+                self._worker.close()
+            except BaseException:  # noqa: BLE001
+                pass
+        self._close_remote_sessions(remote_sessions)
+        if self._chip_worker is not None:
+            try:
+                self._chip_worker.finalize()
+            except BaseException:  # noqa: BLE001
+                pass
+            self._chip_worker = None
+
+        self._remote_sessions.clear()
+        self._abort_hierarchical()
+        self._hierarchical_started = False
+        self._comm_base_ready = False
+        self._initialized = False
+        with self._hierarchical_start_cv:
+            if self._hierarchical_start_state != "started":
+                self._hierarchical_start_state = "not_started"
+            self._hierarchical_start_cv.notify_all()
+
     @property
-    def live_domains(self) -> dict[str, "CommDomainHandle"]:
+    def live_domains(self) -> dict[str, CommDomainHandle]:
         """Read-only snapshot of currently-live dynamic CommDomain handles.
 
         Useful for debugging.  Mutating the returned dict has no effect; use
         ``handle.release()`` or ``orch.release_domain(handle)`` to free.
         """
         return dict(self._live_domains)
+
+    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
+        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
+
+        return L3L2OrchCommClient(shm)
+
+    def _ensure_l3_l2_orch_comm(self, worker_id: int):
+        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
+
+        if self.level < 3:
+            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires Worker.init()")
+        device_ids = self._config.get("device_ids", [])
+        if worker_id < 0 or worker_id >= len(device_ids):
+            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+        if worker_id in self._l3_l2_orch_comm_ready:
+            return self._l3_l2_orch_comm_clients[worker_id]
+
+        chip_shm = self._chip_shms[worker_id]
+        assert chip_shm.buf is not None
+        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
+        if state != _IDLE:
+            raise RuntimeError(
+                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
+                "the L3-L2 service is not ready"
+            )
+
+        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
+        try:
+            client = self._make_l3_l2_orch_comm_client(control_shm)
+            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
+        except Exception:
+            try:
+                control_shm.close()
+                control_shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._l3_l2_orch_comm_shms[worker_id] = control_shm
+        self._l3_l2_orch_comm_clients[worker_id] = client
+        self._l3_l2_orch_comm_ready.add(worker_id)
+        return client
+
+    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
+        client = self._ensure_l3_l2_orch_comm(int(worker_id))
+        return client.submit(request, timeout_s)
+
+    def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
+        match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
+        if match is None:
+            return False
+        region_id = int(match.group(1))
+        if region_id == 0:
+            return False
+        poisoned = False
+        for region in self._live_l3_l2_regions:
+            if int(region.region_id) == region_id:
+                region._poison()
+                poisoned = True
+        return poisoned
+
+    def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
+        from .task_interface import Tensor  # noqa: PLC0415
+
+        if not isinstance(tensor, Tensor):
+            raise TypeError("L3-L2 host buffer registration expects a Tensor")
+        if tensor.child_memory:
+            raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        if not tensor.is_contiguous:
+            raise ValueError("L3-L2 payload buffer must be contiguous")
+        base = int(tensor.data)
+        nbytes = int(tensor.nbytes())
+        if base <= 0 or nbytes <= 0:
+            return
+        self._l3_l2_orch_comm_host_buffers[base] = max(
+            int(self._l3_l2_orch_comm_host_buffers.get(base, 0)),
+            nbytes,
+        )
+
+    def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
+        from .task_interface import Tensor  # noqa: PLC0415
+
+        if not isinstance(tensor, Tensor):
+            raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
+        if tensor.child_memory:
+            raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        if not tensor.is_contiguous:
+            raise ValueError("L3-L2 payload buffer must be contiguous")
+        base = int(tensor.data)
+        nbytes = int(tensor.nbytes())
+        if base <= 0 or nbytes <= 0:
+            raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
+        registered_nbytes = self._l3_l2_orch_comm_host_buffers.get(base)
+        if registered_nbytes is None:
+            raise ValueError("L3-L2 payload Tensor is not registered; use a tensor returned by orch.alloc(...)")
+        if nbytes > int(registered_nbytes):
+            raise ValueError(
+                f"L3-L2 payload Tensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
+            )
+
+    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
+        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
+
+        if payload_bytes <= 0:
+            raise ValueError("create_l3_l2_region: payload_bytes must be positive")
+        if counter_bytes <= 0 or counter_bytes % 4 != 0:
+            raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
+        response = self._l3_l2_orch_comm_submit(
+            int(worker_id),
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.ALLOC_REGION,
+                payload_bytes=int(payload_bytes),
+                counter_bytes=int(counter_bytes),
+            ),
+            timeout_s=5.0,
+        )
+        if response.status != 0 or response.desc is None:
+            raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
+        region = L3L2OrchRegion(self, int(worker_id), response.desc)
+        self._live_l3_l2_regions.append(region)
+        return region
+
+    def _cleanup_l3_l2_regions(self) -> None:
+        if not self._live_l3_l2_regions:
+            return
+        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest  # noqa: PLC0415
+
+        regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
+        for region in regions:
+            try:
+                if region._worker_id in self._l3_l2_orch_comm_ready:
+                    self._l3_l2_orch_comm_submit(
+                        region._worker_id,
+                        L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
+                        timeout_s=5.0,
+                    )
+            finally:
+                region._expire()
+
+    def _close_l3_l2_orch_comm(self) -> None:
+        self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_clients.clear()
+        self._l3_l2_orch_comm_ready.clear()
+        self._l3_l2_orch_comm_host_buffers.clear()
+        for shm in self._l3_l2_orch_comm_shms.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        self._l3_l2_orch_comm_shms.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
@@ -2219,7 +3785,7 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         for w in workers:
             if w < 0 or w >= len(device_ids):
-                raise ValueError(f"allocate_domain: worker index {w} outside [0, {len(device_ids)})")
+                raise ValueError(f"allocate_domain: worker_id {w} outside [0, {len(device_ids)})")
         if window_size <= 0:
             raise ValueError("allocate_domain: window_size must be positive")
         buffer_names = [b.name for b in buffers]
@@ -2430,7 +3996,7 @@ class Worker:
         *,
         workers: tuple[int, ...],
         request_shms: dict[int, SharedMemory],
-        reply_shms: Optional[dict[int, SharedMemory]],
+        reply_shms: dict[int, SharedMemory] | None,
         op: str,
         allocation_id: int,
     ) -> None:
@@ -2555,10 +4121,352 @@ class Worker:
         self._orch.copy_from(worker_id, dst, src, size)
 
     # ------------------------------------------------------------------
+    # Post-fork zero-copy host buffers
+    # ------------------------------------------------------------------
+
+    def import_ipc_all(self, device_key_map: dict[int, bytes]) -> dict[int, int]:
+        """Import one external ACL IPC allocation in every chip child.
+
+        ``device_key_map`` is keyed by physical device id.  Each 256-byte key is
+        imported inside the matching child ACL context with peer access enabled;
+        the returned map contains child-valid device VAs.  This is a zero-copy
+        ownership bridge: the exporter must keep every allocation alive until
+        this Worker is closed.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("import_ipc_all requires Worker.init()")
+        normalized = _normalize_ipc_device_key_map(device_key_map)
+        expected_devices = [int(device_id) for device_id in self._config.get("device_ids", [])]
+        if set(normalized) != set(expected_devices):
+            raise ValueError(
+                "import_ipc_all device map must exactly match Worker device_ids: "
+                f"expected={sorted(expected_devices)}, got={sorted(normalized)}"
+            )
+        device_ids = sorted(normalized)
+        reply = SharedMemory(
+            create=True,
+            size=_IPC_REPLY_HEADER.size + len(device_ids) * _IPC_REPLY_RECORD.size,
+        )
+        try:
+            reply_buf = reply.buf
+            assert reply_buf is not None
+            _IPC_REPLY_HEADER.pack_into(reply_buf, 0, len(device_ids))
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, 0)
+            payload = _encode_ipc_import_payload(reply.name, normalized)
+            results = self._worker.broadcast_control_all(
+                WorkerType.NEXT_LEVEL,
+                int(_CTRL_IMPORT_IPC),
+                payload,
+                None,
+                timeout_s=self._py_control_timeout_s,
+            )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"import_ipc_all failed on {len(errors)} chip children; first: {errors[0]}"
+                )
+            imported: dict[int, int] = {}
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                reply_device_id, va = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+                if reply_device_id != device_id or va <= 0:
+                    raise RuntimeError(
+                        "import_ipc_all received an invalid reply: "
+                        f"expected device={device_id}, got device={reply_device_id}, va=0x{va:x}"
+                    )
+                imported[device_id] = va
+            return imported
+        finally:
+            reply.close()
+            reply.unlink()
+
+    def create_host_buffer(self, nbytes: int) -> HostBuffer:
+        """Allocate a born-shared host buffer, attached into every chip child,
+        that a later ``run()`` reads/writes with **no per-run copy**.
+
+        L3 chip children are forked lazily on the first ``run()``; memory created
+        afterwards is not in their address space. This hands you memory that is
+        *born* in a shm already attached into every child, so there is nothing to
+        copy: the child reads and writes the same physical pages the parent sees.
+
+        Returns a :class:`HostBuffer` whose ``buffer`` is a ``memoryview`` over
+        that shm. Build a tensor over it with the buffer protocol, framework of
+        your choice, and pass it to ``run()`` as usual::
+
+            buf = worker.create_host_buffer(n * 4)
+            t = torch.frombuffer(buf.buffer, dtype=torch.float32, count=n)
+            t.uniform_(0, 1)                       # in place → lands in the shm
+            worker.run(orch(chip, t, out), args=None, config=CallConfig())
+            worker.free_host_buffer(buf)           # drop the tensor first
+
+        simpler stays framework-free: torch/numpy appear only on the user's side
+        (``frombuffer``). Blocks until every chip child has attached the buffer;
+        not thread-safe against a concurrent ``run`` / ``create`` / ``free`` on
+        the same Worker — drive them from one thread, as the L3 worker is
+        otherwise.
+        """
+        if self.level < 3:
+            raise TypeError("create_host_buffer requires a level >= 3 Worker")
+        if not self._initialized:
+            raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
+        self._start_hierarchical()
+        if not self._chip_shms:
+            raise RuntimeError("create_host_buffer requires forked chip children (none are configured)")
+        assert self._worker is not None
+
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            raise ValueError("create_host_buffer: nbytes must be positive")
+
+        # Create the shm up front, then guard everything after it — mapping the
+        # address (``_shm_base_addr``), reserving the registry slot, and the
+        # broadcast — under one ``try`` so any failure closes and unlinks the shm
+        # instead of leaking a /dev/shm segment. The registry mutation stays under
+        # ``_registry_lock`` (mirrors Worker.register's discipline); the slow
+        # broadcast runs *outside* the lock — wire-level concurrency is serialized
+        # at the C++ mailbox, not here. The born-shared shm's own mapped base is
+        # the buffer's data_ptr, so a tensor built over buffer.buffer resolves to
+        # this registered range.
+        shm = SharedMemory(create=True, size=nbytes)
+        token: int | None = None
+        data_ptr: int | None = None
+        try:
+            data_ptr = _shm_base_addr(shm)
+            with self._registry_lock:
+                token = self._host_buf_token_counter
+                self._host_buf_token_counter += 1
+                entry = _HostBufEntry(
+                    token=token,
+                    data_ptr=data_ptr,
+                    nbytes=nbytes,
+                    shm=shm,
+                    shm_name=shm.name,
+                    shm_base=data_ptr,
+                )
+                self._host_buf_registry[data_ptr] = entry
+                self._rebuild_host_buf_snapshot()
+
+            payload = _HOST_BUF_MAP_HEADER.pack(token, data_ptr, nbytes) + shm.name.encode("utf-8")
+            results = self._worker.broadcast_control_all(
+                WorkerType.NEXT_LEVEL,
+                int(_CTRL_MAP_HOST),
+                payload,
+                None,
+                timeout_s=self._py_control_timeout_s,
+            )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"create_host_buffer: MAP_HOST failed on {len(errors)} chip children; first error: {errors[0]}"
+                )
+        except BaseException:
+            # Roll back on any failure — a staging error before the map, a partial
+            # map, or an exception from the broadcast itself (any of which would
+            # otherwise leak the shm): unmap any child that took it, drop the
+            # reservation, free the shm. No user view exists yet, so close() cannot
+            # be blocked by an exported buffer.
+            try:
+                if token is not None:
+                    self._broadcast_host_unmap(token)
+            except Exception as unmap_exc:  # noqa: BLE001 -- must not mask the original failure below
+                sys.stderr.write(
+                    f"[worker pid={os.getpid()}] WARN: create_host_buffer rollback UNMAP_HOST "
+                    f"failed (continuing best-effort): {unmap_exc}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                with self._registry_lock:
+                    if data_ptr is not None and self._host_buf_registry.pop(data_ptr, None) is not None:
+                        self._rebuild_host_buf_snapshot()
+                shm.close()
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+        buf_view = shm.buf
+        assert buf_view is not None
+        return HostBuffer(token=token, data_ptr=data_ptr, nbytes=nbytes, buffer=buf_view)
+
+    def free_host_buffer(self, handle: HostBuffer) -> None:
+        """Release a born-shared buffer created by ``create_host_buffer``.
+
+        Unmaps it from every chip child and frees the parent shm. Drop every
+        tensor / ``memoryview`` you built over ``handle.buffer`` *first*: a live
+        view keeps the shm's pages exported, so ``close()`` cannot release them
+        and the buffer only warns (and is reclaimed once the last view is gone).
+
+        Best-effort and idempotent: a stale handle whose token no longer matches
+        (e.g. freed twice) is a silent no-op.
+        """
+        if not isinstance(handle, HostBuffer):
+            raise TypeError("free_host_buffer expects a HostBuffer from create_host_buffer")
+        with self._registry_lock:
+            entry = self._host_buf_registry.get(handle.data_ptr)
+            if entry is None or entry.token != handle.token:
+                return
+            self._host_buf_registry.pop(handle.data_ptr, None)
+            self._rebuild_host_buf_snapshot()
+        errors: list[str] = []
+        try:
+            if self._worker is not None and getattr(self, "_hierarchical_started", False):
+                errors = self._broadcast_host_unmap(entry.token)
+        except Exception as exc:  # noqa: BLE001
+            errors = [str(exc)]
+        finally:
+            close_warn = self._close_host_shm(entry)
+            if close_warn:
+                errors.append(close_warn)
+        if errors:
+            sys.stderr.write(
+                f"[worker pid={os.getpid()}] WARN: free_host_buffer token={entry.token} "
+                f"failed on {len(errors)} chip children; first error: {errors[0]}\n"
+            )
+            sys.stderr.flush()
+
+    @staticmethod
+    def _close_host_shm(entry: _HostBufEntry) -> str | None:
+        """Close + unlink a host-buffer's parent shm.
+
+        Returns a warning string (else ``None``) when a still-live view over a
+        zero-copy buffer blocks ``close()``: ``memoryview.release()`` raises
+        ``BufferError`` while a tensor built via ``frombuffer`` still holds the
+        pages exported. The name is unlinked regardless, so the OS reclaims the
+        segment once the user drops that last view.
+        """
+        warn: str | None = None
+        try:
+            entry.shm.close()
+        except BufferError:
+            warn = (
+                f"host buffer token={entry.token} still has a live view (a tensor/memoryview over "
+                f"buffer.buffer); drop it before free_host_buffer/close() to release the shm promptly"
+            )
+        try:
+            entry.shm.unlink()
+        except FileNotFoundError:
+            pass
+        return warn
+
+    def _release_all_host_buffers(self) -> None:
+        """Unmap + free every still-registered host buffer (called from close())."""
+        with self._registry_lock:
+            entries = list(self._host_buf_registry.values())
+            self._host_buf_registry.clear()
+            self._rebuild_host_buf_snapshot()
+        for entry in entries:
+            try:
+                if self._worker is not None and getattr(self, "_hierarchical_started", False):
+                    self._broadcast_host_unmap(entry.token)
+            except Exception as exc:  # noqa: BLE001
+                # A failed unmap broadcast must not strand the parent shm; log it
+                # (mirrors free_host_buffer) instead of swallowing silently.
+                sys.stderr.write(
+                    f"[worker pid={os.getpid()}] WARN: close() UNMAP_HOST token={entry.token} "
+                    f"failed (continuing best-effort): {exc}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                # Tolerates a still-live view over a zero-copy buffer at close():
+                # unlinks the name regardless so the OS reclaims it once dropped.
+                self._close_host_shm(entry)
+
+    def _broadcast_host_unmap(self, token: int) -> list[str]:
+        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every chip child."""
+        if self._worker is None:
+            return []
+        results = self._worker.broadcast_control_all(
+            WorkerType.NEXT_LEVEL,
+            int(_CTRL_UNMAP_HOST),
+            _HOST_BUF_UNMAP.pack(token),
+            None,
+            timeout_s=self._py_control_timeout_s,
+        )
+        return self._control_errors(list(results))
+
+    def _stage_host_buffers_for_chip_submit(self, args: Any) -> None:
+        """Validate the host tensors of one chip submit before dispatch.
+
+        Called from ``Orchestrator.submit_next_level`` on the LOCAL_CHIP path —
+        only there does the forked child dereference raw host pointers. Each host
+        tensor is either:
+
+        * inside a buffer from ``create_host_buffer`` → born-shared, so its bytes
+          already live in the child-visible shm and the child writes results back
+          into the same physical pages: nothing to copy. ``_find_host_buf_entry``
+          still validates the view fits inside the buffer (else the child would
+          read past its shm mapping);
+        * unregistered → forwarded unvalidated. A fork-inherited ``share_memory_``
+          tensor is the legitimate case; an unregistered post-fork tensor reads
+          stale/unmapped memory in the child — allocate it with
+          ``create_host_buffer`` instead.
+
+        The child rewrites in-range host pointers to its own mapping; see
+        _rewrite_blob_host_addrs.
+        """
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            if tensor.child_memory:
+                continue
+            addr = int(tensor.data)
+            if addr == 0:
+                continue
+            # Raises if an in-range view overruns its buffer; otherwise there is
+            # nothing to do — the born-shared bytes are already child-visible.
+            self._find_host_buf_entry(addr, int(tensor.nbytes()))
+
+    def _rebuild_host_buf_snapshot(self) -> None:
+        """Rebuild the lock-free read snapshot from the registry.
+
+        Caller must hold ``_registry_lock``. Rebinds ``_host_buf_snapshot`` to a
+        fresh ``(sorted_ptrs_tuple, registry_copy)`` pair so an in-flight
+        ``_find_host_buf_entry`` keeps reading the prior immutable snapshot until
+        the single atomic rebind swaps it — see ``_find_host_buf_entry``.
+        """
+        registry = dict(self._host_buf_registry)
+        self._host_buf_snapshot = (tuple(sorted(registry)), registry)
+
+    def _find_host_buf_entry(self, addr: int, nbytes: int) -> _HostBufEntry | None:
+        """Host buffer whose ``[data_ptr, data_ptr+nbytes)`` contains the whole
+        ``[addr, addr+nbytes)`` view, or None. Raises if a view starts inside a
+        buffer but runs past its end (would read past the shm in the child).
+
+        Host buffers are distinct, non-overlapping allocations, so the only
+        candidate for ``addr`` is the entry with the greatest base ``<= addr`` —
+        found by bisecting the snapshot's sorted keys so this stays log-time on
+        the per-submit hot path rather than scanning every buffer.
+
+        Sub-view matching assumes the blob's ``Tensor.buffer.addr`` is the
+        contiguous base of the host buffer (``make_tensor_arg`` builds tensors with
+        ``start_offset == 0``); a non-zero ``start_offset`` would shift ``addr``
+        and is not modelled here.
+        """
+        # Load the immutable snapshot once: sorted keys and the dict they index
+        # into are captured together, so a concurrent create/free (which rebinds a
+        # fresh snapshot) cannot mutate what we bisect and index here — no lock, no
+        # IndexError from a shrinking list, no torn key/dict pairing.
+        sorted_ptrs, registry = self._host_buf_snapshot
+        idx = bisect.bisect_right(sorted_ptrs, addr) - 1
+        if idx < 0:
+            return None
+        entry = registry.get(sorted_ptrs[idx])
+        if entry is None or addr >= entry.data_ptr + entry.nbytes:
+            return None
+        if addr + nbytes > entry.data_ptr + entry.nbytes:
+            raise RuntimeError(
+                f"Host tensor 0x{addr:x} (+{nbytes} B) overruns its host buffer "
+                f"0x{entry.data_ptr:x} (+{entry.nbytes} B); create a buffer at least as large."
+            )
+        return entry
+
+    # ------------------------------------------------------------------
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, callable, args=None, config=None) -> RunTiming:
+    def run(self, callable, args=None, config=None) -> None:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
         Dispatch:
@@ -2571,12 +4479,12 @@ class Worker:
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
 
-        Returns a :class:`RunTiming` with ``host_wall_us`` (Python wall-clock
-        around the dispatch) and ``device_wall_us`` (on-NPU orchestrator wall,
-        populated whenever the runtime was built with ``PTO2_PROFILING`` —
-        the default build has it on). For L3+ DAGs, ``host_wall_us`` covers
-        the whole orch fn and ``device_wall_us`` is unset (0) — per-task
-        device timings are not aggregated here.
+        Returns ``None``. Per-stage run timing (host wall, on-NPU device wall +
+        AICPU phase breakdown) is no longer returned — the platform emits it as
+        ``[STRACE]`` log markers from each L2 ``simpler_run``, so the L3
+        dispatcher and its L2 children are observed uniformly. Parse the markers
+        with ``simpler_setup.tools.strace_timing`` (see
+        ``docs/dfx/host-trace.md``).
         """
         assert self._initialized, "Worker not initialized; call init() first"
         cfg = config if config is not None else CallConfig()
@@ -2584,7 +4492,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            return self._chip_worker._run_slot(state.slot_id, args, cfg)
+            self._chip_worker._run_slot(state.slot_id, args, cfg)
+            return None
 
         self._start_hierarchical()
         assert self._orch is not None
@@ -2595,7 +4504,6 @@ class Worker:
         # poked it.
         self._orch._clear_error()
         self._orch._scope_begin()
-        t_start = time.perf_counter_ns()
         try:
             callable(self._orch, args, cfg)
         finally:
@@ -2617,16 +4525,24 @@ class Worker:
             # cleanup lives in a finally: a failed task must not strand
             # backend domain allocations into the next run.
             try:
-                self._orch._drain()
+                try:
+                    self._orch._drain()
+                except Exception as e:
+                    self._poison_l3_l2_region_from_endpoint_error(e)
+                    raise
             finally:
+                self._release_active_remote_slot_refs()
+                self._flush_pending_remote_frees()
+                try:
+                    self._cleanup_l3_l2_regions()
+                finally:
+                    self._l3_l2_orch_comm_host_buffers.clear()
                 self._execute_pending_domain_releases()
                 if self._live_domains:
                     self._release_all_live_domains()
-        # device_wall stays 0 for L3+: aggregating per-task device cycles
-        # across a DAG isn't implemented here (would need accumulation in the
-        # ring scheduler). Callers wanting per-task device wall should issue
-        # individual run calls.
-        return RunTiming(time.perf_counter_ns() - t_start, 0)
+        # L3+ returns None like every other worker level; per-L2-child timing
+        # is emitted as `[STRACE]` markers from each simpler_run.
+        return None
 
     @property
     def aicpu_dlopen_count(self) -> int:
@@ -2662,12 +4578,24 @@ class Worker:
         # Release any orch-allocated CommDomain handles before tearing down
         # the C++ scheduler.  Once `dw.close()` runs, the chip mailboxes
         # become unusable and we can no longer drive CTRL_RELEASE_DOMAIN.
+        self._cleanup_l3_l2_regions()
         if self._live_domains:
             self._release_all_live_domains()
+        try:
+            self._release_active_remote_slot_refs()
+            self._flush_pending_remote_frees()
+        except BaseException as exc:  # noqa: BLE001
+            sys.stderr.write(f"Worker.close(): remote buffer cleanup reported error (continuing): {exc}\n")
+            sys.stderr.flush()
+
+        # Release any host buffers the user never unregistered. Must run while
+        # the chip mailboxes are still usable (before _worker.close()).
+        self._release_all_host_buffers()
 
         if self.level == 2:
             if self._chip_worker:
                 self._chip_worker.finalize()
+                self._chip_worker = None
         else:
             if self._worker:
                 self._worker.close()
@@ -2709,6 +4637,7 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
+            self._close_l3_l2_orch_comm()
             self._sub_shms.clear()
             self._sub_pids.clear()
             self._chip_shms.clear()
@@ -2716,10 +4645,23 @@ class Worker:
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
+            self._next_level_worker_ids.clear()
+
+        # Drop the Worker-held references to registered callables. These dicts
+        # pin ChipCallable/CoreCallable nanobind instances (and, via identity
+        # state, their payloads); if a closed Worker is kept alive past
+        # interpreter exit — e.g. a failing test's traceback pins the frame's
+        # `worker` local — any surviving instance prevents nanobind from
+        # unloading its module and triggers a leak dump at shutdown. Guard with
+        # _registry_lock, mirroring every other mutation of these three dicts.
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
 
         self._initialized = False
 
-    def __enter__(self) -> "Worker":
+    def __enter__(self) -> Worker:
         return self
 
     def __exit__(self, *_: Any) -> None:

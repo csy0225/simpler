@@ -66,12 +66,15 @@ struct L2SwimlaneAicoreLocalState {
  *
  * Race avoidance: AICPU rotates strictly before `write_reg(DATA_MAIN_BASE)`
  * for the first task of a new BUFFER_SIZE batch — driven by AICPU's own
- * per-core dispatch count (no AICore-side signal). The runtime's
- * completion-before-dispatch invariant (AICore per core is single-threaded
- * and AICPU does not dispatch task K+1 until K FIN'd) guarantees all prior
- * tasks have FIN'd at rotation time, so AICore has already finished writing
- * their records and dcci'd them out before AICPU enqueues the old buffer to
- * the ready queue.
+ * per-core dispatch count (no AICore-side signal). At rotation AICPU only
+ * publishes the new buffer; it does NOT hand the old buffer to the host there.
+ * The completion-before-dispatch invariant proves all prior tasks FIN'd, but
+ * this runtime writes FIN before the record below, so a FIN-gated release could
+ * publish a buffer whose tail record's `dcci(record, CACHELINE_OUT) + dsb` has
+ * not landed. AICPU instead releases the old buffer once it observes AICore ACK
+ * the new buffer's first task (l2_swimlane_aicpu_on_aicore_ack): by this core's
+ * single-threaded program order that ACK is emitted only after the previous
+ * task's record dcci+dsb, so the old buffer's last record is guaranteed drained.
  *
  * @param head            Per-core L2SwimlaneActiveHead channel. The executor
  *                        resolves it right after Phase 1 handshake exit
@@ -97,12 +100,20 @@ struct L2SwimlaneAicoreLocalState {
  *                        the same core — each dispatch needs its own AICore
  *                        record matched to its own AICPU record, which
  *                        task_token_raw alone cannot disambiguate.
- * @param start_time      Start timestamp (get_sys_cnt)
+ * @param receive_time    Timestamp captured immediately after `read_reg(DATA_MAIN_BASE)`
+ *                        returns the new task_id (before dcci+ack). Stored as a
+ *                        32-bit delta `start_time - receive_time` in the record;
+ *                        host recovers `receive_time = start_time - delta`.
+ *                        Lets DFX split head_OH into the unfixable
+ *                        AICPU→AICore NoC propagation (dispatch_ts → receive_time)
+ *                        and the AICore-local dcci+ack cost (receive_time → start_time).
+ * @param start_time      Start timestamp (get_sys_cnt) — post-dcci+ack, just
+ *                        before kernel `execute_task`.
  * @param end_time        End timestamp
  */
 __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_record_task(
     __gm__ L2SwimlaneActiveHead *head, L2SwimlaneAicoreLocalState *local, uint64_t task_token_raw, uint32_t reg_task_id,
-    uint64_t start_time, uint64_t end_time
+    uint64_t receive_time, uint64_t start_time, uint64_t end_time
 ) {
     // Re-fetch head channel each task; cheap relative to the
     // baseline `dcci(payload, ENTIRE_DATA_CACHE)` we already pay per task.
@@ -132,6 +143,9 @@ __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_
     record->end_time = end_time;
     record->task_token_raw = task_token_raw;
     record->reg_task_id = reg_task_id;
+    // 32-bit delta; receive_time always precedes start_time on the same core
+    // (sys_cnt is monotonic per AICore), so the subtraction can never wrap.
+    record->receive_to_start_cycles = static_cast<uint32_t>(start_time - receive_time);
     local->slot_within_buf = slot + 1;
 
     // Flush record to GM so host can read it after the buffer is enqueued.

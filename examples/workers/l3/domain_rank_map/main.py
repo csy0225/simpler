@@ -43,10 +43,10 @@ from simpler.task_interface import (  # noqa: E402
     ChipCallable,
     ChipDomainContext,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -89,7 +89,7 @@ def _scratch_buffers() -> list[CommBufferSpec]:
 def build_allreduce_callable(platform: str) -> ChipCallable:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
     kernel_bytes = kc.compile_incore(
@@ -118,7 +118,7 @@ def build_allreduce_callable(platform: str) -> ChipCallable:
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
     args.add_tensor(
-        ContinuousTensor.make(
+        Tensor.make(
             data=domain.buffer_ptrs["scratch"],
             shapes=(COUNT,),
             dtype=DataType.FLOAT32,

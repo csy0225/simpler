@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -49,15 +50,18 @@ static inline void account_dropped_records(DumpBufferState *state, uint32_t drop
     state->dropped_record_count = (next < prev) ? UINT32_MAX : next;
 }
 
-extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dump_base = dump_data_base; }
-
-extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
+static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
 
 static bool g_enable_dump_args = false;
 // Dump level latched from the header in dump_args_init(). The selective
 // (PARTIAL) and json-only (FULL_JSON_ONLY) modes are derived from it rather
 // than tracked as separate flags — mirrors g_l2_swimlane_level.
 static DumpTensorLevel g_dump_args_level = DumpTensorLevel::OFF;
+
+extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dump_base = dump_data_base; }
+
+extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
+
 struct DumpTaskMaskEntry {
     uint64_t task_id;
     TensorDumpArgMask mask;
@@ -341,35 +345,90 @@ bool try_log_dump_args_layout_mismatch() {
 /**
  * Enqueue a full dump metadata buffer to the thread's ready queue.
  */
-static int enqueue_dump_ready_buffer(int thread_idx, uint64_t buffer_ptr, uint32_t buffer_seq) {
-    uint32_t capacity = PLATFORM_DUMP_READYQUEUE_SIZE;
-    uint32_t current_tail = s_dump_header->queue_tails[thread_idx];
-    uint32_t current_head = s_dump_header->queue_heads[thread_idx];
+struct DumpDeviceModule {
+    struct Context {
+        DumpDataHeader *header;
+        int thread_idx;
+    };
 
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    if (next_tail == current_head) {
-        return -1;  // Queue full
+    using DataHeader = DumpDataHeader;
+    using State = DumpBufferState;
+    using FreeQueue = DumpFreeQueue;
+    using Buffer = DumpMetaBuffer;
+
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_DUMP_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_DUMP_SLOT_COUNT;
+    static constexpr uint64_t kBackpressureWaitCycles = kDumpQueueBackpressureWaitCycles;
+
+    static DataHeader *header(Context ctx) { return ctx.header; }
+    static int ready_thread(Context ctx) { return ctx.thread_idx; }
+    static FreeQueue *free_queue(State *state) { return &state->free_queue; }
+
+    static uint64_t current_ptr(State *state) { return state->current_buf_ptr; }
+    static void set_current_ptr(State *state, uint64_t ptr) { state->current_buf_ptr = ptr; }
+    static uint32_t current_seq(State *state) { return state->current_buf_seq; }
+    static void set_current_seq(State *state, uint32_t seq) { state->current_buf_seq = seq; }
+
+    static uint32_t count(Buffer *buffer) { return buffer->count; }
+    static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
+
+    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        ctx.header->queues[ctx.thread_idx][tail].thread_index = static_cast<uint32_t>(ctx.thread_idx);
+        ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    s_dump_header->queues[thread_idx][current_tail].thread_index = static_cast<uint32_t>(thread_idx);
-    s_dump_header->queues[thread_idx][current_tail].buffer_ptr = buffer_ptr;
-    s_dump_header->queues[thread_idx][current_tail].buffer_seq = buffer_seq;
-    wmb();
-    s_dump_header->queue_tails[thread_idx] = next_tail;
-    wmb();
+    static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
+    static void on_pop_success(Context ctx, State *, Buffer *buffer) { s_current_dump_buf[ctx.thread_idx] = buffer; }
+    static void on_current_cleared(Context ctx, State *) { s_current_dump_buf[ctx.thread_idx] = nullptr; }
+    static void on_null_free_slot(Context, State *) {}
 
-    return 0;
+    static void on_enqueue_failed(Context ctx, State *, Buffer *) {
+        if (!s_logged_ready_queue_full[ctx.thread_idx]) {
+            s_logged_ready_queue_full[ctx.thread_idx] = true;
+            LOG_WARN(
+                "Args dump ready queue full on thread %d after bounded wait, "
+                "dropping current metadata buffer. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
+                ctx.thread_idx
+            );
+        }
+    }
+
+    static void on_no_replacement(Context ctx, State *) {
+        if (!s_logged_no_free_meta_buffer[ctx.thread_idx]) {
+            s_logged_no_free_meta_buffer[ctx.thread_idx] = true;
+            LOG_WARN(
+                "Args dump published a full metadata buffer on thread %d but no replacement was available; "
+                "records will drop until recovery. Increase PLATFORM_DUMP_BUFFERS_PER_THREAD.",
+                ctx.thread_idx
+            );
+        }
+    }
+
+    static void on_switch_complete(Context ctx, State *, Buffer *) { s_buffers_switched[ctx.thread_idx]++; }
+};
+
+using DumpEngine = profiling_device::DeviceProfilerEngine<DumpDeviceModule>;
+
+static DumpDeviceModule::Context dump_context(int thread_idx) {
+    return DumpDeviceModule::Context{s_dump_header, thread_idx};
+}
+
+static int enqueue_dump_ready_buffer(int thread_idx, uint64_t buffer_ptr, uint32_t buffer_seq) {
+    return DumpEngine::enqueue_ready(dump_context(thread_idx), buffer_ptr, buffer_seq);
+}
+
+static DumpMetaBuffer *try_pop_dump_meta_buffer(int thread_idx, DumpBufferState *state, uint32_t next_seq) {
+    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS || state == nullptr) {
+        return nullptr;
+    }
+    return DumpEngine::pop_free(dump_context(thread_idx), state, next_seq);
 }
 
 /**
- * Maximum spin-wait iterations when free_queue or ready_queue is exhausted.
- * Gives host mgmt_loop time to replenish before falling back to buffer overwrite.
- */
-static constexpr uint32_t DUMP_SPIN_WAIT_LIMIT = 1000000;
-
-/**
- * Switch metadata buffer: enqueue the full buffer, pop a new one.
- * Spin-waits briefly for host to replenish before falling back to overwrite.
+ * Switch metadata buffer: enqueue the full buffer first, then pop a new one.
+ * If no replacement is available, later records drop until host replenishes
+ * free_queue.
  */
 static int switch_dump_meta_buffer(int thread_idx) {
     if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
@@ -380,80 +439,7 @@ static int switch_dump_meta_buffer(int thread_idx) {
     if (state == nullptr || cur == nullptr) {
         return -1;
     }
-
-    // Spin-wait for a free buffer, giving host mgmt_loop time to replenish
-    rmb();
-    uint32_t head = state->free_queue.head;
-    uint32_t tail = state->free_queue.tail;
-    if (head == tail) {
-        for (uint32_t spin = 0; spin < DUMP_SPIN_WAIT_LIMIT; spin++) {
-            rmb();
-            head = state->free_queue.head;
-            tail = state->free_queue.tail;
-            if (head != tail) {
-                break;
-            }
-        }
-    }
-    if (head == tail) {
-        // Still empty after spin — overwrite current buffer
-        account_dropped_records(state, cur->count);
-        cur->count = 0;
-        wmb();
-        if (!s_logged_no_free_meta_buffer[thread_idx]) {
-            s_logged_no_free_meta_buffer[thread_idx] = true;
-            LOG_WARN(
-                "Args dump ran out of free metadata buffers on thread %d after spin-wait, "
-                "overwriting current buffer. Increase PLATFORM_DUMP_BUFFERS_PER_THREAD.",
-                thread_idx
-            );
-        }
-        return 0;
-    }
-
-    // Enqueue the full buffer (spin-wait if ready queue is full)
-    uint64_t buf_addr = reinterpret_cast<uint64_t>(cur);
-    uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_dump_ready_buffer(thread_idx, buf_addr, seq);
-    if (rc != 0) {
-        for (uint32_t spin = 0; spin < DUMP_SPIN_WAIT_LIMIT; spin++) {
-            rmb();
-            rc = enqueue_dump_ready_buffer(thread_idx, buf_addr, seq);
-            if (rc == 0) {
-                break;
-            }
-        }
-    }
-    if (rc != 0) {
-        // Still full after spin — overwrite current buffer
-        account_dropped_records(state, cur->count);
-        cur->count = 0;
-        wmb();
-        if (!s_logged_ready_queue_full[thread_idx]) {
-            s_logged_ready_queue_full[thread_idx] = true;
-            LOG_WARN(
-                "Args dump ready queue full on thread %d after spin-wait, "
-                "overwriting current buffer. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
-                thread_idx
-            );
-        }
-        return 0;
-    }
-
-    // Pop next buffer from free_queue
-    uint64_t new_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_DUMP_SLOT_COUNT];
-    rmb();
-    state->free_queue.head = head + 1;
-
-    DumpMetaBuffer *new_buf = reinterpret_cast<DumpMetaBuffer *>(new_ptr);
-    new_buf->count = 0;
-    s_current_dump_buf[thread_idx] = new_buf;
-    state->current_buf_ptr = new_ptr;
-    state->current_buf_seq = seq + 1;
-    wmb();
-
-    s_buffers_switched[thread_idx]++;
-
+    DumpEngine::switch_buffer(dump_context(thread_idx), state);
     return 0;
 }
 
@@ -588,17 +574,8 @@ void dump_args_init(int num_dump_threads) {
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
         if (head != tail) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_DUMP_SLOT_COUNT];
-            rmb();
-            state->free_queue.head = head + 1;
-            wmb();
-
-            DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(buf_ptr);
-            buf->count = 0;
-            s_current_dump_buf[t] = buf;
-            state->current_buf_ptr = buf_ptr;
-            state->current_buf_seq = 0;
-            wmb();
+            (void)try_pop_dump_meta_buffer(t, state, 0);
+            uint64_t buf_ptr = state->current_buf_ptr;
             LOG_DEBUG("Thread %d: popped initial dump buffer (addr=0x%lx)", t, buf_ptr);
         } else {
             LOG_ERROR("Thread %d: dump free_queue is empty during init!", t);
@@ -625,7 +602,11 @@ int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
     DumpBufferState *state = s_dump_states[thread_idx];
     DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
     if (buf == nullptr) {
-        return -1;
+        buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
+        if (buf == nullptr) {
+            account_dropped_records(state, 1);
+            return -1;
+        }
     }
 
     // Switch metadata buffer if full
@@ -635,7 +616,11 @@ int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
         }
         buf = s_current_dump_buf[thread_idx];
         if (buf == nullptr) {
-            return -1;
+            buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
+            if (buf == nullptr) {
+                account_dropped_records(state, 1);
+                return -1;
+            }
         }
     }
 
@@ -688,6 +673,13 @@ int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
     rec->scalar_value = is_scalar ? info.scalar_value : 0;
     rec->kind = info.kind;
     rec->flags = info.flags;
+    // kernel_id is bounded by RUNTIME_MAX_FUNC_ID (1024), far below the 0xFFFF
+    // "unknown" sentinel, so this narrowing is lossless and never collides.
+    // func_ids carries the task's active-subtask set (its mix membership).
+    rec->func_count = static_cast<uint8_t>(info.func_count);
+    for (int32_t i = 0; i < info.func_count && i < TENSOR_DUMP_MAX_FUNC_IDS; i++) {
+        rec->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);  // -1 -> 0xFFFF (unknown)
+    }
     rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         rec->shapes[d] = info.shapes[d];

@@ -13,6 +13,7 @@
 
 #include <dlfcn.h>
 
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -78,8 +79,8 @@ void ChipWorker::init(
     // those globals. The Python `ChipWorker` wrapper does this preload.
     //
     // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
-    // identically-named symbols (simpler_init, prepare_callable,
-    // run_prepared, etc.) do not collide when switching runtimes within the
+    // identically-named symbols (simpler_init, simpler_register_callable,
+    // simpler_run, etc.) do not collide when switching runtimes within the
     // same process.
     // Cross-runtime isolation relies on -fno-gnu-unique (#453) allowing
     // dlclose to actually unload the previous runtime's SO before loading
@@ -102,12 +103,14 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
-        prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
-        run_prepared_fn_ = load_symbol<RunPreparedFn>(handle, "run_prepared");
-        unregister_callable_fn_ = load_symbol<UnregisterCallableFn>(handle, "unregister_callable");
+        register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
+        run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        l3_l2_orch_comm_init_fn_ = load_symbol<L3L2OrchCommInitFn>(handle, "l3_l2_orch_comm_init_ctx");
+        l3_l2_orch_comm_shutdown_fn_ = load_symbol<L3L2OrchCommShutdownFn>(handle, "l3_l2_orch_comm_shutdown_ctx");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
         // have a real backend (today: a5) ship not-supported stubs rather
@@ -147,7 +150,7 @@ void ChipWorker::init(
     // of the executor binaries to the DeviceRunner, and (onboard) sync CANN
     // dlog from HostLogger. Subsequent device-ops re-attach their caller
     // threads idempotently against the recorded device id; subsequent
-    // prepare_callable / run_prepared invocations reuse the cached binaries.
+    // register_callable / run invocations reuse the cached binaries.
     //
     // read_binary_file may throw — defer the dlsym/dlclose rollback to the
     // catch block so the buffers and any partially-resolved handle are torn
@@ -183,12 +186,14 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
-        prepare_callable_fn_ = nullptr;
-        run_prepared_fn_ = nullptr;
+        register_callable_fn_ = nullptr;
+        run_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        l3_l2_orch_comm_init_fn_ = nullptr;
+        l3_l2_orch_comm_shutdown_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -221,12 +226,14 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
-        prepare_callable_fn_ = nullptr;
-        run_prepared_fn_ = nullptr;
+        register_callable_fn_ = nullptr;
+        run_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        l3_l2_orch_comm_init_fn_ = nullptr;
+        l3_l2_orch_comm_shutdown_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -252,6 +259,9 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    if (device_ctx_ != nullptr && l3_l2_orch_comm_shutdown_fn_ != nullptr && initialized_) {
+        l3_l2_orch_comm_shutdown_fn_(device_ctx_);
+    }
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
         finalize_device_fn_(device_ctx_);
     }
@@ -270,12 +280,14 @@ void ChipWorker::finalize() {
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
-    prepare_callable_fn_ = nullptr;
-    run_prepared_fn_ = nullptr;
+    register_callable_fn_ = nullptr;
+    run_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    l3_l2_orch_comm_init_fn_ = nullptr;
+    l3_l2_orch_comm_shutdown_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -294,43 +306,38 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
+void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     if (callable == nullptr) {
-        throw std::runtime_error("prepare_callable: callable must not be null");
+        throw std::runtime_error("register_callable: callable must not be null");
     }
-    int rc = prepare_callable_fn_(device_ctx_, callable_id, callable);
+    int rc = register_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
-        throw std::runtime_error("prepare_callable failed with code " + std::to_string(rc));
+        throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
     }
 }
 
-RunTiming ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
     ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    return run(callable_id, &chip_storage, config);
+    run(callable_id, &chip_storage, config);
 }
 
-RunTiming ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
+void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
     void *rt = runtime_buf_.data();
-
-    PtoRunTiming timing{0, 0};
-    int rc = run_prepared_fn_(
-        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
-        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
-        config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
-        config.output_prefix, &timing
-    );
+    // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
+    // returned (see chip_worker.h::run). CallConfig is threaded through to the C
+    // ABI as a single pointer rather than unpacked into per-field args.
+    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
     if (rc != 0) {
-        throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));
+        throw std::runtime_error("run failed with code " + std::to_string(rc));
     }
-    return RunTiming{timing.host_wall_ns, timing.device_wall_ns};
 }
 
 void ChipWorker::unregister_callable(int32_t callable_id) {
@@ -493,6 +500,38 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::l3_l2_orch_comm_init(uint64_t control_block_addr, size_t control_block_size) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (control_block_addr == 0 || control_block_size == 0) {
+        throw std::runtime_error("l3_l2_orch_comm_init requires a non-null control block and nonzero size");
+    }
+    if (l3_l2_orch_comm_init_fn_ == nullptr) {
+        throw std::runtime_error("l3_l2_orch_comm_init is not supported by this runtime");
+    }
+    int rc = l3_l2_orch_comm_init_fn_(device_ctx_, reinterpret_cast<void *>(control_block_addr), control_block_size);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+        throw std::runtime_error("l3_l2_orch_comm_init is not supported by this platform/runtime");
+    }
+    if (rc != 0) {
+        throw std::runtime_error("l3_l2_orch_comm_init failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::l3_l2_orch_comm_shutdown() {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (l3_l2_orch_comm_shutdown_fn_ == nullptr) {
+        throw std::runtime_error("l3_l2_orch_comm_shutdown is not supported by this runtime");
+    }
+    int rc = l3_l2_orch_comm_shutdown_fn_(device_ctx_);
+    if (rc != 0) {
+        throw std::runtime_error("l3_l2_orch_comm_shutdown failed with code " + std::to_string(rc));
     }
 }
 

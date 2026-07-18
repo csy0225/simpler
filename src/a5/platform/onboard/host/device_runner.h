@@ -15,7 +15,6 @@
  * kernels on Ascend devices using CANN runtime APIs.
  *
  * Key Components:
- * - DeviceArgs: AICPU device argument structure
  * - KernelArgsHelper: Helper for managing kernel arguments with device memory
  * - DeviceRunner: kernel launching and execution
  */
@@ -40,7 +39,7 @@
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
 #include "device_runner_base.h"     // common DeviceRunnerBase
-#include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
+#include "device_runner_helpers.h"  // common KernelArgsHelper
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
@@ -56,7 +55,7 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "runtime.h"
 
-// DeviceArgs + KernelArgsHelper are defined in
+// KernelArgsHelper is defined in
 // src/common/platform/onboard/host/device_runner_helpers.h (included above).
 
 /**
@@ -106,7 +105,7 @@ public:
      * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
+    int run(Runtime &runtime, const CallConfig &config) override;
 
     // `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -130,7 +129,7 @@ public:
     int finalize() override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
-    // `register_callable_host_orch`, `unregister_callable`, `has_callable`,
+    // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
     // `bind_callable_to_runtime`, `aicpu_dlopen_count`, and
     // `host_dlopen_count` are inherited from `DeviceRunnerBase`.
 
@@ -175,7 +174,7 @@ private:
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, kernel_args_, device_wall_*,
-    // device_args_, binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -226,8 +225,11 @@ private:
     // Called from finalize() only on the device-poison path (device_unusable_).
     // Safe because onboard work always holds an exclusive task-submit lock on
     // the card (.claude/rules/running-onboard.md) and the reset is verified to
-    // scope to this card only (does not disturb other devices).
-    void force_reset_device();
+    // scope to this card only (does not disturb other devices). Returns 0 on
+    // success, non-zero if the reset did not run or failed, so finalize() can
+    // keep a still-poisoned card flagged instead of clearing device_unusable_
+    // unconditionally.
+    int force_reset_device();
 
     /**
      * Initialize performance profiling device buffers
