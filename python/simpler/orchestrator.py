@@ -425,6 +425,15 @@ class Orchestrator:
         """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
         return int(self._o.malloc(int(worker_id), int(size)))
 
+    def import_ipc(self, worker_id: int, key: bytes) -> int:
+        """Import an ACL device-IPC *key* on next-level worker *worker_id*.
+
+        Returns a device pointer valid in that worker's (forked chip child's) ACL
+        context — the import runs inside the child, so the pointer can back a
+        :class:`~pypto.runtime.DeviceTensor` (``child_memory``) kernel argument.
+        """
+        return int(self._o.import_ipc(int(worker_id), bytes(key)))
+
     def free(self, worker_id: int, ptr: int) -> None:
         """Free memory on next-level worker *worker_id*."""
         self._o.free(int(worker_id), int(ptr))

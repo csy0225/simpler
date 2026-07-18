@@ -316,6 +316,15 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("worker_id"), nb::arg("size"), "Allocate memory on next-level worker."
         )
         .def(
+            "import_ipc",
+            [](Orchestrator &self, int worker_id, nb::bytes key) {
+                return self.import_ipc(worker_id, reinterpret_cast<const uint8_t *>(key.data()),
+                                       static_cast<size_t>(key.size()));
+            },
+            nb::arg("worker_id"), nb::arg("key"),
+            "Import an ACL device-IPC key on next-level worker; returns a device ptr."
+        )
+        .def(
             "free",
             [](Orchestrator &self, int worker_id, uint64_t ptr) {
                 self.free(worker_id, ptr);

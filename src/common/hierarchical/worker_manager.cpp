@@ -65,6 +65,9 @@ namespace {
 }  // namespace
 
 uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("control_malloc"); }
+uint64_t WorkerEndpoint::control_import_ipc(const uint8_t *, size_t) {
+    throw_unsupported_control("control_import_ipc");
+}
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
 void WorkerEndpoint::control_copy_to(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_to"); }
 void WorkerEndpoint::control_copy_from(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_from"); }
@@ -556,6 +559,19 @@ uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
     return read_control_result(mbox());
 }
 
+uint64_t LocalMailboxEndpoint::control_import_ipc(const uint8_t *key, size_t key_len) {
+    if (key_len == 0 || key_len > CTRL_IMPORT_IPC_KEY_MAX) {
+        throw std::runtime_error("control_import_ipc: invalid IPC key length " + std::to_string(key_len));
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    // arg0 = key length; raw key bytes staged at MAILBOX_OFF_ARGS (the child
+    // reads exactly key_len bytes there and imports in its own ACL context).
+    write_control_args(mbox(), CTRL_IMPORT_IPC, static_cast<uint64_t>(key_len));
+    std::memcpy(mbox() + MAILBOX_OFF_ARGS, key, key_len);
+    run_control_command("control_import_ipc");
+    return read_control_result(mbox());
+}
+
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_PREPARE);
@@ -742,6 +758,11 @@ void LocalMailboxEndpoint::control_l3_l2_orch_comm_init(const char *control_shm_
 uint64_t WorkerThread::control_malloc(size_t size) {
     if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
     return endpoint_->control_malloc(size);
+}
+
+uint64_t WorkerThread::control_import_ipc(const uint8_t *key, size_t key_len) {
+    if (!endpoint_) throw std::runtime_error("control_import_ipc: null endpoint");
+    return endpoint_->control_import_ipc(key, key_len);
 }
 
 void WorkerThread::control_prepare(const uint8_t *digest) {
