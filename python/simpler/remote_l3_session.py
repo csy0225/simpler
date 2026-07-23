@@ -20,11 +20,14 @@ import ctypes
 import hashlib
 import importlib
 import json
+import math
 import os
+import signal
 import socket
 import struct
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -161,9 +164,35 @@ def _send_ready(fd: int, payload: dict[str, Any]) -> None:
 
 def _session_timeout_s(manifest: dict[str, Any]) -> float:
     timeout_s = float(manifest.get("session_timeout_s", 30.0))
-    if timeout_s <= 0:
-        raise ValueError("manifest session_timeout_s must be positive")
+    if not (timeout_s > 0 and math.isfinite(timeout_s)):
+        raise ValueError("manifest session_timeout_s must be a positive finite number of seconds")
     return timeout_s
+
+
+def _startup_remaining_s(manifest: dict[str, Any]) -> float:
+    # The parent's remaining slice of the single root startup budget. Absent only
+    # from a pre-P0.3 parent; fall back to the runtime command timeout then. The
+    # fallback is evaluated only when the key is absent, so a valid
+    # startup_remaining_s is not held hostage to an invalid session_timeout_s.
+    if "startup_remaining_s" not in manifest:
+        return _session_timeout_s(manifest)
+    remaining_s = float(manifest["startup_remaining_s"])
+    if not (remaining_s > 0 and math.isfinite(remaining_s)):
+        raise ValueError("manifest startup_remaining_s must be a positive finite number of seconds")
+    return remaining_s
+
+
+def _startup_deadline(manifest: dict[str, Any]) -> float:
+    # The daemon and this runner share CLOCK_MONOTONIC (same host), so when the
+    # daemon supplies an absolute deadline the runner uses it directly — its
+    # remaining is measured post-spawn, and its deadline cannot exceed the
+    # daemon's. Only a pre-P0.3 daemon omits it; fall back to the duration then.
+    if "startup_deadline_monotonic" in manifest:
+        deadline = float(manifest["startup_deadline_monotonic"])
+        if not math.isfinite(deadline):
+            raise ValueError("manifest startup_deadline_monotonic must be a finite monotonic timestamp")
+        return deadline
+    return time.monotonic() + _startup_remaining_s(manifest)
 
 
 def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
@@ -908,11 +937,28 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
     try:
-        session_timeout_s = _session_timeout_s(manifest)
+        # Validate the runtime command timeout wire value up front (rejects a
+        # malformed session_timeout_s); the command lane itself idle-waits blocking.
+        _session_timeout_s(manifest)
+        # Establish this runner's single absolute deadline before any startup work
+        # (registry install, inner init) so every stage draws from it. It is the
+        # daemon's shared-clock deadline when supplied (so spawn/import time is
+        # already charged), else derived from the remaining duration.
+        startup_deadline = _startup_deadline(manifest)
         manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
-        inner_worker.init()
+        # Register the inner L3 callables before init() so they are frozen into
+        # the eager startup snapshot and uploaded to the chip children before
+        # those children publish INIT_READY. init() is the single, eager startup
+        # point: it forks and readies the whole inner L3->L2 tree, so the runner
+        # reports ready (below) only once that subtree is up.
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
-        inner_worker._start_hierarchical()  # noqa: SLF001 -- session runner owns the fork-safe prestart.
+        # Bound the inner startup by the runner's single deadline established
+        # above (which already charges registry-install time), not a fresh full
+        # session_timeout_s. Mark it non-root so its chip/sub children inherit
+        # this runner's process group (see start_new_session in the daemon)
+        # rather than splitting into their own — the daemon reaps the whole
+        # L3->L2 subtree with one killpg on the runner.
+        inner_worker.init(_startup_deadline=startup_deadline)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
         command_sock = _bind_listener(listen_host)
@@ -937,8 +983,22 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
             },
         )
 
-        command_sock.settimeout(session_timeout_s)
+        # Waiting for the parent to attach is still the attach phase, so bound it
+        # by the remaining startup budget — not session_timeout_s. Otherwise a
+        # tiny runtime timeout could drop the parent before it connects, and a
+        # large one could keep the runner alive well past the root deadline if the
+        # parent is lost.
+        attach_remaining = startup_deadline - time.monotonic()
+        if attach_remaining <= 0:
+            raise TimeoutError("remote L3 runner: startup deadline exceeded before parent attach")
+        command_sock.settimeout(attach_remaining)
         conn, _addr = command_sock.accept()
+        # Force the command connection blocking, explicitly: accept() inherits
+        # socket.getdefaulttimeout(), which a user module imported during registry
+        # install could have set. A finite timeout would tear down a healthy but
+        # idle session; the loop instead idle-waits blocking and ends when the
+        # parent closes the command socket (read_frame sees EOF).
+        conn.settimeout(None)
         with conn:
             _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)
         return 0
@@ -963,11 +1023,18 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
             pass
 
 
+def _raise_keyboard_interrupt(_signum, _frame):
+    # A daemon cooperative-kill (SIGTERM) unwinds run_session so its finally
+    # closes the inner Worker — reaping the L3->L2 subtree — before exit.
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--ready-fd", required=True, type=int)
     ns = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     with open(ns.manifest, encoding="utf-8") as f:
         manifest = json.load(f)
     return run_session(manifest, ns.ready_fd)

@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 static constexpr uint32_t L3L2_ORCH_COMM_MAGIC = 0x4C334C32u;  // "L3L2"
 static constexpr uint16_t L3L2_ORCH_COMM_ABI_MAJOR = 2;
@@ -29,16 +30,6 @@ struct L3L2OrchRegionDesc {
     uint64_t payload_bytes;
     uint64_t counter_base;
     uint64_t counter_bytes;
-};
-
-enum class L3L2OrchCommCmd : uint32_t {
-    ALLOC_REGION = 1,
-    FREE_REGION = 2,
-    PAYLOAD_WRITE = 3,
-    PAYLOAD_READ = 4,
-    SIGNAL_NOTIFY = 5,
-    SIGNAL_WAIT = 6,
-    SIGNAL_TEST = 7,
 };
 
 enum class L3L2OrchNotifyOp : uint32_t {
@@ -71,37 +62,28 @@ enum class L3L2OrchCommValidationError : uint32_t {
     NULL_POINTER = 7,
 };
 
-struct L3L2OrchCommRequest {
-    uint32_t cmd;
-    uint32_t op;
-    uint64_t region_id;
-    uint64_t payload_offset;
-    uint64_t host_ptr;
-    uint64_t payload_bytes;
-    uint64_t counter_addr;
-    uint64_t counter_bytes;
-    int32_t counter_operand;
-    uint32_t reserved0;
-    uint64_t timeout_ns;
-};
+namespace l3_l2_orch_comm {
 
-struct L3L2OrchCommResponse {
-    int32_t status;
-    uint32_t error_kind;
-    uint64_t region_id;
-    int32_t observed_counter;
-    uint32_t matched;
-    L3L2OrchRegionDesc desc;
-    char message[256];
-};
+static inline void copy_error_message(char *dst, size_t dst_size, const char *message) {
+    if (dst == nullptr || dst_size == 0) {
+        return;
+    }
+    const char *src = message == nullptr ? "" : message;
+    size_t n = strnlen(src, dst_size - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
-static inline uint64_t l3_l2_orch_comm_pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
+}  // namespace l3_l2_orch_comm
+
+static constexpr uint64_t l3_l2_orch_comm_pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
     return (static_cast<uint64_t>(magic) << 32) | (static_cast<uint64_t>(major) << 16) | static_cast<uint64_t>(minor);
 }
 
-static inline uint64_t l3_l2_orch_comm_magic_version() {
-    return l3_l2_orch_comm_pack_magic_version(L3L2_ORCH_COMM_MAGIC, L3L2_ORCH_COMM_ABI_MAJOR, L3L2_ORCH_COMM_ABI_MINOR);
-}
+static constexpr uint64_t L3L2_ORCH_COMM_MAGIC_VERSION =
+    l3_l2_orch_comm_pack_magic_version(L3L2_ORCH_COMM_MAGIC, L3L2_ORCH_COMM_ABI_MAJOR, L3L2_ORCH_COMM_ABI_MINOR);
+
+static inline uint64_t l3_l2_orch_comm_magic_version() { return L3L2_ORCH_COMM_MAGIC_VERSION; }
 
 static inline uint32_t l3_l2_orch_comm_magic(uint64_t magic_version) {
     return static_cast<uint32_t>(magic_version >> 32);
@@ -115,17 +97,39 @@ static inline uint16_t l3_l2_orch_comm_abi_minor(uint64_t magic_version) {
     return static_cast<uint16_t>(magic_version & 0xFFFFu);
 }
 
-static inline bool l3_l2_orch_comm_add_overflows(uint64_t a, uint64_t b) { return a > UINT64_MAX - b; }
+static inline bool l3_l2_orch_comm_add_overflows(uint64_t a, uint64_t b) {
+#if defined(__clang__) || defined(__GNUC__)
+    uint64_t result = 0;
+    return __builtin_add_overflow(a, b, &result);
+#else
+    return a > UINT64_MAX - b;
+#endif
+}
 
-static inline bool l3_l2_orch_comm_is_aligned(uint64_t value, uint64_t align) {
-    return align != 0 && (value % align) == 0;
+static inline uint64_t l3_l2_orch_comm_add_sat(uint64_t a, uint64_t b) {
+#if defined(__clang__) || defined(__GNUC__)
+    uint64_t result = 0;
+    return __builtin_add_overflow(a, b, &result) ? UINT64_MAX : result;
+#else
+    return l3_l2_orch_comm_add_overflows(a, b) ? UINT64_MAX : a + b;
+#endif
+}
+
+template <uint64_t Align>
+static constexpr bool l3_l2_orch_comm_is_aligned(uint64_t value) {
+    static_assert(Align > 0 && (Align & (Align - 1)) == 0, "Align must be a power of two");
+    return (value & (Align - 1)) == 0;
+}
+
+static inline bool l3_l2_orch_comm_is_aligned_runtime(uint64_t value, uint64_t align) {
+    return align != 0 && (align & (align - 1)) == 0 && (value & (align - 1)) == 0;
 }
 
 static inline bool l3_l2_orch_comm_range_contains(uint64_t base, uint64_t size, uint64_t value) {
     if (size == 0 || l3_l2_orch_comm_add_overflows(base, size)) {
         return false;
     }
-    return value >= base && value < base + size;
+    return value >= base && value - base < size;
 }
 
 static inline bool
@@ -134,23 +138,26 @@ l3_l2_orch_comm_ranges_overlap(uint64_t first_base, uint64_t first_size, uint64_
         l3_l2_orch_comm_add_overflows(second_base, second_size)) {
         return false;
     }
-    return first_base < second_base + second_size && second_base < first_base + first_size;
+    if (first_base < second_base) {
+        return second_base - first_base < first_size;
+    }
+    return first_base - second_base < second_size;
 }
 
 static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64_t payload_bytes) {
-    if (nbytes == 0 || payload_bytes == 0 || l3_l2_orch_comm_add_overflows(offset, nbytes)) {
+    if (nbytes == 0 || payload_bytes == 0) {
         return L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE;
     }
-    if (offset > payload_bytes || offset + nbytes > payload_bytes) {
+    if (l3_l2_orch_comm_add_overflows(offset, nbytes) || l3_l2_orch_comm_add_sat(offset, nbytes) > payload_bytes) {
         return L3L2OrchCommValidationError::OUT_OF_BOUNDS;
     }
     return L3L2OrchCommValidationError::OK;
 }
 
 static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_counter_range(const L3L2OrchRegionDesc &desc) {
-    if (desc.counter_base == 0 || desc.counter_bytes == 0 ||
-        !l3_l2_orch_comm_is_aligned(desc.counter_base, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT) ||
+    if (desc.counter_bytes == 0 ||
+        !l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT>(desc.counter_base) ||
         (desc.counter_bytes % L3L2_ORCH_COMM_COUNTER_BYTES) != 0 ||
         l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
@@ -169,8 +176,7 @@ static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_desc(const L3
     if (desc.region_id == 0) {
         return L3L2OrchCommValidationError::BAD_REGION_ID;
     }
-    if (desc.payload_base == 0 || desc.payload_bytes == 0 ||
-        l3_l2_orch_comm_add_overflows(desc.payload_base, desc.payload_bytes)) {
+    if (desc.payload_bytes == 0 || l3_l2_orch_comm_add_overflows(desc.payload_base, desc.payload_bytes)) {
         return L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE;
     }
     L3L2OrchCommValidationError counter_error = l3_l2_orch_comm_validate_counter_range(desc);
@@ -253,19 +259,97 @@ static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
     // Address validity is 4-byte; wrapper protocols must keep different
     // counter writers off the same cache line.
-    if (!l3_l2_orch_comm_is_aligned(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES)) {
+    if (!l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BYTES>(counter_addr)) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
-    if (l3_l2_orch_comm_validate_counter_range(desc) != L3L2OrchCommValidationError::OK ||
-        l3_l2_orch_comm_add_overflows(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES) ||
-        l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
+    if (l3_l2_orch_comm_validate_counter_range(desc) != L3L2OrchCommValidationError::OK) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
-    if (counter_addr < desc.counter_base ||
-        counter_addr + L3L2_ORCH_COMM_COUNTER_BYTES > desc.counter_base + desc.counter_bytes) {
+    if (desc.counter_bytes < L3L2_ORCH_COMM_COUNTER_BYTES) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
+    }
+    uint64_t max_counter_addr = desc.counter_base + desc.counter_bytes - L3L2_ORCH_COMM_COUNTER_BYTES;
+    if (counter_addr < desc.counter_base || counter_addr > max_counter_addr) {
         return L3L2OrchCommValidationError::OUT_OF_BOUNDS;
     }
     return L3L2OrchCommValidationError::OK;
 }
+
+namespace l3_l2_orch_comm {
+
+static constexpr uint64_t pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
+    return ::l3_l2_orch_comm_pack_magic_version(magic, major, minor);
+}
+
+static inline uint64_t magic_version() { return ::l3_l2_orch_comm_magic_version(); }
+
+static inline uint32_t magic(uint64_t magic_version_value) { return ::l3_l2_orch_comm_magic(magic_version_value); }
+
+static inline uint16_t abi_major(uint64_t magic_version_value) {
+    return ::l3_l2_orch_comm_abi_major(magic_version_value);
+}
+
+static inline uint16_t abi_minor(uint64_t magic_version_value) {
+    return ::l3_l2_orch_comm_abi_minor(magic_version_value);
+}
+
+static inline bool add_overflows(uint64_t a, uint64_t b) { return ::l3_l2_orch_comm_add_overflows(a, b); }
+
+static inline uint64_t add_sat(uint64_t a, uint64_t b) { return ::l3_l2_orch_comm_add_sat(a, b); }
+
+template <uint64_t Align>
+static constexpr bool is_aligned(uint64_t value) {
+    return ::l3_l2_orch_comm_is_aligned<Align>(value);
+}
+
+static inline bool is_aligned_runtime(uint64_t value, uint64_t align) {
+    return ::l3_l2_orch_comm_is_aligned_runtime(value, align);
+}
+
+static inline bool range_contains(uint64_t base, uint64_t size, uint64_t value) {
+    return ::l3_l2_orch_comm_range_contains(base, size, value);
+}
+
+static inline bool
+ranges_overlap(uint64_t first_base, uint64_t first_size, uint64_t second_base, uint64_t second_size) {
+    return ::l3_l2_orch_comm_ranges_overlap(first_base, first_size, second_base, second_size);
+}
+
+static inline L3L2OrchCommValidationError
+validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64_t payload_bytes) {
+    return ::l3_l2_orch_comm_validate_payload_bounds(offset, nbytes, payload_bytes);
+}
+
+static inline L3L2OrchCommValidationError validate_counter_range(const L3L2OrchRegionDesc &desc) {
+    return ::l3_l2_orch_comm_validate_counter_range(desc);
+}
+
+static inline L3L2OrchCommValidationError validate_desc(const L3L2OrchRegionDesc &desc) {
+    return ::l3_l2_orch_comm_validate_desc(desc);
+}
+
+static inline bool encode_desc(const L3L2OrchRegionDesc &desc, uint64_t *scalars, size_t scalar_count) {
+    return ::l3_l2_orch_comm_encode_desc(desc, scalars, scalar_count);
+}
+
+static inline bool decode_desc(
+    const uint64_t *scalars, size_t scalar_count, L3L2OrchRegionDesc *out_desc, L3L2OrchCommValidationError *out_error
+) {
+    return ::l3_l2_orch_comm_decode_desc(scalars, scalar_count, out_desc, out_error);
+}
+
+static inline bool valid_notify_op(L3L2OrchNotifyOp op) { return ::l3_l2_orch_comm_valid_notify_op(op); }
+
+static inline bool valid_wait_cmp(L3L2OrchWaitCmp cmp) { return ::l3_l2_orch_comm_valid_wait_cmp(cmp); }
+
+static inline bool compare_counter(int32_t observed, int32_t cmp_value, L3L2OrchWaitCmp cmp) {
+    return ::l3_l2_orch_comm_compare_counter(observed, cmp_value, cmp);
+}
+
+static inline L3L2OrchCommValidationError validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
+    return ::l3_l2_orch_comm_validate_counter_addr(desc, counter_addr);
+}
+
+}  // namespace l3_l2_orch_comm
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_L3_L2_ORCH_COMM_H_

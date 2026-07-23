@@ -164,8 +164,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
 | `total_size` | Init | Both | Total shared memory size |
-| `graph_output_ptr` | Orchestrator | Host | Address of final output (packed buffer) |
-| `graph_output_size` | Orchestrator | Host | Size of final output in bytes |
 
 ### 3.2 Size Calculation
 
@@ -370,8 +368,8 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `completed_subtasks` | Atomic counter; each subtask increments on completion. Trigger condition: `completed_subtasks == total_required_subtasks` |
-| `fanin_count` | Number of producer dependencies (set by scheduler during wiring) |
-| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by scheduler wiring + completion) |
+| `fanin_count` | Number of producer dependencies (set by Orch-side wiring) |
+| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by Orch-side wiring + scheduler completion) |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
 | `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
@@ -418,7 +416,7 @@ Key members:
 - `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + FaninPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
-- `scheduler`: pointer to scheduler state (for wiring queue and ready queue access)
+- `scheduler`: pointer to scheduler state (for Orch-side wiring helpers and ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
 ### 7.2 Task Submission Flow (`PTO2OrchestratorState::submit_task`)
@@ -430,17 +428,15 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
-| 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
+| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. This step runs **before** `payload.init()`. |
+| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues |
 
-> **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
-> orchestrator submit hot path to the scheduler's global `wiring_queue` (SPSC). This reduces the
-> orchestrator's shared L2 cache / memory bus pressure, as the orchestrator no longer
-> acquires `fanout_lock` or allocates from `dep_pool` during submission.
+> **Note**: Fanout wiring is now completed before publish in the orchestrator submit path.
+> Scheduler threads consume ready queues directly.
 
-### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
+### 7.3 Orch-Side Fanout Wiring
 
-The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches, deferring if the queue holds fewer than a full batch of items to reduce contention (unless a final flush is needed at end of execution). For each task:
+The orchestrator completes fanout wiring before publishing a task to the ready queues. For each task with live producers:
 
 1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
 2. For each producer in `payload->fanin_slot_states[]`:
@@ -448,8 +444,10 @@ The orchestrator pushes each submitted task to the global `scheduler->wiring_que
    - Checks `task_state >= COMPLETED` (early-finished optimization)
    - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
    - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
-4. If all deps satisfied: pushes task to ready queue
+3. Atomically releases the +1 redundance + completed-fanin count via `fanin_refcount.fetch_add`
+4. If all deps satisfied: pushes task to the routed ready queue
+
+Zero-fanin tasks and tasks whose claimed producers are already completed skip dep_pool entry allocation and publish directly to the routed ready queue.
 
 The scheduler's completion handler mirrors this:
 
@@ -546,11 +544,12 @@ Each scheduler thread runs a tight loop with two main phases:
 - Poll register `COND` on each managed core
 - When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, trigger `on_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
-**Phase 2 — Dispatch**:
+**Phase 2 — Dispatch** (full model in §8.6):
 
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
-- Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
+- Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE` (DMB offset `0xD0` on a5)
+- After normal ready queues are empty, Phase **4b** may stage speculative early-dispatch candidates onto spare slots (`early_dispatch_queues[]` / `early_sync_start_queue`)
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
 
@@ -558,11 +557,13 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
+- One `PTO2ReadyQueue` per resource shape (`MIX` / `AIC` / `AIV` in the production tensormap path)
+- **Push**: any thread (orchestrator via wiring, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
+
+Unlike a2a3, a5 does **not** keep a separate `ready_sync_queues[]` tier: ready `require_sync_start` cohorts share `ready_queues[]`. Speculative sync_start early candidates still use the dedicated `early_sync_start_queue` (see §8.6).
 
 ### 8.4 Watermark Advancement (last_task_alive)
 
@@ -587,7 +588,9 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 
 | Method | Phase | Purpose |
 | ------ | ----- | ------- |
-| `init(runtime, aicpu_thread_num, sched_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
+| `pre_handshake_init(runtime, aicpu_thread_num, sched_thread_num, regs_base)` | leader, once per run | Zero state, reset counters, latch `regs_base`, bind `func_id_to_addr_` before any thread handshakes |
+| `handshake_partition(runtime, tidx, nthreads)` | every thread | Handshake this thread's disjoint core slice in parallel |
+| `post_handshake_init(runtime)` | leader, after barrier | Build worker-id lists in core order, assign cores to threads |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores |
@@ -599,9 +602,87 @@ Private internals are split across three .cpp files by responsibility:
 
 - `scheduler_completion.cpp` — completion polling, drain protocol
 - `scheduler_dispatch.cpp` — task dispatch loop and helpers
-- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`init/deinit`), core management (`handshake_all_cores` / `assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
+- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
 
 `AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
+
+### 8.6 Dispatch model — two sources, sync tiers, occupancy order
+
+`resolve_and_dispatch` places ready and speculative work onto AICore cores under one
+occupancy model (ported from a2a3 early-dispatch; a5 specifics called out below). Two
+orthogonal axes decide *what* runs and *where*:
+
+- **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
+  pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; its dispatch
+  payload carries a non-zero `src_payload` gate and launches later by a high-32 doorbell on
+  `DATA_MAIN_BASE`). Normal strictly precedes early.
+- **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
+  block launches independently). "is it ready" (source) and "does it need a rendezvous"
+  (cohort) are orthogonal.
+
+Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV`** (shape), and per
+shape **idle ▸ pending** (an idle core takes its running slot; a busy core takes its gated
+pending slot, promoted on completion). a5 implements this order inline in
+`dispatch_ready_tasks` / `try_early_dispatch` (no separate `run_staging_order` helper).
+
+#### Queues
+
+| Source | Regular lanes | sync_start lane |
+| ------ | ------------- | --------------- |
+| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | *(same `ready_queues[]` — a5 has no `ready_sync_queues[]`)* |
+| EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
+
+A task routes to the early sync lane iff `task_attrs.requires_sync_start()`. Early
+dispatch runs only once normal `ready_queues[]` are empty **and** the local
+`CoreTracker` has a spare slot (`has_any_free_slot`, a2a3 #1288).
+
+**Direct-only eligibility (a2a3 #1285/#1292):** a consumer is an early candidate only when
+every *direct* producer is flagged `allow_early_resolve` (slot-state hint from Arg, or
+unconditional true for hidden alloc creators). There is no auto-chain inheritance.
+
+#### sync_start drain + rendezvous
+
+A sync_start cohort of `block_num` cores must occupy all its cores before any of them run.
+When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
+
+1. **Single election** — a CAS on `sync_start_pending` makes drains mutually exclusive.
+2. **All-or-nothing** — the elected thread checks global available capacity ≥ `block_num`
+   before staging; if short it aborts and retries after completions free cores.
+3. **Parallel stage** — threads barrier, then each CAS-claims a block range and stages its
+   own cores with a non-zero `src_payload` gate (`drain_stage_cores`): idle → running,
+   busy → pending (`pending_gated` when still waiting for the doorbell).
+4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
+   reaches `popcount(staged_core_mask)` **and** the producer has released,
+   `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
+
+Doorbell ownership is exclusive (`claim_all_staged_doorbell_bits` /
+`claim_late_staged_doorbell_bits`); launch is latched via `early_dispatch_launch_state`.
+
+#### Early-candidate gate: producer must publish every block
+
+Producer-side `propagate_dispatch_fanin` no-ops until the producer is **fully published**:
+`published_block_count == logical_block_num` (a2a3 #1326). Publication is recorded after
+prepare/publish makes payload + low-32 dispatch tokens visible. Early queue entries carry a
+`task_id_snapshot` generation tag (#1336) so recycled slots cannot revive stale candidates.
+
+Wiring and propagation serialize under `fanout_lock` with `PTO2_DISPATCH_PROPAGATED` so
+late-wired consumers still receive exactly one early-candidate contribution per eligible
+edge (#1405).
+
+#### a5 platform notes
+
+- `RUNTIME_MAX_WORKER = 108` — doorbell table / `staged_core_mask` words must cover 108 cores.
+- AICore index fields are `s_block_idx` / `s_block_num` (not a2a3 `block_idx` / `block_num`).
+- DMB MMIO offset is **`0xD0`** (a2a3 uses `0xA0`). Ready dispatch writes the low 32 bits;
+  early release rings high 32 via 64-bit STR `(token<<32)|token`. AICore gated path spins on
+  `read_dmb_high32() == task_id` before ACK.
+- Ready path keeps `src_payload == 0` and ACK-then-execute behavior unchanged.
+
+#### MIX per-core placement
+
+A MIX task spans a cluster (1 AIC + 2 AIV). Gated MIX may place **per core**
+(`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
+skew within a block is tolerated by AICore incore synchronization.
 
 ---
 
@@ -630,11 +711,13 @@ Instead of polling a shared-memory status flag, the production protocol uses har
 
 **AICore execution loop**:
 
-1. Poll `DATA_MAIN_BASE` for value != AICPU_IDLE_TASK_ID
+1. Poll `DATA_MAIN_BASE` (low 32) for value != AICPU_IDLE_TASK_ID
 2. Read payload from `Handshake.task`
-3. Write ACK to `COND`
-4. Execute kernel function via `func_id_to_addr` lookup
-5. Write FIN to `COND`
+3. If `src_payload != 0` (early/gated): materialize args from `src_payload`, spin until
+   `read_dmb_high32() == task_id`, **then** ACK
+4. Else (ready path): ACK immediately
+5. Execute kernel function via `func_id_to_addr` lookup
+6. Write FIN to `COND`
 
 ### 9.3 PTO2DispatchPayload
 
@@ -647,8 +730,9 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `kernel_id` | Function ID for this subtask slot |
 | `core_type` | AIC or AIV |
 | `function_bin_addr` | GM address of compiled kernel binary |
+| `src_payload` | Non-zero ⇒ gated early path (AICore materializes args + waits high-32 doorbell) |
 | `num_args` | Number of arguments |
-| `args[]` | Tensor addresses and scalar values |
+| `args[]` | Tensor addresses and scalar values (filled by AICPU on ready path; by AICore when gated) |
 
 ---
 
@@ -683,7 +767,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
-| `orchestrator_done_` | Orchestrator thread | Scheduler threads when `PTO2_SERIAL_ORCH_SCHED=1` | Full task graph built |
+| `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
 Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
@@ -696,15 +780,13 @@ Startup sequence:
 2. Scheduler threads: wait for `runtime_init_ready_` → enter main loop
 3. Orchestrator thread: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
 
-With `PTO2_SERIAL_ORCH_SCHED=1`, scheduler threads still wait for
+With `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1`, scheduler threads still wait for
 `runtime_init_ready_` first, then additionally wait for `orchestrator_done_`
 before entering `resolve_and_dispatch()`. The default is off, preserving the
 current overlapped orch/sched pipeline. Serial mode is intended for measurement
-and debugging. During the serial wait, scheduler thread 0 may drain deferred
-wiring records to prevent bounded wiring-queue backpressure, but it does not
-dispatch AICore work until `orchestrator_done_` is set. Large graphs may still
-require larger task-ring, heap, or dependency-pool capacity because no task
-execution/reclaim happens during graph build.
+and debugging. It does not dispatch AICore work until `orchestrator_done_` is
+set. Large graphs may still require larger task-ring, heap, or dependency-pool
+capacity because no task execution/reclaim happens during graph build.
 
 ---
 

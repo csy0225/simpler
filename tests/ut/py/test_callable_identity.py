@@ -478,6 +478,23 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
         def add_remote_l3_socket(self, worker_id, *args):
             self.remote_worker_ids.append(worker_id)
 
+        # Eager init() forks the local L3 child and starts the C++ scheduler, so
+        # the mock must satisfy the register/init/orchestrator surface.
+        def add_sub_worker(self, *args):
+            pass
+
+        def add_next_level_worker(self, *args):
+            pass
+
+        def add_next_level_worker_at(self, *args):
+            pass
+
+        def init(self):
+            pass
+
+        def get_orchestrator(self):
+            return None
+
         def close(self):
             self.closed = True
 
@@ -487,7 +504,7 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         opened_worker_ids.append(worker_id)
         return worker_mod._RemoteSession(  # noqa: SLF001
             worker_id=worker_id,
@@ -528,6 +545,7 @@ def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
             spec=RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert loopback["listen_host"] == "127.0.0.1"
         assert loopback["connect_host"] == "127.0.0.1"
@@ -536,6 +554,7 @@ def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
             spec=RemoteWorkerSpec(endpoint="10.0.0.8:19073", platform="a2a3sim"),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert remote["listen_host"] == "10.0.0.8"
         assert remote["connect_host"] == "10.0.0.8"
@@ -552,7 +571,7 @@ def test_remote_session_manifest_requires_wildcard_bind_opt_in():
             session_listen_host="0.0.0.0",
         )
         with pytest.raises(ValueError, match="wildcard session bind"):
-            worker._build_remote_manifest(spec=spec, worker_id=0, session_id=1)
+            worker._build_remote_manifest(spec=spec, worker_id=0, session_id=1, startup_remaining_s=30.0)
 
         opted_in = worker._build_remote_manifest(
             spec=RemoteWorkerSpec(
@@ -563,6 +582,7 @@ def test_remote_session_manifest_requires_wildcard_bind_opt_in():
             ),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert opted_in["listen_host"] == "0.0.0.0"
         assert opted_in["connect_host"] == "10.0.0.8"
@@ -1014,7 +1034,6 @@ def test_remote_sim_prepare_callable_control_roundtrip():
             workers=[worker_id],
         )
         worker.init()
-        worker._start_hierarchical()  # noqa: SLF001 -- exercise PREPARE_CALLABLE before TASK dispatch.
         assert worker._worker is not None
         worker._worker.control_prepare(worker_id, handle.digest)
 
@@ -1200,7 +1219,6 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
             workers=[worker_id],
         )
         worker.init()
-        worker._start_hierarchical()
         assert worker._worker is not None
         inner_digest = hashid_to_digest(_INNER_SUB_HASHID)
         target = b"tests.ut.py.test_callable_identity:_remote_inner_sub_noop"
@@ -1403,8 +1421,7 @@ def test_remote_owner_free_waits_for_import_release():
     worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     importer_worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
     worker._worker = fake
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
 
     imported = worker.remote_import(exported, worker=importer_worker_id)
     worker.remote_free(owner)
@@ -1455,8 +1472,7 @@ def test_remote_import_pins_owner_during_control_and_rolls_back_on_error():
     fake = FailingRemoteWorker()
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     worker._worker = fake  # type: ignore[assignment]
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
 
     with pytest.raises(RuntimeError, match="import failed"):
         worker.remote_import(exported, worker=worker_id)
@@ -1507,8 +1523,7 @@ def test_remote_import_releases_remote_mapping_when_handle_build_fails(monkeypat
     fake = FakeRemoteWorker()
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     worker._worker = fake  # type: ignore[assignment]
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     monkeypatch.setattr(RemoteBufferHandle, "_from_imported_mapping", staticmethod(fail_from_imported_mapping))
 
     with pytest.raises(RuntimeError, match="handle build failed"):
@@ -1574,8 +1589,7 @@ def test_remote_pending_free_is_retained_when_control_fails():
     owner._mark_released()
     worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     worker._worker = FailingRemoteWorker()  # type: ignore[assignment]
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._pending_remote_buffer_frees = [owner]
 
     worker._flush_pending_remote_frees()
@@ -1602,7 +1616,7 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
 
     calls = 0
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -1659,7 +1673,7 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         return opened_session
 
     def fake_close_remote_session(self, session):
@@ -1948,10 +1962,8 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
     worker = Worker(level=4, num_sub_workers=0)
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     fake = FakeRemoteCWorker()
-    worker._initialized = True
     worker._worker = fake  # type: ignore[assignment]
-    worker._hierarchical_started = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     try:
         handle = worker.remote_malloc(worker=worker_id, nbytes=4)
         assert handle.worker_id == worker_id
@@ -1994,8 +2006,7 @@ def test_remote_register_prepare_exception_marks_hash_uncertain():
 
     worker = Worker(level=4, num_sub_workers=0)
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._worker = FailingPrepareWorker()  # type: ignore[assignment]
     digest = hashid_to_digest(_REMOTE_NOOP_ORCH_HASHID)
 
@@ -2023,8 +2034,7 @@ def test_remote_register_commit_exception_aborts_prepared_and_marks_uncertain():
     fake = FailingCommitWorker()
     worker = Worker(level=4, num_sub_workers=0)
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._worker = fake  # type: ignore[assignment]
     digest = hashid_to_digest(_REMOTE_NOOP_ORCH_HASHID)
 
@@ -2043,8 +2053,7 @@ def test_remote_unregister_exception_is_best_effort_and_marks_uncertain():
     worker = Worker(level=4, num_sub_workers=0)
     worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     handle = worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[worker_id])
-    worker._initialized = True
-    worker._hierarchical_start_state = "started"
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._worker = FailingUnregisterWorker()  # type: ignore[assignment]
 
     worker.unregister(handle)

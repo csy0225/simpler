@@ -81,7 +81,8 @@ public:
     // prestart and reported HELLO READY on the command lane.
     void add_remote_l3_socket(
         int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
-        uint16_t port, const std::string &health_host, uint16_t health_port, double timeout_s
+        uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
+        double runtime_timeout_s
     );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
@@ -113,8 +114,12 @@ public:
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
-    void control_l3_l2_orch_comm_init(int worker_id, const std::string &control_shm_name) {
-        manager_.control_l3_l2_orch_comm_init(worker_id, control_shm_name.c_str());
+    void
+    control_l3_l2_region_create(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
+        manager_.control_l3_l2_region_create(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
+    }
+    void control_l3_l2_region_release(int worker_id, uint64_t region_id) {
+        manager_.control_l3_l2_region_release(worker_id, region_id);
     }
 
     ControlResult

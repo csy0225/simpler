@@ -43,7 +43,7 @@ static DepGenDataHeader *s_dep_gen_header = nullptr;
 static DepGenBufferState *s_dep_gen_state = nullptr;
 static int s_orch_thread_idx = -1;  // set via dep_gen_aicpu_set_orch_thread_idx
 
-static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
+static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 extern "C" void set_platform_dep_gen_base(uint64_t dep_gen_data_base) { g_platform_dep_gen_base = dep_gen_data_base; }
 
@@ -152,7 +152,7 @@ void dep_gen_aicpu_init() {
 }
 
 void dep_gen_aicpu_record_submit(
-    uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,
+    uint64_t task_id_raw, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
     const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, int block_num,
     const int32_t kernel_ids[3]
 ) {
@@ -252,6 +252,9 @@ void dep_gen_aicpu_record_submit(
     // Cast the enum to uint32_t before the ternary so Linux GCC's -Wextra
     // does not warn about "enumerated and non-enumerated type in conditional".
     uint32_t base_flags = in_manual_scope ? static_cast<uint32_t>(DEP_GEN_FLAG_IN_MANUAL_SCOPE) : 0u;
+    if (early_dispatch) {
+        base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_EARLY_DISPATCH);
+    }
     if (needed > 1) {
         base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_HAS_OVERFLOW);
     }

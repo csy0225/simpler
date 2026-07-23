@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/device_phase.h"
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -164,6 +165,11 @@ typedef struct {
     // DFX-specific fields
     uint64_t start_time;  // Start time of the task
     uint64_t end_time;    // End time of the task
+
+    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
+    // Set post-submit via set_task_timing_slot(); the AICPU folds this task's
+    // dispatch/finish cycles into the tagged slot (see common/device_phase.h).
+    int32_t task_timing_slot;
 } Task;
 
 // =============================================================================
@@ -224,18 +230,18 @@ public:
     int next_task_id;
 
     // Function address mapping (for API compatibility with rt2). Device-read
-    // under PTO2_PROFILING (dump-args path), so it lives in the prefix.
+    // under SIMPLER_DFX (dump-args path), so it lives in the prefix.
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Tensor info metadata for tensor dump. Device-read via get_tensor_info()
-    // under PTO2_PROFILING, so it lives in the prefix.
+    // Tensor info metadata for args dump. Device-read via get_tensor_info()
+    // under SIMPLER_DFX, so it lives in the prefix.
     void *tensor_info_storage_;
     uint64_t tensor_info_storage_bytes_;
     uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
     uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
 
     // Device allocation ranges used to recover tensor buffer addresses from
-    // task.args[]. Device-read via is_tensor_buffer_addr() under PTO2_PROFILING,
+    // task.args[]. Device-read via is_tensor_buffer_addr() under SIMPLER_DFX,
     // so it lives in the prefix.
     void *tensor_allocation_storage_;
     uint64_t tensor_allocation_storage_bytes_;
@@ -299,6 +305,10 @@ public:
      * @return Task ID (>= 0) on success, -1 on failure
      */
     int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+
+    // Tag an already-submitted task with a timing slot (0..15). Out-of-range
+    // task/slot ids are rejected. See common/device_phase.h.
+    void set_task_timing_slot(int task_id, int32_t slot);
 
     /**
      * Add a dependency edge: from_task -> to_task

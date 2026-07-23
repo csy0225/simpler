@@ -11,14 +11,78 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
+- **[critical_path](#critical_path)** — L2 swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
-Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
-are resolved relative to the **current working directory** — run these from the
-directory that holds your `outputs/`. Each test case writes into its own
-`outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
+For CLIs that allow an omitted input, auto-detection paths
+(`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
+relative to the **current working directory** — run these from the directory
+that holds your `outputs/`. Each test case writes into its own
+`outputs/<case>_<ts>/` directory; those tools auto-pick the latest by mtime.
+
+---
+
+## critical_path
+
+Post-processing analysis over an L2-swimlane run. Given a run directory, it
+recursively discovers every directory containing all three required artifacts:
+
+- `l2_swimlane_records.json` (or legacy `l2_perf_records.json`)
+- `deps.json`
+- `name_map*.json` (the newest matching sibling is used when several exist)
+
+When a sibling `merged_swimlane*.json` is present, the newest matching file is
+used as the source for two additional Perfetto-compatible traces:
+
+- `CPM_static.json` — highlights the Static CPM task set.
+- `CPM_observed.json` — highlights the Observed path task set.
+
+Both files retain every view, metadata event, bar, and flow from the merged
+trace. Only AIC/AIV task bars in Worker View (`pid=4`) outside the selected path
+are renamed to `·(rXtY)` (or `·(tY)` for ring 0); path bars and every slice
+in other views keep their original names. With Perfetto's default name-based
+coloring, the middle dot maps to a light blue-purple while digits are removed
+before hashing, so anonymous Worker View bars share a subdued color and path
+bars remain grouped by function. `dummy(...)` and `alloc(...)` bars keep their
+original names because the AICore critical-path model does not classify them.
+
+This supports both simpler directories such as `outputs/<case>_<ts>/` and
+PyPTO directories such as `build_output/<case>/dfx_outputs/`, including nested
+rank/device layouts. Each discovered artifact directory is analyzed separately,
+and its `critical_path_report.md` is written beside
+`l2_swimlane_records.json`. Pointing the command at a whole run therefore
+creates one local report per rank/device rather than one combined report at the
+scan root.
+
+For each rank/device, the tool builds a happens-before DAG from the dependency
+graph oriented by observed timestamps, then computes two critical paths:
+
+- **Static CPM** — the longest duration-weighted path, i.e. the
+  dependency-limited latency floor with unlimited cores.
+- **Observed** — the as-executed backward blame walk from the last-finishing
+  task. Each task's compute plus its preceding scheduling stall (`data-wait`,
+  `core-wait`, or `front-gap`) tiles the makespan exactly.
+
+The report contains a makespan/CPM/compute/stall overview, a per-kernel-family
+table, and a full per-task listing. It is pure post-processing: no C++ or device
+is required. If no sibling `merged_swimlane*.json` exists, Markdown analysis
+still succeeds and the tool prints a warning that the two Perfetto traces were
+skipped.
+
+```bash
+# Analyze one simpler output directory or an entire PyPTO run tree
+python -m simpler_setup.tools.critical_path outputs/<case>_<ts>
+python -m simpler_setup.tools.critical_path build_output/<case>
+
+# Customize each local report filename/table size and print a combined stdout view
+python -m simpler_setup.tools.critical_path <run-dir> \
+    --report critical_path_report.md --top 25 --stdout
+```
+
+`--report` accepts a filename, not a path, so the report cannot be redirected
+away from the directory containing its source `l2_swimlane_records.json`.
 
 ---
 
@@ -38,6 +102,11 @@ python -m simpler_setup.tools.swimlane_converter
 
 # Specify an input file
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
+
+# A unique sibling name_map*.json is loaded automatically.
+# Override it explicitly when needed:
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
+    --func-names outputs/<case>_<ts>/name_map_<case>.json
 
 # Specify an output file
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
@@ -61,6 +130,11 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 > `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
 > alongside the perf JSON (and `--deps-json` isn't passed), the trace
 > still renders but has no arrows; the converter prints a warning.
+
+When neither `--func-names` nor `--kernel-config` is specified, the converter
+loads a unique `name_map*.json` next to the input file. If that directory
+contains multiple matching files, it prints a warning and uses default function
+labels until one is selected explicitly with `--func-names`.
 
 ### SPMD dependency visualization
 
@@ -90,7 +164,7 @@ SPMD tasks are present.
 | `input` | | Input JSON file (l2_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
-| `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
+| `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping |
 | `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
 | `--overhead` | | Add the 8-line Overhead Analysis counter group (needs `deps.json`). See [sched-overhead-model](../../docs/dfx/sched-overhead-model.md). |
 | `--verbose` | `-v` | Enable verbose output |
@@ -114,6 +188,13 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Latency**: end-to-end latency from the AICPU perspective (finish_time - dispatch_time, including head OH + Exec + tail OH)
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
+
+The table prints the source `l2_swimlane_level` recorded in
+`l2_swimlane_records.json`. At level 1, only AICore timing is captured, so
+Latency, Exec%, Head/Tail OH, and Propagation render as `-`, including total
+latency in the TOTAL row. Count, Exec, and Local Setup remain available. The
+`Total Test Time` line is omitted and replaced by an `AICore Observed Span`
+summary. Level 2 and above retain the full latency summary.
 
 #### 3. Scheduler Overhead Deep-Dive
 
@@ -205,7 +286,7 @@ The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_schedule
 
 Per-stage breakdown of every `simpler_run()` from `[STRACE]` host-trace
 markers in a log (host stderr or CANN device log). The runtime emits one
-`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_PROFILING`,
+`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_HOST_STRACE`,
 `LOG_INFO_V9`), including the AICPU device-phase subdivision (`clk=dev`). See
 [docs/dfx/host-trace.md](../../docs/dfx/host-trace.md) for the marker grammar.
 
@@ -229,6 +310,13 @@ Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
 buckets by callable hash `hid`, and reports each callable's mean `simpler_run`
 plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
 host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
+
+`--tree` renders one nested span tree per callable; each node's duration is the
+**median across every invocation** of that callable (not one invocation's
+value). This matters for a callable whose invocations differ in cost — e.g.
+qwen3 decode, where the pypto-serving profile warmup dispatches a tiny-KV step
+(seq_len≈257, ~28 ms) before the real 3.5k-context steps (~40 ms); a
+single-invocation tree would report the warmup value.
 
 `--rounds-table` renders one row per invocation of the busiest `hid` —
 **Host** always, plus **Device / Effective / Orch / Sched** when present, in the
@@ -261,7 +349,7 @@ this is the structural view.
     - `annotated_edges`: total number of annotated edge rows
     - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
     - `func_name_map`: `yes` when at least one task name resolved to a named
-      `func_name` from `--func-names` or an auto-discovered `name_map_*.json`.
+      `func_name` from `--func-names` or an auto-discovered `name_map*.json`.
       `func_name_map` stays `no` unless a real human-readable name was resolved.
   - `TASK INDEX` (one line per task for grep)
     - `kind=` distinguishes `submit` / `dummy` / `alloc` / `unknown`
@@ -302,15 +390,47 @@ python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
 # Override task labels with a func_id -> name mapping
 python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+
+# Transitive reduction: select non-redundant edges, print what was removed
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --edge-mode reduced
+
+# Redundant-only: select the transitively-implied edges reduced would drop
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --edge-mode omitted
 ```
+
+`--edge-mode` selects which structural `(pred, succ)` edges are visible:
+
+- `full` (default) — every dependency edge.
+- `reduced` — the minimal (transitively-reduced) edge set: every edge already
+  implied by a longer path is dropped, e.g. `A->C` when `A->B->C` exists.
+- `omitted` — only the redundant edges `reduced` would drop (its complement),
+  for auditing exactly which dependencies are transitively covered.
+
+`reduced` and `omitted` print the redundant edges to stdout as a
+`<task> -> <task>` list, where each task uses the same label as the rendered
+graph — the bare `local` counter when every task is in ring 0, or the explicit
+`(ring, local)` tuple once any task lives in ring >= 1. Text output emits only
+the selected edge set. HTML output keeps every edge in the Graphviz layout and
+colors unselected edges like the page background, so `reduced` / `omitted`
+preserve the full-graph node placement and routing while showing only the
+selected edge set. Selected edges are drawn above background-colored edges so
+they stay visible where routes overlap. When `-o` is omitted the graph is
+written to a mode-specific stem (`deps_viewer_reduced.*` /
+`deps_viewer_omitted.*`) rather than `deps_viewer.*` so it never clobbers a
+full-graph render in the same directory. Reduction is purely structural (it
+ignores the per-edge tensor/arg identity) and is skipped with a warning if the
+graph contains a cycle.
 
 ### Command-Line Options
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
 | `input` | | Path to `deps.json` (default: newest under `./outputs/`) |
-| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML) |
+| `--output` | `-o` | Output path; default stem is `deps_viewer`, or `deps_viewer_{mode}` for `reduced` / `omitted` |
 | `--format` | | Output format: `text` (default) or `html` |
+| `--edge-mode` | | Select visible edges: `full`, `reduced`, or `omitted`; HTML preserves full layout. |
 | `--engine` | | HTML-only Graphviz layout engine: `dot` (default), `sfdp`, `neato`, `fdp`, `circo`, `twopi` |
 | `--direction` | | HTML-only flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL` |
 | `--show-tensor-info` | | HTML-only: render per-task tensor rows and route edges to specific arg ports |
@@ -331,7 +451,8 @@ at view time.
 ### Browser controls
 
 - **drag** → pan
-- **wheel** → zoom about cursor
+- **scroll / two-finger swipe** → pan
+- **Ctrl+scroll / trackpad pinch** → zoom about cursor
 - **f** → fit to view
 - **r** → reset to 1:1
 
@@ -448,8 +569,8 @@ The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 
 - A structural view of task dependencies (who feeds whom)
 - Fast grep-friendly inspection via the default text output
-- A single-file HTML you can open offline, drag-pan / wheel-zoom in any
-  browser when you want a visual layout
+- A single-file HTML you can open offline and pan by dragging or scrolling;
+  use Ctrl+scroll or trackpad pinch to zoom
 - Optional per-task tensor rows and arg-port routing in HTML via
   `--show-tensor-info`
 - A graph that survives without an associated timing run (deps.json is

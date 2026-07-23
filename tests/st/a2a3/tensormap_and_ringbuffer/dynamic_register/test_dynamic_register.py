@@ -158,10 +158,10 @@ def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
         config.block_dim = 3
         config.aicpu_thread_num = 4
 
-        # 1. Run pre_handle once to force _start_hierarchical (forks chip
-        #    children, runs the CTRL_PREPARE prewarm loop). This puts the
-        #    chip child into _run_chip_main_loop, the only state in which
-        #    a CTRL_REGISTER broadcast can be ACKed.
+        # 1. Run pre_handle once against the snapshot-prepared chip callable.
+        #    init() already forked the chip children and prepared the startup
+        #    snapshot, so they are in _run_chip_main_loop — the only state in
+        #    which the CTRL_REGISTER broadcast in step 2 can be ACKed.
         def orch_pre(o, _args, _cfg):
             o.submit_next_level(pre_handle, chip_args_pre, config)
 
@@ -265,7 +265,10 @@ def test_prepare_capacity_overflow_post_start(st_platform, st_device_ids):
     worker = Worker(
         level=3,
         device_ids=[int(st_device_ids[0])],
-        num_sub_workers=0,
+        # A sub worker gives the LOCAL_PYTHON fillers below a valid resolver, so
+        # they exercise the shared capacity ceiling as eligible registrations
+        # (not inert ones) alongside the chip callable.
+        num_sub_workers=1,
         platform=st_platform,
         runtime=_RUNTIME,
     )

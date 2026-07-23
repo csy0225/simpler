@@ -944,7 +944,7 @@ class ChipWorker:
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
 
-    def init(self, device_id, bins, log_level=None, log_info_v=None):
+    def init(self, device_id, bins, log_level=None, log_info_v=None, prewarm_config=None, enable_sdma=False):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
 
@@ -1010,6 +1010,8 @@ class ChipWorker:
             str(bins.aicore_path),
             "" if dispatcher_path is None else str(dispatcher_path),
             int(device_id),
+            prewarm_config,
+            bool(enable_sdma),
         )
         for slot_id, callable_obj in list(self._callable_registry.items()):
             self._impl.register_callable(int(slot_id), callable_obj)
@@ -1019,11 +1021,13 @@ class ChipWorker:
 
         Terminal operation — the object cannot be reused after this.
         """
-        self._impl.finalize()
-        with self._registry_lock:
-            self._callable_registry.clear()
-            self._identity_registry.clear()
-            self._live_handles.clear()
+        try:
+            self._impl.finalize()
+        finally:
+            with self._registry_lock:
+                self._callable_registry.clear()
+                self._identity_registry.clear()
+                self._live_handles.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
@@ -1207,19 +1211,6 @@ class ChipWorker:
     def copy_from(self, dst, src, size):
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._impl.copy_from(int(dst), int(src), int(size))
-
-    def l3_l2_orch_comm_init_from_addr(self, control_block_addr: int, control_block_size: int) -> None:
-        """Start the independent L3-L2 orchestrator communication service.
-
-        ``control_block_addr`` must point at a shared-memory control block
-        mapped in this chip child process. The child keeps that mapping alive
-        until the service is shut down.
-        """
-        self._impl.l3_l2_orch_comm_init_from_addr(int(control_block_addr), int(control_block_size))
-
-    def l3_l2_orch_comm_shutdown(self) -> None:
-        """Stop the independent L3-L2 orchestrator communication service."""
-        self._impl.l3_l2_orch_comm_shutdown()
 
     def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
         """Initialize a distributed communicator for this rank.

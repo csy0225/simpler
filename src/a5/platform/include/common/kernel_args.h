@@ -38,6 +38,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/dma_workspace.h"
+
 // Forward declarations
 class Runtime;
 
@@ -102,7 +104,7 @@ struct KernelArgs {
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|l2_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
@@ -115,13 +117,12 @@ static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
 /**
- * InitArgs - per-device one-shot invariants
+ * InitArgs - per-device runtime configuration
  *
- * Uploaded once at worker init via the `simpler_aicpu_init` entry, before any
- * register_callable/exec launch. Carries the values fixed for the lifetime of
- * the device context (orch device id, log config) so they no longer ride on
- * the per-run KernelArgs: latched once into the resident AICPU SO globals and
- * surviving every subsequent per-task launch.
+ * Uploaded at worker init via `simpler_aicpu_init`, before any
+ * register_callable/exec launch. Republished when first-use provisioning adds
+ * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
+ * resident AICPU SO keeps the latest configuration across task launches.
  *
  * `regs` is intentionally NOT here — on a5 the per-core register table is also
  * read by the AICore KERNEL_ENTRY off the per-run device KernelArgs copy, so it
@@ -132,6 +133,9 @@ struct InitArgs {
     uint32_t log_level{1};            // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};           // INFO verbosity threshold (0..9); default V5
     int32_t scheduler_timeout_ms{0};  // AICPU no-progress watchdog (ms); 0 -> compile default
+    // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
+    // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
+    uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
 };
 
 /**

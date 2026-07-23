@@ -143,7 +143,8 @@ class KernelCompiler:
         runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
-        return [runtime_dir, runtime_common_dir, common_dir] + self.get_platform_include_dirs()
+        src_common_dir = str(self.project_root / "src" / "common")
+        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -155,8 +156,15 @@ class KernelCompiler:
         exposes them. Both compile_incore and _compile_incore_sim prepend
         these regardless of what extra_include_dirs the caller passes, so
         kernels can include them without the call site knowing the dependency.
+
+        Also carries ``src/common/platform/include`` so kernel-facing runtime
+        headers (e.g. ``intrinsic.h``) can pull shared platform headers like
+        ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [str(Path(__file__).resolve().parent / "incore")]
+        return [
+            str(Path(__file__).resolve().parent / "incore"),
+            str(self.project_root / "src" / "common" / "platform" / "include"),
+        ]
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -208,6 +216,15 @@ class KernelCompiler:
                         source_files.append(str(f))
 
         return include_dirs, source_files
+
+    def _get_orchestration_platform_sources(self) -> list[str]:
+        """Sources needed when public AICPU helper headers are used by orchestration SOs."""
+        variant = "sim" if self.platform.endswith("sim") else "onboard"
+        source_dir = self.project_root / "src" / "common" / "platform" / variant / "aicpu"
+        return [
+            str(source_dir / "cache_ops.cpp"),
+            str(source_dir / "device_time.cpp"),
+        ]
 
     def _run_subprocess(
         self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
@@ -417,16 +434,25 @@ class KernelCompiler:
         orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
         if orch_includes:
             include_dirs = include_dirs + orch_includes
+        orch_sources = list(orch_sources) + self._get_orchestration_platform_sources()
 
-        # Resolve toolchain: HOST_GXX needs no runtime-specific extras
-        toolchain_type = self._get_toolchain(
-            {
-                "a2a3": ToolchainType.AARCH64_GXX,
-                "a2a3sim": ToolchainType.HOST_GXX,
-                "a5": ToolchainType.AARCH64_GXX,
-                "a5sim": ToolchainType.HOST_GXX,
-            },
-        )
+        # host_build_graph dlopens the orchestration .so on the host, so it
+        # compiles with the host g++ (x86_64) regardless of platform.
+        # tensormap_and_ringbuffer dlopens it on the aarch64 AICPU onboard, so
+        # it cross-compiles there and uses the host g++ only for sim.
+        if runtime_name == "host_build_graph":
+            toolchain_type = ToolchainType.HOST_GXX
+        elif runtime_name == "tensormap_and_ringbuffer":
+            toolchain_type = self._get_toolchain(
+                {
+                    "a2a3": ToolchainType.AARCH64_GXX,
+                    "a2a3sim": ToolchainType.HOST_GXX,
+                    "a5": ToolchainType.AARCH64_GXX,
+                    "a5sim": ToolchainType.HOST_GXX,
+                },
+            )
+        else:
+            raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
         toolchain: Union[GxxToolchain, Aarch64GxxToolchain]
         if toolchain_type == ToolchainType.AARCH64_GXX:
             assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
@@ -436,7 +462,8 @@ class KernelCompiler:
 
         # HOST_GXX: simulation build (host execution)
         # AARCH64_GXX: cross-compilation for supported runtimes
-        #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
+        # Runtime calls still go through pto_orchestration_api.h; platform helper sources
+        # are linked only for public AICPU utility headers used directly by orchestration code.
         return self._compile_orchestration_shared_lib(
             source_path,
             toolchain,
@@ -558,7 +585,9 @@ class KernelCompiler:
         cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
         cmd += self._sanitizer_flags(self.gxx15)
 
-        # Add PTO ISA header paths if provided
+        # Add PTO ISA header paths if provided. The path always comes from
+        # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,
+        # so no per-compile re-check is needed here.
         if pto_isa_root:
             pto_include = os.path.join(pto_isa_root, "include")
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")

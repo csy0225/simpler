@@ -38,6 +38,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/dma_workspace.h"
+
 // Forward declarations
 class Runtime;
 
@@ -68,7 +70,7 @@ extern "C" {
  * - runtime_args: Written by host, read by AICPU (task runtime, includes
  *   handshake buffers)
  * - dump_data_base: Written by host, read by AICPU platform layer; zero when
- *   tensor dump is unused
+ *   args dump is unused
  * - pmu_data_base: Written by host platform, read by AICPU platform layer;
  *   zero when PMU is unused
  * - dep_gen_data_base: Written by host platform, read by AICPU platform layer;
@@ -76,7 +78,7 @@ extern "C" {
  *
  * enable_profiling_flag bit definitions (umbrella bitmask — "profiling" is
  * the umbrella, each bit is a parallel diagnostics sub-feature):
- * - bit0: tensor dump enabled
+ * - bit0: args dump enabled
  * - bit1: L2 swimlane enabled
  * - bit2: PMU enabled
  * - bit3: dep_gen capture enabled
@@ -123,21 +125,19 @@ struct KernelArgs {
     // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
     // 32-bit tail.
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|l2_swimlane|pmu|dep_gen|scope_stats
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
 /**
- * InitArgs - per-device one-shot invariants
+ * InitArgs - per-device runtime configuration
  *
- * Uploaded once at worker init via the `simpler_aicpu_init` entry, before any
- * register_callable/exec launch. Carries the values that are fixed for the
- * lifetime of the device context, so they no longer ride on the per-run
- * KernelArgs: the AICPU platform globals (orch device id, log verbosity) are
- * latched once into the resident AICPU SO and survive every subsequent
- * per-task launch.
+ * Uploaded at worker init via `simpler_aicpu_init`, before any
+ * register_callable/exec launch. Republished when first-use provisioning adds
+ * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
+ * resident AICPU SO keeps the latest configuration across task launches.
  *
  * `regs` / `pmu_reg_addrs` are intentionally NOT here — they back per-core
  * register tables consumed on the per-run AICore path and stay in KernelArgs.
@@ -147,6 +147,9 @@ struct InitArgs {
     uint32_t log_level{1};            // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};           // INFO verbosity threshold (0..9); default V5
     int32_t scheduler_timeout_ms{0};  // AICPU no-progress watchdog (ms); 0 -> compile default
+    // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
+    // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
+    uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
 };
 
 /**

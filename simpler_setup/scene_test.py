@@ -36,7 +36,31 @@ from .pto_isa import ensure_pto_isa_root
 
 logger = logging.getLogger(__name__)
 
-_compile_cache: dict[tuple[str, str, str], object] = {}
+_compile_cache: dict[tuple, object] = {}
+
+
+def _pto_isa_compile_cache_token() -> str:
+    """Pin SHA included in session compile-cache keys.
+
+    ``ensure_pto_isa_root()`` always resolves the managed checkout, but the
+    session cache previously keyed only on (qualname, platform, runtime). A
+    mid-session pin bump could then reuse kernels built against the old ISA.
+    """
+    from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+    return read_pto_isa_pin()
+
+
+def l3_compile_cache_key(qualname: str, name: str, platform: str, runtime: str) -> tuple:
+    """Session compile-cache key for an L3 orchestration entry.
+
+    Every L3 compile path (scene-test ``test_run``, standalone worker, the
+    ``st_worker`` pytest fixture) keys ``_compile_cache`` through here so they
+    share one entry per orchestration; a divergent key format recompiles the
+    same kernels once per path. The pin token pins the key to the current
+    pto-isa revision.
+    """
+    return (qualname, name, platform, runtime, _pto_isa_compile_cache_token())
 
 
 def clear_compile_cache() -> None:
@@ -115,15 +139,31 @@ class TaskArgsBuilder:
         self._add_scalar(Scalar(name, value))
 
     def _add_tensor(self, spec: Tensor) -> None:
+        # Names are this container's lookup keys, so reject a bad name before any
+        # mutation — a rejected add leaves the builder untouched.
+        self._reject_bad_name(spec.name)
         if self._has_scalar:
             raise ValueError("Cannot add tensor after scalar (tensor-before-scalar ordering required)")
         self._specs.append(spec)
         self._data[spec.name] = spec.value
 
     def _add_scalar(self, spec: Scalar) -> None:
+        self._reject_bad_name(spec.name)
         self._has_scalar = True
         self._specs.append(spec)
         self._data[spec.name] = spec.value
+
+    def _reject_bad_name(self, name: str) -> None:
+        # A name already stored duplicates an argument. A name that resolves to a
+        # real attribute (the `specs`/`clone`/`tensor_names`/`add_*` members)
+        # would shadow that member: `__getattr__` only fires on lookup miss, so
+        # `args.<name>` would return the member, not the argument value. Reject
+        # both — names must be unique across tensors and scalars and must not
+        # collide with the container's own surface.
+        if name in self._data:
+            raise ValueError(f"TaskArgsBuilder: duplicate argument name {name!r}")
+        if hasattr(self, name):
+            raise ValueError(f"TaskArgsBuilder: argument name {name!r} conflicts with builder attributes/methods")
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -165,6 +205,121 @@ class TaskArgsBuilder:
     def tensor_names(self) -> list[str]:
         """Names of all tensor arguments, in order."""
         return [s.name for s in self._specs if isinstance(s, Tensor)]
+
+
+class _RehostedTaskArgs:
+    """Move a builder's host tensors into born-shared child buffers.
+
+    ``Worker.init()`` is eager: the L3 chip/sub children are forked in ``init()``,
+    before ``generate_args()`` runs, so a plain post-init host tensor's raw VA is
+    not in any child's address space. Each host tensor is rehosted into its own
+    ``create_host_buffer`` (born-shared, mapped into every direct child) with
+    dtype / shape / value preserved, and the builder is rebound to a view over
+    that buffer so multi-round reset, dispatch, and golden compare all read and
+    write the same physical pages the children see.
+
+    Each tensor gets an independent buffer (no aliasing of one registered range).
+    A non-contiguous / non-faithfully-representable layout is rejected rather
+    than silently copied to contiguous. ``release()`` frees every buffer in LIFO
+    order; a partial-construction failure rolls the builder back and frees what
+    was already allocated.
+    """
+
+    def __init__(self, worker, test_args: TaskArgsBuilder):
+        import torch  # noqa: PLC0415
+
+        self._worker = worker
+        self._torch = torch
+        self._buffers: list = []  # (HostBuffer, view) in creation order
+        self._originals: dict[str, Any] = {}  # name -> pre-rehost tensor
+        self._test_args = test_args
+        self._reject_aliased_tensors(test_args)
+        try:
+            new_specs = []
+            for spec in test_args._specs:
+                # Only non-empty host tensors carry bytes across the process edge;
+                # an empty tensor is never dereferenced by the child, so it is
+                # left untouched rather than allocating a zero-length buffer.
+                if isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor) and spec.value.numel() > 0:
+                    view = self._rehost_one(spec.value)
+                    self._originals[spec.name] = test_args._data[spec.name]
+                    test_args._data[spec.name] = view
+                    new_specs.append(Tensor(spec.name, view))
+                else:
+                    new_specs.append(spec)
+            test_args._specs = new_specs
+        except BaseException:
+            self.release()
+            raise
+
+    def _reject_aliased_tensors(self, test_args: TaskArgsBuilder) -> None:
+        # Two args whose storage byte-ranges overlap encode an OverlapMap
+        # dependency that independent born-shared buffers cannot preserve, so
+        # reject rather than silently split them into separate storage.
+        torch = self._torch
+        ranges: list = []  # (name, lo, hi)
+        for spec in test_args._specs:
+            if not (isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor)):
+                continue
+            t = spec.value
+            if t.numel() == 0:
+                continue
+            lo = t.data_ptr()
+            hi = lo + t.numel() * t.element_size()
+            for oname, olo, ohi in ranges:
+                if lo < ohi and olo < hi:
+                    raise ValueError(
+                        f"SceneTest rehost: tensors {spec.name!r} and {oname!r} alias overlapping storage; "
+                        "an aliased layout is not faithfully representable across the process edge — build "
+                        "them as independent tensors in generate_args()"
+                    )
+            ranges.append((spec.name, lo, hi))
+
+    def _rehost_one(self, t):
+        torch = self._torch
+        if t.device.type != "cpu":
+            raise ValueError(
+                f"SceneTest rehost: a host tensor crossing a process edge must be a CPU tensor, got "
+                f"device {t.device}; a device tensor must be declared child_memory, not rehosted to host"
+            )
+        if not t.is_contiguous():
+            raise ValueError(
+                "SceneTest rehost: a host tensor crossing a process edge must be contiguous to move "
+                "into a born-shared child buffer; a non-contiguous / aliased layout is not faithfully "
+                "representable — build it contiguous in generate_args()"
+            )
+        nbytes = t.numel() * t.element_size()
+        buf = self._worker.create_host_buffer(nbytes)
+        try:
+            view = torch.frombuffer(buf.buffer, dtype=t.dtype, count=t.numel()).view(t.shape)
+            view.copy_(t)
+        except BaseException:
+            self._worker.free_host_buffer(buf)
+            raise
+        self._buffers.append((buf, view))
+        return view
+
+    def release(self) -> None:
+        # Restore the builder's original entries (dropping the born-shared view
+        # refs), then free each buffer in LIFO order after releasing its view.
+        for name, orig in self._originals.items():
+            self._test_args._data[name] = orig
+        self._test_args._specs = [
+            Tensor(s.name, self._originals[s.name]) if isinstance(s, Tensor) and s.name in self._originals else s
+            for s in self._test_args._specs
+        ]
+        self._originals.clear()
+        while self._buffers:
+            buf, view = self._buffers.pop()
+            del view
+            try:
+                buf.buffer.release()
+            except (ValueError, BufferError):
+                pass
+            try:
+                self._worker.free_host_buffer(buf)
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup; a leak here must not mask the test result, but process-control exceptions still propagate
+                logger.warning("SceneTest rehost cleanup: free_host_buffer failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +998,7 @@ class SceneTestCase:
     @classmethod
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
-        cache_key = (cls.__qualname__, platform, cls._st_runtime)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
         return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
@@ -853,7 +1008,7 @@ class SceneTestCase:
         for entry in cls.CALLABLE["callables"]:
             if "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
@@ -924,7 +1079,7 @@ class SceneTestCase:
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
         config.enable_l2_swimlane = enable_l2_swimlane
-        config.enable_dump_tensor = enable_dump_args
+        config.enable_dump_args = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
@@ -1109,51 +1264,59 @@ class SceneTestCase:
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-        # Save initial tensor values for reset between rounds
-        all_tensor_names = test_args.tensor_names()
-        initial_tensors = {}
-        if rounds > 1:
-            for name in all_tensor_names:
-                initial_tensors[name] = getattr(test_args, name).clone()
+        # Eager Worker.init() forked the chip/sub children before generate_args
+        # ran, so move test_args' host tensors into born-shared buffers the
+        # children can see. Golden was cloned above from the original host data;
+        # reset, dispatch, and compare below all operate on the rehosted views.
+        rehosted = _RehostedTaskArgs(worker, test_args)
+        try:
+            # Save initial tensor values for reset between rounds
+            all_tensor_names = test_args.tensor_names()
+            initial_tensors = {}
+            if rounds > 1:
+                for name in all_tensor_names:
+                    initial_tensors[name] = getattr(test_args, name).clone()
 
-        # Build CallableNamespace: compiled ChipCallables + sub callable IDs
-        ns = CallableNamespace({**compiled_callables, **sub_handles})
+            # Build CallableNamespace: compiled ChipCallables + sub callable IDs
+            ns = CallableNamespace({**compiled_callables, **sub_handles})
 
-        # Get orch function (plain function from CALLABLE)
-        orch_fn = self.CALLABLE["orchestration"]
+            # Get orch function (plain function from CALLABLE)
+            orch_fn = self.CALLABLE["orchestration"]
 
-        # Execute rounds. As for L2 (see _run_and_validate_l2), per-round timing
-        # is obtained offline from the `[STRACE]` stderr markers via
-        # `strace_timing --rounds-table`; the L3 chip children emit their own
-        # markers (grouped by (pid, inv)), so multi-round works without any
-        # inline fd capture here.
-        for round_idx in range(rounds):
-            if round_idx > 0:
-                for name, initial in initial_tensors.items():
-                    getattr(test_args, name).copy_(initial)
+            # Execute rounds. As for L2 (see _run_and_validate_l2), per-round
+            # timing is obtained offline from the `[STRACE]` stderr markers via
+            # `strace_timing --rounds-table`; the L3 chip children emit their own
+            # markers (grouped by (pid, inv)), so multi-round works without any
+            # inline fd capture here.
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_tensors.items():
+                        getattr(test_args, name).copy_(initial)
 
-            # See _run_and_validate_l2: the per-round masking is dead code
-            # under the existing upstream gate. Keep parity by passing through.
-            config = self._build_config(
-                config_dict,
-                enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_args=enable_dump_args,
-                enable_pmu=enable_pmu,
-                enable_dep_gen=enable_dep_gen,
-                enable_scope_stats=enable_scope_stats,
-                output_prefix=output_prefix,
-            )
+                # See _run_and_validate_l2: the per-round masking is dead code
+                # under the existing upstream gate. Keep parity by passing through.
+                config = self._build_config(
+                    config_dict,
+                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_dump_args=enable_dump_args,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    enable_scope_stats=enable_scope_stats,
+                    output_prefix=output_prefix,
+                )
 
-            # Orch fn signature: (orch, args, cfg) — inner fn forwards to
-            # the user's scene orch which takes (orch, callables, task_args, config).
-            def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
-                orch_fn(orch, _ns, _test_args, _config)
+                # Orch fn signature: (orch, args, cfg) — inner fn forwards to
+                # the user's scene orch which takes (orch, callables, task_args, config).
+                def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
+                    orch_fn(orch, _ns, _test_args, _config)
 
-            with _temporary_env(self._resolve_env()):
-                worker.run(task_orch)
+                with _temporary_env(self._resolve_env()):
+                    worker.run(task_orch)
 
-            if not skip_golden:
-                _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+                if not skip_golden:
+                    _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+        finally:
+            rehosted.release()
 
     # ------------------------------------------------------------------
     # pytest auto test method
@@ -1401,7 +1564,9 @@ class SceneTestCase:
                     f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
                 )
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
+        # Eager pin checkout for kernel/orchestration compiles that pass
+        # pto_isa_root explicitly. Do not export PTO_ISA_ROOT (#1403).
+        ensure_pto_isa_root(verbose=True)
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
@@ -1812,7 +1977,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle

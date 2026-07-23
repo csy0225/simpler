@@ -23,7 +23,7 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
 
 // Run-wall capture: the host allocates a device buffer addressed by
@@ -75,16 +75,16 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // profiling-buffer bases are pushed here.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_args_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table(k_args->l2_swimlane_aicore_rotation_table);
-    set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
+    set_l2_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
-    set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
     set_platform_dep_gen_base(k_args->dep_gen_data_base);
-    set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
-    set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
+    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
+    set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
     // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU
@@ -129,11 +129,11 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
 /**
  * AICPU per-device init entry point.
  *
- * Launched once at worker init (before any register_callable / exec), this
- * latches the per-device invariants — log config and orchestration device id —
- * into the resident AICPU SO globals. Because the inner SO stays dlopen'd in
- * the AICPU OS process across launches, these globals survive every subsequent
- * per-task launch, so exec / register_callable no longer re-push them.
+ * Launched at worker init (before any register_callable / exec), this latches
+ * the per-device invariants into the resident AICPU SO globals. It is launched
+ * again only when first-use provisioning adds an async-DMA workspace. Because
+ * the inner SO stays dlopen'd across launches, the latest values survive every
+ * subsequent per-task launch.
  *
  * @param arg Pointer to an InitArgs payload
  * @return 0 on success, non-zero on error
@@ -150,6 +150,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     set_log_info_v(static_cast<int>(init_args->log_info_v));
     set_orch_device_id(static_cast<int>(init_args->device_id));
     set_scheduler_timeout_ms(static_cast<int>(init_args->scheduler_timeout_ms));
+    for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+        set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
+    }
 
     LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
     return 0;

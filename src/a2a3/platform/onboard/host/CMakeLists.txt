@@ -61,7 +61,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
@@ -77,7 +77,6 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

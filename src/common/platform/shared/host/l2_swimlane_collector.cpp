@@ -20,6 +20,7 @@
 
 #include "host/l2_swimlane_collector.h"
 
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
@@ -42,6 +43,37 @@
 // Sched / orch phase records route through separate BufferKinds; no
 // parse-time discriminator function is needed (the device-side type tag is
 // the source of truth).
+
+namespace {
+
+int owner_recycled_shard_for_core(int core_index, int thread_count) {
+    int cluster_index = core_index / PLATFORM_CORES_PER_BLOCKDIM;
+    return cluster_index % thread_count;
+}
+
+bool recycled_seed_capacity_is_sufficient(
+    const char *label, int num_cores, int thread_count, int surplus_per_core, size_t capacity
+) {
+    if (surplus_per_core <= 0) return true;
+    std::array<int, PLATFORM_MAX_AICPU_THREADS> per_shard{};
+    for (int core = 0; core < num_cores; core++) {
+        per_shard[static_cast<size_t>(owner_recycled_shard_for_core(core, thread_count))] += surplus_per_core;
+    }
+
+    bool ok = true;
+    for (int shard = 0; shard < thread_count; shard++) {
+        if (static_cast<size_t>(per_shard[static_cast<size_t>(shard)]) <= capacity) continue;
+        LOG_ERROR(
+            "%s recycled seed exceeds lane capacity: shard=%d need=%d capacity=%zu "
+            "(num_cores=%d thread_count=%d)",
+            label, shard, per_shard[static_cast<size_t>(shard)], capacity, num_cores, thread_count
+        );
+        ok = false;
+    }
+    return ok;
+}
+
+}  // namespace
 
 L2SwimlaneCollector::~L2SwimlaneCollector() {
     stop();
@@ -73,6 +105,16 @@ int L2SwimlaneCollector::initialize(
         LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
         return -1;
     }
+    if (aicpu_thread_num <= 0 || aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Invalid number of AICPU threads: %d (valid range: 1-%d)", aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
+        );
+        return -1;
+    }
+
+    // Must precede the recycled-lane seeding below: push_recycled() folds its
+    // shard argument modulo the manager's shard count.
+    set_aicpu_thread_num(aicpu_thread_num);
 
     num_aicore_ = num_aicore;
     aicpu_thread_num_ = aicpu_thread_num;
@@ -178,6 +220,16 @@ int L2SwimlaneCollector::initialize(
     // Step 5: Initialize L2SwimlaneAicpuTaskPools. Seed as many buffers as
     // the device-side free_queue can hold; any remaining buffers stay in the
     // host recycled pool.
+    constexpr int kAicpuInitialFreeCount = (PLATFORM_PROF_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
+                                               PLATFORM_PROF_BUFFERS_PER_CORE :
+                                               PLATFORM_PROF_SLOT_COUNT;
+    constexpr int kAicpuSurplusPerCore = PLATFORM_PROF_BUFFERS_PER_CORE - kAicpuInitialFreeCount;
+    if (!recycled_seed_capacity_is_sufficient(
+            "L2SwimlaneAicpuTask", num_aicore, aicpu_thread_num, kAicpuSurplusPerCore,
+            decltype(manager_)::kRecycledQueueCapacity
+        )) {
+        return -1;
+    }
     for (int i = 0; i < num_aicore; i++) {
         L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(perf_host_ptr, i);
         memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
@@ -187,9 +239,7 @@ int L2SwimlaneCollector::initialize(
         state->head.current_buf_ptr = 0;
         state->head.current_buf_seq = 0;
 
-        const int initial_free_count = (PLATFORM_PROF_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
-                                           PLATFORM_PROF_BUFFERS_PER_CORE :
-                                           PLATFORM_PROF_SLOT_COUNT;
+        const int initial_free_count = kAicpuInitialFreeCount;
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicpuTaskBuffer), &host_buf_ptr);
@@ -204,7 +254,11 @@ int L2SwimlaneCollector::initialize(
             if (s < initial_free_count) {
                 state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::AICPU_TASK), dev_buf_ptr);
+                int shard = owner_recycled_shard_for_core(i, aicpu_thread_num);
+                int kind = static_cast<int>(ProfBufferType::AICPU_TASK);
+                if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                    (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                }
             }
         }
         wmb();
@@ -214,13 +268,21 @@ int L2SwimlaneCollector::initialize(
 
     // Step 5b: Initialize L2SwimlaneAicoreTaskPools — per-core AICore rotation
     // channel + buffer pool. Same SPSC pattern as the AICPU pool above.
+    constexpr int kAicoreInitialFreeCount = (PLATFORM_AICORE_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
+                                                PLATFORM_AICORE_BUFFERS_PER_CORE :
+                                                PLATFORM_PROF_SLOT_COUNT;
+    constexpr int kAicoreSurplusPerCore = PLATFORM_AICORE_BUFFERS_PER_CORE - kAicoreInitialFreeCount;
+    if (!recycled_seed_capacity_is_sufficient(
+            "L2SwimlaneAicoreTask", num_aicore, aicpu_thread_num, kAicoreSurplusPerCore,
+            decltype(manager_)::kRecycledQueueCapacity
+        )) {
+        return -1;
+    }
     for (int i = 0; i < num_aicore; i++) {
         L2SwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
         memset(ac_state, 0, sizeof(L2SwimlaneAicoreTaskPool));
 
-        const int initial_free_count = (PLATFORM_AICORE_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
-                                           PLATFORM_AICORE_BUFFERS_PER_CORE :
-                                           PLATFORM_PROF_SLOT_COUNT;
+        const int initial_free_count = kAicoreInitialFreeCount;
         for (int s = 0; s < PLATFORM_AICORE_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicoreTaskBuffer), &host_buf_ptr);
@@ -235,7 +297,11 @@ int L2SwimlaneCollector::initialize(
             if (s < initial_free_count) {
                 ac_state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::AICORE_TASK), dev_buf_ptr);
+                int shard = owner_recycled_shard_for_core(i, aicpu_thread_num);
+                int kind = static_cast<int>(ProfBufferType::AICORE_TASK);
+                if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                    (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                }
             }
         }
         wmb();
@@ -308,7 +374,14 @@ int L2SwimlaneCollector::initialize(
                 if (s < initial_free_count) {
                     state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
                 } else {
-                    manager_.push_recycled(static_cast<int>(recycle_kind), dev_buf_ptr);
+                    int shard = t;
+                    if (recycle_kind == ProfBufferType::AICPU_ORCH_PHASE) {
+                        shard = (aicpu_thread_num > 0) ? (aicpu_thread_num - 1) : 0;
+                    }
+                    int kind = static_cast<int>(recycle_kind);
+                    if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                        (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                    }
                 }
             }
             wmb();
@@ -318,12 +391,16 @@ int L2SwimlaneCollector::initialize(
         return 0;
     };
 
-    // Sched: actual scheduler-thread count is unknown at host-alloc time, so
-    // size buffers to the platform max. Orch: a single instance (pool 0), so
-    // allocate buffers for just one pool while still zeroing all MAX states.
+    // The shm layout spans PLATFORM_MAX_AICPU_THREADS pool states (state_count)
+    // because AICPU's pool-array offsets are fixed at that stride, but only the
+    // first `aicpu_thread_num` of them ever get a producer — so buffers are
+    // allocated for those alone. Seeding a pool at t >= aicpu_thread_num would
+    // also push its surplus into recycled lane `t`, which no drain thread owns.
+    // Orch: a single instance (pool 0), so allocate buffers for just one pool
+    // while still zeroing all MAX states.
     if (init_phase_pools(
             static_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(nullptr), get_sched_phase_buffer_state,
-            /*state_count=*/num_phase_threads, /*buffer_count=*/num_phase_threads,
+            /*state_count=*/num_phase_threads, /*buffer_count=*/aicpu_thread_num,
             /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD, ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
@@ -396,7 +473,7 @@ size_t L2SwimlaneCollector::normalize_collector_shard(int collector_shard) const
 }
 
 void L2SwimlaneCollector::reset_collector_shards() {
-    const size_t shard_count = static_cast<size_t>(L2SwimlaneModule::kCollectorThreadCount);
+    const size_t shard_count = static_cast<size_t>(manager_.shard_count());
 
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});
@@ -951,8 +1028,6 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "dispatch";
             case L2SwimlaneSchedPhaseKind::Release:
                 return "release";
-            case L2SwimlaneSchedPhaseKind::Wire:
-                return "wire";
             case L2SwimlaneSchedPhaseKind::Dummy:
                 return "dummy";
             case L2SwimlaneSchedPhaseKind::EarlyDispatch:
@@ -961,6 +1036,16 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "resolve";
             case L2SwimlaneSchedPhaseKind::DummyTask:
                 return "dummy_task";
+            case L2SwimlaneSchedPhaseKind::PredicatedSkip:
+                return "predicated_skip";
+            case L2SwimlaneSchedPhaseKind::Drain:
+                return "drain";
+            case L2SwimlaneSchedPhaseKind::DrainPrepare:
+                return "drain_prepare";
+            case L2SwimlaneSchedPhaseKind::DrainPublish:
+                return "drain_publish";
+            case L2SwimlaneSchedPhaseKind::AsyncPoll:
+                return "async_poll";
             }
             return "unknown";
         };
@@ -978,7 +1063,14 @@ int L2SwimlaneCollector::export_swimlane_json() {
                         << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
                         << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed;
                 if (pr.kind == L2SwimlaneSchedPhaseKind::Dispatch) {
-                    outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
+                    outfile << ", \"pop_hit\": " << pr.phase_data.dispatch.pop_hit
+                            << ", \"pop_miss\": " << pr.phase_data.dispatch.pop_miss;
+                }
+                if (pr.kind == L2SwimlaneSchedPhaseKind::DummyTask ||
+                    pr.kind == L2SwimlaneSchedPhaseKind::PredicatedSkip) {
+                    uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.dummy_task.ring_id) << 32) |
+                                       pr.phase_data.dummy_task.local_id;
+                    outfile << ", \"task_id\": " << task_id;
                 }
                 // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
                 emit_depth_array("shared_at_start", pr.shared_depth_at_start);
@@ -1145,7 +1237,7 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     // shm_host_ aliases freed device/host memory now; null it so is_initialized()
     // reports false, the dtor's "destroyed without finalize()" warning stays
     // quiet, and a re-entrant finalize() / re-init hits the early-out instead of
-    // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
+    // walking freed buffer state. Mirrors PMU/DepGen/ArgsDump collectors.
     shm_host_ = nullptr;
     collected_perf_records_.clear();
     collected_aicore_records_.clear();

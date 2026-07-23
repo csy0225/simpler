@@ -108,13 +108,32 @@ symmetric window is realized:
 
 | Aspect | Sim | HCCL (onboard) |
 | ------ | --- | -------------- |
-| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | `aclrtMalloc` + `aclrtIpcMem*` import; peer access via `aclrtDeviceEnablePeerAccess` |
+| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | VMM physical allocation + shareable-handle import; peer access via `aclrtDeviceEnablePeerAccess` |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed after handshake (`memset`) | window zeroed after handshake (`aclrtMemset`) |
-| SDMA workspace | n/a | provisioned once per handle (`ensure_sdma_workspace`); inherited into each domain `CommContext` |
+| Async-DMA workspace | n/a | a2a3: opt-in per Worker (`enable_sdma`); a5: optional communication overlay, gated off by default |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
+
+On a2a3, async-DMA resources are a Worker-level opt-in, not a
+communication-domain property. Construct the Worker with `enable_sdma=True` and
+the runtime provisions the SDMA workspace once at init, latches its address into
+the resident `KernelArgs`, and injects it into every run's kernel
+`GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
+SDMA streams and its kernels read a zero workspace address. The workspace is
+released at Worker finalize by ordinary stream/manager teardown.
+Communication-domain allocation does not create SDMA streams or carry the
+workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
+streams sit in the device fault/sync domain, a fault on that Worker slows its
+teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
+so ordinary workloads are unaffected — see
+[docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
+and issue #1425. `enable_sdma` is currently honored only by the a2a3 onboard
+`tensormap_and_ringbuffer` runtime; host-build-graph, simulation, a5, and
+provider-disabled builds fail Worker init fast when it is set. The a5
+communication overlay remains isolated behind its default-off gate; see
+[a5-sdma-overlay.md](a5-sdma-overlay.md).
 
 ---
 
@@ -150,26 +169,24 @@ with orch.allocate_domain(...) as handle:
 
 ## 6. Host tensor visibility for `worker.run`
 
-A host tensor passed to `worker.run(...)` / `orch.submit_next_level(...)` is
-ultimately dereferenced from the forked chip child, not the parent, so its
-memory must be reachable there. Zero-copy requires born-shared memory (a virtual
-address is not portable across the fork, so the child can only reach the same
-physical pages via a MAP_SHARED backing established at allocation time), which is
-why the buffer is worker-allocated rather than a user tensor. Two sources are
-legal:
+A host tensor passed to `worker.run(...)` / `orch.submit_next_level(...)` /
+`orch.submit_sub(...)` is ultimately dereferenced from a forked local L3 child,
+not the parent, so its memory must be backed by pages mapped into that child.
+Fork-inherited MAP_SHARED mappings retain their virtual address, while post-fork
+worker-allocated buffers may map at a different address and have their pointers
+rewritten before decoding. Two sources are legal:
 
 | Source | How | Why it works |
 | ------ | --- | ------------ |
-| **fork-inherited** | `tensor.share_memory_()` **before the chip children are forked** (i.e. before the first `Worker.run()`) | the child inherits the MAP_SHARED page at fork |
-| **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the chips exist | born-shared memory attached into every child, **zero-copy** |
+| **fork-inherited** | `tensor.share_memory_()` **before `Worker.init()`** (before the local L3 children are forked) | the child inherits the MAP_SHARED page at fork |
+| **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the children exist | born-shared memory attached into every local child, **zero-copy** |
 
-The chip children are forked lazily on the **first** `run()`. A host tensor
+The local L3 children are forked eagerly in `Worker.init()`. A host tensor
 created after that — the natural dynamic-shape serving pattern — is invisible to
 the children unless it lives in a `create_host_buffer` buffer:
 
 ```python
-worker = Worker(level=3, ...); worker.register(chip); worker.init()
-worker.run(orch0, ...)                          # forks the chips
+worker = Worker(level=3, ...); worker.register(chip); worker.init()   # forks the chips
 
 buf_h = worker.create_host_buffer(tokens * hidden_size * 4)   # born-shared, post-fork
 buf_o = worker.create_host_buffer(batch * vocab * 4)
@@ -216,7 +233,7 @@ the child — allocate it with `create_host_buffer` instead.
 - **`orch.copy_to` is the unmanaged low-level path.** `create_host_buffer`
   covers the `run` / `submit_next_level` host-tensor args. The explicit
   `orch.copy_to(src=tensor.data_ptr())` staging path (§5) is *not* validated —
-  its `src` must be fork-inherited (`.share_memory_()` before the first `run()`)
+  its `src` must be fork-inherited (`.share_memory_()` before `init()`)
   or a `create_host_buffer` buffer.
 - **Fork-inherited anonymous memory is copy-on-write, hence stale.** Even a
   tensor the child legitimately inherited is only useful as a *live* input if it
@@ -228,11 +245,12 @@ the child — allocate it with `create_host_buffer` instead.
 
 ## 7. Examples
 
-- `examples/workers/l3/allreduce_distributed/` — single domain, PTO-ISA remote
-  reads over the window.
+- [`tests/st/worker/collectives/allreduce/`](../tests/st/worker/collectives/allreduce/) — single domain, PTO-ISA remote
+  reads over the window (allreduce scene tests with multiple algorithm modes).
 - `examples/workers/l3/domain_rank_map/` — two domains, domain-local ranks,
   missing-domain `KeyError`, per-domain allreduce.
 - `examples/workers/l3/dual_domain_overlap/` — overlapping domains where one
   worker participates in both.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
-  staging via `copy_to` + cross-rank `SdmaTget` (needs the SDMA workspace).
+  staging via `copy_to` + cross-rank `SdmaTget`; its producer `CoreCallable`
+  declares the SDMA workspace requirement.

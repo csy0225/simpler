@@ -165,7 +165,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -248,7 +248,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -326,10 +326,10 @@ jobs:
             --require-pto-isa --dump-args
 
   # ---------- Profiling sub-flags smoke (compile + run) ----------
-  # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
-  # PTO2_TENSORMAP_PROFILING are compile-time gates whose defaults and
+  # SIMPLER_DFX / SIMPLER_ORCH_PROFILING / SIMPLER_SCHED_PROFILING /
+  # SIMPLER_TENSORMAP_PROFILING are compile-time gates whose defaults and
   # dependency checks live in src/common/task_interface/profiling_config.h.
-  # The defaults (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job,
+  # The defaults (SIMPLER_DFX=1, sub-flags=0) are exercised by every CI job,
   # but non-default branches are otherwise dead coverage: a developer flipping
   # any of them for perf debugging or to minimize logging overhead had no gate
   # protecting the gated code from drift (renamed fields, changed signatures,
@@ -344,11 +344,11 @@ jobs:
   # Combos walk the macro hierarchy explicitly (not just "all on" or "all
   # off") so log scrubbing the failing leg pinpoints the specific gate:
   #
-  #   PTO2_PROFILING (default=1, covered by every other CI job)
-  #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
-  #   ├── orch:             -DPTO2_ORCH_PROFILING=1
-  #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
-  #   ├── sched:            -DPTO2_SCHED_PROFILING=1
+  #   SIMPLER_DFX (default=1, covered by every other CI job)
+  #   ├── dfx-off:         -DSIMPLER_DFX=0   (no profiling at all)
+  #   ├── orch:             -DSIMPLER_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DSIMPLER_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DSIMPLER_SCHED_PROFILING=1
   #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
   #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
   #
@@ -414,14 +414,14 @@ jobs:
           # Combo names paired with their CXX defines. Parallel arrays (not
           # an associative array) so the loop iteration order is deterministic
           # and the log reads top-to-bottom in hierarchy order.
-          COMBO_NAMES=(pto2-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_NAMES=(dfx-off orch orch-tensormap sched orch-sched all-on)
           COMBO_DEFS=(
-            "-DPTO2_PROFILING=0"
-            "-DPTO2_ORCH_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
-            "-DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_DFX=0"
+            "-DSIMPLER_ORCH_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
           )
           ARCHES=(a2a3sim a5sim)
           FAIL=()
@@ -463,9 +463,9 @@ jobs:
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -484,7 +484,12 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests -m requires_hardware --platform a2a3 --device \$TASK_DEVICE -v"
+          fi
 
       - name: Build and run C++ hardware unit tests
         run: |
@@ -493,17 +498,19 @@ jobs:
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
-          python3 -c "
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python3 -c "
           import json, os
           p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
           npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
           json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
                     open('tests/ut/cpp/build/resources.json', 'w'))
           "
-          ctest --test-dir tests/ut/cpp/build \
-              -L "^requires_hardware(_a2a3)?$" \
-              --resource-spec-file $PWD/tests/ut/cpp/build/resources.json \
-              -j$(nproc) --output-on-failure
+            ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python3 -c \"import json,os; ids=os.environ['TASK_DEVICE'].split(','); json.dump({'version':{'major':1,'minor':0},'local':[{'npus':[{'id':i,'slots':1} for i in ids]}]}, open('tests/ut/cpp/build/resources.json','w'))\" && ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
+          fi
 
       - name: Build cann-examples/query (CANN host-API smoke)
         run: |
@@ -542,9 +549,9 @@ jobs:
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -570,8 +577,37 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
-            --pto-session-timeout 600 --require-pto-isa
+          # SDMA workloads provision 48 device-only STARS streams that sit in the
+          # device fault/sync domain, so a fault on that device pays a multi-minute
+          # teardown (issue #1425). Keep EVERY SDMA test out of this general sweep
+          # — which also runs the aicore_op_timeout fault-injection test — and run
+          # them on their own dedicated device(s) in the SDMA step below, so an
+          # SDMA fault's slow teardown can never mix with ordinary fault recovery.
+          SDMA_IGNORE="--ignore=examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo --ignore=examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest examples tests/st $SDMA_IGNORE --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest examples tests/st $SDMA_IGNORE --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+          fi
+
+      # SDMA pytest — every SDMA test runs here on its own dedicated device(s),
+      # isolated from the general sweep's aicore_op_timeout fault-injection test
+      # (issue #1425). Both demos create their Worker with enable_sdma=True so the
+      # runtime provisions the SDMA workspace: prefetch_async_demo on 1 device (L2),
+      # sdma_async_completion_demo on 2 devices (L3, workspace provisioned per chip
+      # child) with a comm domain for the peer windows.
+      - name: SDMA pytest (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          SDMA_TESTS="examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest $SDMA_TESTS --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
+              --run "python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+          fi
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
       # race window in dep_gen only fires on real timing, so this row is
@@ -581,33 +617,61 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-dep-gen
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-dep-gen
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-dep-gen"
+          fi
 
       - name: l2_swimlane smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
-            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          fi
 
       - name: PMU smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
-            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-pmu 2
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-pmu 2
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-pmu 2"
+          fi
 
       - name: args_dump smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
-            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --dump-args
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --dump-args
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --dump-args"
+          fi
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
@@ -660,9 +724,9 @@ jobs:
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -730,9 +794,9 @@ jobs:
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository

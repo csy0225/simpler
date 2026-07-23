@@ -69,38 +69,42 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
 
-    // Phase 1: Wait for AICPU initialization signal
-    while (my_hank->aicpu_ready == 0) {
-        dcci(my_hank, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-
-    // Phase 2: Report physical core ID, signal ready
+    // Phase 1: report physical core ID + core type and signal done in one write,
+    // with no wait for the AICPU — both fields are self-known. The AICPU opens
+    // this core's register window only after it observes aicore_done, so a single
+    // report suffices. The host clears aicore_done before this kernel launches,
+    // so the value the AICPU reads is this run's report, never a stale prior one.
     my_hank->physical_core_id = get_physical_core_id();
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_regs_ready = 1;
-    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    while (my_hank->aicpu_regs_ready == 0) {
-        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-    // Report initial idle status via register
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
-
-    // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
-
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
+    // Phase 2: Wait for the AICPU to open our register window. A kernel launch
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon); the AICPU writes
+    // DATA_MAIN_BASE = AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a
+    // non-zero read means the window is open and reads/writes are valid. The
+    // AICPU runs assign_cores_to_threads (µs) between opening the window and the
+    // first dispatch, so this IDLE is observed long before any task_id lands —
+    // the poll cannot miss it and mistake a later task for the reset value.
+    // Window-open is the sync point for everything the AICPU publishes (task
+    // pointer, swimlane head): the AICPU writes those before opening the window.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    // Report initial idle status via register (FAST_PATH is now open).
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+
+    // The AICPU writes task after observing our report (so our CACHELINE_OUT flush
+    // above cannot clobber it) and before opening the window; dcci to read its
+    // fresh value here.
+    dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
 
     // Per-core L2SwimlaneActiveHead channel. AICPU completes
     // `l2_swimlane_aicpu_init` (in pre_handshake_init) before any thread writes
@@ -140,9 +144,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // (receive_time → start_time). Stored as a 32-bit delta
             // `start_time - receive_time`.
             //
-            // Common path (not_ready == 0): the new task_id is itself the ready
+            // Common path (src_payload == 0): the new task_id is itself the ready
             // signal, so receive_time is the true ready moment. Early-dispatch path
-            // (not_ready == 1): receive_time stays at pickup — before the
+            // (src_payload != 0): receive_time stays at pickup — before the
             // doorbell wait — so it precedes the producer's end_time; the host
             // folds it to start_time for those tasks (detected when receive
             // precedes the producer task's end_time).
@@ -156,16 +160,39 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(exec_payload, ENTIRE_DATA_CACHE);
 
-            // Early-dispatch gate. A not-ready task was staged on
-            // this core before its dependencies resolved; wait until AICPU rings
-            // the doorbell (DATA_MAIN_BASE high 32 == task_id) before executing.
-            // The ACK is deferred until AFTER the gate so the scheduler keeps the
-            // core off-limits (pending_occupied stays set, no ACK->pending_freed)
-            // while the task is gated — preventing a real task from being
-            // dual-issued behind it. The kernel's own input dcci runs inside
-            // execute_task() below — strictly AFTER this gate — so predecessor
-            // outputs are visible. not_ready == 0 (the common path) skips this.
-            if (exec_payload->not_ready) {
+            // Early-dispatch gate. A gated task was staged on this core before its
+            // dependencies resolved; wait until AICPU rings the doorbell
+            // (DATA_MAIN_BASE high 32 == task_id) before executing. The ACK is
+            // deferred until AFTER the gate so the scheduler keeps the core
+            // off-limits (pending_occupied stays set, no ACK->pending_freed) while
+            // the task is gated — preventing a real task from being dual-issued
+            // behind it. The kernel's own input dcci runs inside execute_task()
+            // below — strictly AFTER this gate — so predecessor outputs are visible.
+            // src_payload == 0 (the common ready path) skips this; a non-zero
+            // src_payload is both the gate flag and the source PTO2TaskPayload.
+            if (exec_payload->src_payload != 0) {
+                // AICPU staged only src_payload, not the arg vector — fill
+                // args[0..num_args) ourselves now, while we are idle waiting for
+                // the doorbell. The whole-cache dcci(ENTIRE_DATA_CACHE) above
+                // already invalidated src's lines, so tensor_count/scalar_count/
+                // scalars read coherently with the orchestrator's submit writes.
+                // args[SPMD_LOCAL_CONTEXT_INDEX]/[SPMD_GLOBAL_CONTEXT_INDEX] are
+                // still written by the AICPU (num_args <= 48 never reaches them).
+                __gm__ char *src = reinterpret_cast<__gm__ char *>(exec_payload->src_payload);
+                int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
+                int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+                __gm__ uint64_t *src_scalars =
+                    reinterpret_cast<__gm__ uint64_t *>(src + PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+                int n = 0;
+                for (int32_t i = 0; i < tensor_count; i++) {
+                    exec_payload->args[n++] = reinterpret_cast<uint64_t>(
+                        src + PTO2_TASKPAYLOAD_TENSORS_OFFSET + i * PTO2_TASKPAYLOAD_TENSOR_STRIDE
+                    );
+                }
+                for (int32_t i = 0; i < scalar_count; i++) {
+                    exec_payload->args[n++] = src_scalars[i];
+                }
+                OUT_OF_ORDER_STORE_BARRIER();
                 while (true) {
                     // Honor teardown: shutdown overwrites the low half with EXIT.
                     // Check it on the doorbell-match iteration too, so an EXIT that
@@ -209,7 +236,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pmu_aicore_end();
             }
 
-            if (dump_tensor_enabled) {
+            if (dump_args_enabled) {
                 pipe_barrier(PIPE_ALL);
             }
 

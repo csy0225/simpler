@@ -44,13 +44,17 @@ RUNTIME = "tensormap_and_ringbuffer"
 KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
 
-# case -> dict(orch, code, runtime_env, kernel, marker)
+# case -> dict(orch, code, runtime_env, kernel, marker, explain)
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
 #   runtime_env: CallConfig.runtime_env overrides that pin the offending resource small
 #   kernel     : AIV kernel (rel to kernels/) for the async cases, else None
 #   marker     : substring of the validate_runtime_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
+#   explain    : PTO2_ERROR_* name the "error detail:" annotation line must carry, so
+#                the log says what the code *means* and not just what it is. Every reachable
+#                code is checked here; the unreachable ones (10/11/103) are covered by the
+#                cpput over the name table itself.
 CASES = {
     "scope_deadlock": dict(
         orch="scope_deadlock_orch.cpp",
@@ -58,6 +62,7 @@ CASES = {
         runtime_env={"ring_task_window": 4},
         kernel=None,
         marker="orch_error_code=1",
+        explain="SCOPE_DEADLOCK",
     ),
     "heap_ring_deadlock": dict(
         orch="heap_ring_deadlock_orch.cpp",
@@ -65,6 +70,7 @@ CASES = {
         runtime_env={"ring_heap": 1024},
         kernel=None,
         marker="orch_error_code=2",
+        explain="HEAP_RING_DEADLOCK",
     ),
     "flow_control_deadlock": dict(
         orch="flow_control_deadlock_orch.cpp",
@@ -72,6 +78,7 @@ CASES = {
         runtime_env={"ring_task_window": 4},
         kernel=None,
         marker="orch_error_code=3",
+        explain="FLOW_CONTROL_DEADLOCK",
     ),
     "dep_pool_overflow": dict(
         orch="dep_pool_overflow_orch.cpp",
@@ -79,6 +86,7 @@ CASES = {
         runtime_env={"ring_dep_pool": 4},
         kernel=None,
         marker="orch_error_code=4",
+        explain="DEP_POOL_OVERFLOW",
     ),
     "invalid_args": dict(
         orch="invalid_args_orch.cpp",
@@ -86,6 +94,7 @@ CASES = {
         runtime_env={},
         kernel=None,
         marker="orch_error_code=5",
+        explain="INVALID_ARGS",
     ),
     "require_sync_start_invalid": dict(
         orch="require_sync_start_orch.cpp",
@@ -93,15 +102,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_noop.cpp",
         marker="orch_error_code=7",
-    ),
-    "scheduler_timeout": dict(
-        orch="scheduler_timeout_orch.cpp",
-        code=100,
-        runtime_env={"ring_dep_pool": 4},
-        kernel=None,
-        # Fire the no-progress watchdog in well under a second (default 10 s).
-        env={"PTO2_SCHEDULER_TIMEOUT_MS": 500},
-        marker="sub_class=S3",
+        explain="REQUIRE_SYNC_START_INVALID",
     ),
     "aicore_hang": dict(
         orch="aicore_hang_orch.cpp",
@@ -113,11 +114,12 @@ CASES = {
         # Scheduler watchdog (2 s) classifies the running stall before STARS (3 s)
         # and host stream sync (4 s) reap the device. Mirrors aicore_op_timeout.
         env={
-            "PTO2_SCHEDULER_TIMEOUT_MS": 2000,
-            "PTO2_OP_EXECUTE_TIMEOUT_US": 3000000,
-            "PTO2_STREAM_SYNC_TIMEOUT_MS": 4000,
+            "SIMPLER_SCHEDULER_TIMEOUT_MS": 2000,
+            "SIMPLER_OP_EXECUTE_TIMEOUT_US": 3000000,
+            "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 4000,
         },
         marker="sub_class=S1",
+        explain="SCHEDULER_TIMEOUT",
     ),
     "tensor_wait_timeout": dict(
         orch="tensor_wait_timeout_orch.cpp",
@@ -132,11 +134,12 @@ CASES = {
         # watchdog above 15 s so the tensor-data wait wins the race and latches
         # code 8 before they reap the hung core.
         env={
-            "PTO2_SCHEDULER_TIMEOUT_MS": 30000,
-            "PTO2_OP_EXECUTE_TIMEOUT_US": 30000000,
-            "PTO2_STREAM_SYNC_TIMEOUT_MS": 40000,
+            "SIMPLER_SCHEDULER_TIMEOUT_MS": 30000,
+            "SIMPLER_OP_EXECUTE_TIMEOUT_US": 30000000,
+            "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 40000,
         },
         marker="orch_error_code=8",
+        explain="TENSOR_WAIT_TIMEOUT",
     ),
     "async_completion_invalid": dict(
         orch="async_error_orch.cpp",
@@ -144,6 +147,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_async_completion_invalid.cpp",
         marker="sched_error_code=101",
+        explain="ASYNC_COMPLETION_INVALID",
     ),
     "async_wait_overflow": dict(
         orch="async_error_orch.cpp",
@@ -151,6 +155,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_async_wait_overflow.cpp",
         marker="sched_error_code=102",
+        explain="ASYNC_WAIT_OVERFLOW",
     ),
     "explicit_fatal": dict(
         orch="explicit_fatal_orch.cpp",
@@ -158,6 +163,7 @@ CASES = {
         runtime_env={},
         kernel=None,
         marker="orch_error_code=9",
+        explain="EXPLICIT_ORCH_FATAL",
     ),
     # Error codes still without an e2e case, and why. Device-side cpput keeps the
     # structural ones covered; the sub-classes have unit coverage of the classifier.
@@ -181,20 +187,25 @@ CASES = {
     #   the ring capacity together, so the constant gap holds.
     #
     # -- Design-unreachable from the public API (defensive classifier branches) --
-    # * SCHEDULER_TIMEOUT sub-classes S4/S5/UNKNOWN: the pure classifier is unit-
+    # * SCHEDULER_TIMEOUT sub-classes S3/S4/S5/UNKNOWN: the pure classifier is unit-
     #   tested for all of them (classify_stall_detail priority table in
     #   tests/ut/cpp/.../test_shared_memory.cpp), but the live states cannot be
-    #   produced through the public API. S4 (dep-deadlock, pure WAIT) needs a
-    #   dependency that never resolves with nothing running/ready; set_dependencies
-    #   only references already-submitted tasks, so cycles are inexpressible, and a
-    #   stuck producer is RUNNING (-> S1), never pure WAIT. S5 (orch-starvation)
-    #   needs completed < total with empty rings, but total_tasks_ is the count of
-    #   *submitted* tasks (sum of current_task_index), so once they retire
-    #   completed == total and the watchdog never fires — a while-loop in the orch
-    #   does not help. UNKNOWN is a bookkeeping-invariant violation (corruption).
-    #   These are kept as defensive labels: if a future bug ever produces the state,
-    #   the classifier names it correctly instead of mislabeling. S1/S3 are the
-    #   reproducible ones (aicore_hang_orch.cpp / scheduler_timeout_orch.cpp).
+    #   produced stably through the public API after Orch-side wiring. S3 used to
+    #   be reachable by under-sizing the fanout dep_pool for a ready dummy consumer,
+    #   but completed-producer fanins now bypass dep_pool entirely, while live
+    #   producers block in Orch-side prewire and either recover or latch the
+    #   orchestrator dep_pool error before the scheduler has an orch-done total to
+    #   classify as ready-but-idle. S4 (dep-deadlock, pure WAIT) needs a dependency
+    #   that never resolves with nothing running/ready; set_dependencies only
+    #   references already-submitted tasks, so cycles are inexpressible, and a stuck
+    #   producer is RUNNING (-> S1), never pure WAIT. S5 (orch-starvation) needs
+    #   completed < total with empty rings, but total_tasks_ is the count of
+    #   *submitted* tasks (sum of current_task_index), so once they retire completed
+    #   == total and the watchdog never fires — a while-loop in the orch does not
+    #   help. UNKNOWN is a bookkeeping-invariant violation (corruption). These are
+    #   kept as defensive labels: if a future bug ever produces the state, the
+    #   classifier names it correctly instead of mislabeling. S1 remains the
+    #   reproducible scheduler-timeout e2e case (aicore_hang_orch.cpp).
     #
     # -- Reachable only by exhausting a fixed compile-time cap --
     # * TENSORMAP_OVERFLOW (11): the tensormap entry pool (PTO2_TENSORMAP_POOL_SIZE
@@ -208,6 +219,19 @@ CASES = {
 }
 
 
+def _assert_annotated(log: str, case: dict) -> None:
+    """The failure line must be followed by what the code *means*, not just the number.
+
+    The machine-readable "PTO2 runtime failed: ..." line is deliberately left alone -- it is
+    what ``marker`` matches and what conftest's device-poison regex reads -- so the meaning is
+    carried on its own "error detail:" line, emitted by the LOG_RUNTIME_FAILURE macro
+    (src/common/runtime_status/error_log.h).
+    """
+    assert "error detail:" in log, "host log carries the raw code but no explanation of it"
+    assert case["explain"] in log, f"annotation does not name the code as '{case['explain']}'"
+    assert "error hint:" in log, "annotation names the code but says nothing about what to do"
+
+
 def _build_chip_callable(platform: str, case: dict) -> ChipCallable:
     kc = KernelCompiler(platform=platform)
     # AIV-kernel compilation needs the PTO-ISA headers (pto/pto-inst.hpp) on every
@@ -215,7 +239,7 @@ def _build_chip_callable(platform: str, case: dict) -> ChipCallable:
     pto_isa_root = None
     if case["kernel"] is not None or not platform.endswith("sim"):
         pto_isa_root = ensure_pto_isa_root()
-        os.environ["PTO_ISA_ROOT"] = pto_isa_root
+        # Path is passed explicitly to KernelCompiler; do not export (#1403).
 
     children = []
     if case["kernel"] is not None:
@@ -277,7 +301,9 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, ChipStorageTaskArgs(), config)
         captured = capfd.readouterr()
-        assert case["marker"] in captured.err + captured.out, f"missing '{case['marker']}' in host log"
+        log = captured.err + captured.out
+        assert case["marker"] in log, f"missing '{case['marker']}' in host log"
+        _assert_annotated(log, case)
     finally:
         worker.close()
 
@@ -299,6 +325,8 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         with pytest.raises(RuntimeError):
             worker.run(handle, ChipStorageTaskArgs(), config)
         captured = capfd.readouterr()
-        assert case["marker"] in captured.err + captured.out, f"device error class '{case['marker']}' not in host log"
+        log = captured.err + captured.out
+        assert case["marker"] in log, f"device error class '{case['marker']}' not in host log"
+        _assert_annotated(log, case)
     finally:
         worker.close()

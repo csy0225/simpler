@@ -20,8 +20,9 @@ Usage:
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -k kernel_config.py
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -v
 
-SPMD (block_num>1): dependency flows use min core_id anchors per core_type
-on physical lanes; see docs/dfx/l2-swimlane-profiling.md §3.5.
+SPMD (block_num>1): dependency flows use the earliest visible task slice
+per (func_id, task_id) independently in each view; see
+docs/dfx/l2-swimlane-profiling.md §3.5.
 """
 
 import argparse
@@ -525,15 +526,32 @@ def _identify_spmd_task_ids(task_map, deps_block_map=None):
     return spmd_ids
 
 
-def _dependency_flow_anchor_rows(task_id, task_map, spmd_task_ids):
-    """Dependency anchor rows.
+def _task_slice_start_us(task):
+    """Start of the task slice emitted in Worker View."""
+    receive_time_us = task.get("receive_time_us")
+    return receive_time_us if receive_time_us is not None else task["start_time_us"]
+
+
+def _scheduler_slice_start_us(task):
+    """Start of the task slice emitted in Scheduler View."""
+    dispatch_time_us = task.get("dispatch_time_us")
+    finish_time_us = task.get("finish_time_us")
+    if dispatch_time_us is None or dispatch_time_us < 0 or finish_time_us is None or finish_time_us <= 0:
+        return float("inf")
+    return dispatch_time_us
+
+
+def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worker_anchor_map=None):
+    """Flow anchor rows selected by one view's visible slice start.
 
     Non-SPMD keeps every subtask row. SPMD collapses rows by
-    ``(func_id, task_id)`` and keeps the earliest-start row in each group, so
-    MIX tasks with shared task_id but distinct AIC/AIV func_id values remain
+    ``(func_id, task_id)`` and keeps the earliest visible slice in each group,
+    so MIX tasks with shared task_id but distinct AIC/AIV func_id values remain
     visible as separate dependency endpoints.
     """
     recs = task_map.get(task_id, [])
+    if not recs and aicpu_worker_anchor_map:
+        return aicpu_worker_anchor_map.get(task_id, [])
     if not recs:
         return []
     if task_id not in spmd_task_ids:
@@ -542,18 +560,28 @@ def _dependency_flow_anchor_rows(task_id, task_map, spmd_task_ids):
     for row in recs:
         func_id = row.get("func_id", -1)
         prev = by_func.get(func_id)
-        if prev is None or (row.get("start_time_us", float("inf")), row.get("core_id", 0)) < (
-            prev.get("start_time_us", float("inf")),
+        if prev is None or (slice_start(row), row.get("core_id", 0)) < (
+            slice_start(prev),
             prev.get("core_id", 0),
         ):
             by_func[func_id] = row
     return list(by_func.values())
 
 
-def _dependency_flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids):
-    """(pred_row, succ_row) pairs for one logical dependency edge."""
-    pred_rows = _dependency_flow_anchor_rows(pred_id, task_map, spmd_task_ids)
-    succ_rows = _dependency_flow_anchor_rows(succ_id, task_map, spmd_task_ids)
+def _worker_flow_anchor_rows(task_id, task_map, spmd_task_ids, aicpu_worker_anchor_map=None):
+    """Worker View flow anchors."""
+    return _flow_anchor_rows(task_id, task_map, spmd_task_ids, _task_slice_start_us, aicpu_worker_anchor_map)
+
+
+def _scheduler_flow_anchor_rows(task_id, task_map, spmd_task_ids, aicpu_worker_anchor_map=None):
+    """Scheduler View flow anchors."""
+    return _flow_anchor_rows(task_id, task_map, spmd_task_ids, _scheduler_slice_start_us, aicpu_worker_anchor_map)
+
+
+def _flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids, anchor_rows, aicpu_worker_anchor_map=None):
+    """(pred_row, succ_row) pairs for one logical dependency edge in one view."""
+    pred_rows = anchor_rows(pred_id, task_map, spmd_task_ids, aicpu_worker_anchor_map)
+    succ_rows = anchor_rows(succ_id, task_map, spmd_task_ids, aicpu_worker_anchor_map)
     if not pred_rows or not succ_rows:
         return []
     return [(pred_row, succ_row) for pred_row in pred_rows for succ_row in succ_rows]
@@ -643,6 +671,16 @@ def resolve_func_id_from_kernel_map(task_id, core_type, kernel_map):
     return -1
 
 
+def resolve_task_func_id_from_kernel_map(task_id, kernel_map):
+    """Look up the first active ``func_id`` for a task without an AICore row."""
+    if kernel_map is None or task_id is None:
+        return -1
+    kids = kernel_map.get(int(task_id))
+    if not kids:
+        return -1
+    return next((func_id for func_id in kids if func_id >= 0), -1)
+
+
 def load_kernel_config(config_path):
     """Load kernel configuration from kernel_config.py file.
 
@@ -714,7 +752,7 @@ def load_func_names_json(json_path):
     return data.get("callable_id_to_name", {}), data.get("orchestrator_name")
 
 
-def print_task_statistics(tasks, func_id_to_name=None):
+def print_task_statistics(tasks, func_id_to_name=None, l2_swimlane_level=None):
     """Print task statistics grouped by func_id.
 
     Exec = kernel execution time (end_time_us - start_time_us) on AICore.
@@ -726,7 +764,11 @@ def print_task_statistics(tasks, func_id_to_name=None):
     Args:
         tasks: List of task dicts
         func_id_to_name: Optional dict mapping func_id to function name
+        l2_swimlane_level: Source collection level. Level 1 has no AICPU
+            dispatch/finish timestamps, so latency-derived metrics are unavailable.
     """
+    has_aicpu_timing = l2_swimlane_level is None or l2_swimlane_level >= 2
+
     # Group tasks by func_id with extended metrics
     func_stats: defaultdict[Any, dict[str, Any]] = defaultdict(
         lambda: {
@@ -744,18 +786,27 @@ def print_task_statistics(tasks, func_id_to_name=None):
     # Track global min dispatch and max finish times
     min_dispatch_time = float("inf")
     max_finish_time = float("-inf")
+    min_aicore_time = float("inf")
+    max_aicore_time = float("-inf")
 
     for task in tasks:
         func_id = task["func_id"]
         duration = task["duration_us"]
         func_stats[func_id]["durations"].append(duration)
 
+        start_time = task["start_time_us"]
+        end_time = task["end_time_us"]
+        receive_time = task.get("receive_time_us")
+        min_aicore_time = min(min_aicore_time, receive_time if receive_time is not None else start_time)
+        max_aicore_time = max(max_aicore_time, end_time)
+
+        if "local_setup_us" in task:
+            func_stats[func_id]["local_setups"].append(task["local_setup_us"])
+
         # Calculate new metrics if dispatch_time_us and finish_time_us are available
-        if "dispatch_time_us" in task and "finish_time_us" in task:
+        if has_aicpu_timing and "dispatch_time_us" in task and "finish_time_us" in task:
             dispatch_time = task["dispatch_time_us"]
             finish_time = task["finish_time_us"]
-            start_time = task["start_time_us"]
-            end_time = task["end_time_us"]
 
             # Head overhead: start_time_us - dispatch_time_us
             head_overhead = start_time - dispatch_time
@@ -769,8 +820,6 @@ def print_task_statistics(tasks, func_id_to_name=None):
             # AICore record came from a pre-receive_time build).
             if "propagation_us" in task:
                 func_stats[func_id]["propagations"].append(task["propagation_us"])
-            if "local_setup_us" in task:
-                func_stats[func_id]["local_setups"].append(task["local_setup_us"])
 
             # Latency: finish_time_us - dispatch_time_us
             latency = finish_time - dispatch_time
@@ -787,6 +836,19 @@ def print_task_statistics(tasks, func_id_to_name=None):
     # Print statistics
     print("\n" + "=" * 140)
     print("Task Statistics by Function")
+    level_descriptions = {
+        1: "AICore timing only",
+        2: "AICore + AICPU timing",
+        3: "AICore + AICPU timing + scheduler phases",
+        4: "full collection with orchestrator phases",
+    }
+    if l2_swimlane_level is None:
+        level_description = "unknown"
+        level_value = "unknown"
+    else:
+        level_description = level_descriptions.get(l2_swimlane_level, "unknown")
+        level_value = l2_swimlane_level
+    print(f"  Source l2_swimlane_level: {level_value} ({level_description}; recorded in l2_swimlane_records.json)")
     print("  Exec = kernel time on AICore; Latency = dispatch->finish (incl. head OH + Exec + tail OH)")
     print("  Head OH split (v3): Prop = NoC propagation (dispatch_ts→AICore receive); Local = dcci+ack (receive→start)")
     print("=" * 140)
@@ -835,11 +897,15 @@ def print_task_statistics(tasks, func_id_to_name=None):
         # Calculate execution ratio: total_exec_time / total_latency
         exec_ratio = (stats["total_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
 
+        latency_str = f"{avg_latency:.2f}" if has_aicpu_timing else "-"
+        exec_ratio_str = f"{exec_ratio:.1f}%" if has_aicpu_timing else "-"
+        head_str = f"{avg_head_overhead:.2f}" if has_aicpu_timing else "-"
+        tail_str = f"{avg_tail_overhead:.2f}" if has_aicpu_timing else "-"
         prop_str = f"{avg_propagation:>12.2f}" if avg_propagation is not None else f"{'-':>12}"
         local_str = f"{avg_local_setup:>13.2f}" if avg_local_setup is not None else f"{'-':>13}"
         print(
-            f"{func_id:<8} {func_name:<12} {count:>5}   {avg_duration:>12.2f}  {avg_latency:>15.2f}  "
-            f"{exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}  "
+            f"{func_id:<8} {func_name:<12} {count:>5}   {avg_duration:>12.2f}  {latency_str:>15}  "
+            f"{exec_ratio_str:>6}   {head_str:>15}  {tail_str:>15}  "
             f"{prop_str}  {local_str}"
         )
 
@@ -848,15 +914,21 @@ def print_task_statistics(tasks, func_id_to_name=None):
 
     # Calculate total latency (sum of all latencies)
     total_latency_sum = sum(stats["total_latency"] for stats in func_stats.values())
-    print(f"{'TOTAL':<21} {total_count:>5}   {total_duration:>12.2f}  {total_latency_sum:>15.2f}")
+    total_latency_str = f"{total_latency_sum:.2f}" if has_aicpu_timing else "-"
+    print(f"{'TOTAL':<21} {total_count:>5}   {total_duration:>12.2f}  {total_latency_str:>15}")
 
     # Print total test execution time
-    if min_dispatch_time != float("inf") and max_finish_time != float("-inf"):
+    if has_aicpu_timing and min_dispatch_time != float("inf") and max_finish_time != float("-inf"):
         total_test_time = max_finish_time - min_dispatch_time
         print(f"\nTotal Test Time: {total_test_time:.2f} us (from earliest dispatch to latest finish)")
+    elif l2_swimlane_level == 1 and min_aicore_time != float("inf") and max_aicore_time != float("-inf"):
+        aicore_observed_span = max_aicore_time - min_aicore_time
+        print(
+            f"\nAICore Observed Span: {aicore_observed_span:.2f} us (from earliest AICore receive to latest AICore end)"
+        )
 
     # Task execution vs Scheduler overhead summary
-    if total_count > 0 and total_latency_sum > 0:
+    if has_aicpu_timing and total_count > 0 and total_latency_sum > 0:
         avg_exec_us = total_duration / total_count
         avg_latency_us = total_latency_sum / total_count
         exec_latency_ratio_pct = total_duration / total_latency_sum * 100
@@ -1128,7 +1200,40 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     task_to_event_id: dict[tuple[int, int], int] = {}
     task_to_aicpu_event_id: dict[tuple[int, int], int] = {}
     task_to_aicpu_tid: dict[tuple[int, int], int] = {}
+    aicpu_worker_anchor_map: dict[int, list[dict]] = defaultdict(list)
     event_id = 0
+
+    AICPU_TID_BASE = 19000  # noqa: N806
+    scheduler_thread_indices = {int(thread_idx) for thread_idx in (core_to_thread or []) if int(thread_idx) >= 0}
+    scheduler_thread_indices.update(
+        thread_idx for thread_idx, thread_records in enumerate(scheduler_phases or []) if thread_records
+    )
+    scheduler_thread_count = (
+        max(scheduler_thread_indices) + 1 if scheduler_thread_indices else len(scheduler_phases or [])
+    )
+    orchestrator_thread_base = scheduler_thread_count
+    aicpu_worker_thread_count = scheduler_thread_count + len(orchestrator_phases or [])
+
+    # core_to_thread and non-empty phase pools carry runtime scheduler indices;
+    # phase arrays may also contain trailing empty capacity slots. Orchestrator
+    # pools are ordinal-only and occupy the dedicated threads after schedulers.
+    for thread_idx in range(aicpu_worker_thread_count):
+        events.append(
+            {
+                "args": {"name": f"AICPU_{thread_idx}"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 4,
+                "tid": AICPU_TID_BASE + thread_idx,
+            }
+        )
+
+    def worker_flow_endpoint(row):
+        event_id_key = row.get("event_id")
+        if "trace_tid" in row:
+            return row["trace_tid"], event_id_key
+        return core_to_tid[row["core_id"]], task_to_event_id.get((row["task_id"], row["core_id"]))
 
     # Invert deps (pred -> [succ]) into a fanin map (succ -> [pred]) so each task
     # bar can show both its consumers (fanout) and producers (fanin) with counts.
@@ -1141,8 +1246,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
         local_setup_us = task.get("local_setup_us", 0.0) or 0.0
-        receive_time_us = task.get("receive_time_us")
-        ts = receive_time_us if receive_time_us is not None else task["start_time_us"]
+        ts = _task_slice_start_us(task)
         dur = task["end_time_us"] - ts
 
         # func_id is already resolved (level=1 records recovered from
@@ -1291,73 +1395,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             task_to_aicpu_event_id[(task["task_id"], task["core_id"])] = event_id
             event_id += 1
 
-    # Flow events (Flow events "s" and "f" for dependencies). Edges come from
-    # deps.json (dep_gen replay); without one we emit no flow events at all,
-    # since the device hot path no longer carries fanout (PR #863).
-    # SPMD logical tasks anchor dependency arrows on the min-core_id subtask
-    # row per core_type (AIC and AIV separately when both are present).
     flow_id = 0
     hb_violation_count = 0
     deps_flow_count = 0
     edges_by_pred = deps_edges or {}
-    flow_epsilon = 0.01
-
-    for pred_id, succ_ids in edges_by_pred.items():
-        if pred_id not in task_map:
-            continue
-
-        for succ_id in succ_ids:
-            if succ_id not in task_map:
-                if verbose:
-                    print(
-                        f"Warning: Task {format_task_display(pred_id)} (raw {pred_id}) "
-                        f"references non-existent successor {format_task_display(succ_id)} (raw {succ_id})"
-                    )
-                continue
-
-            row_pairs = _dependency_flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids)
-            if not row_pairs:
-                continue
-
-            output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
-            input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
-            for pred_row, succ_row in row_pairs:
-                src_ts_end = pred_row["end_time_us"] - flow_epsilon
-                dst_ts_start = succ_row.get("receive_time_us") or succ_row["start_time_us"]
-                hb_violated = (src_ts_end + flow_epsilon) > dst_ts_start
-                flow_name = "hb_violation" if hb_violated else "dependency"
-                if hb_violated:
-                    hb_violation_count += 1
-                _append_dependency_flow_pair(
-                    events,
-                    flow_id,
-                    flow_name,
-                    4,
-                    core_to_tid[pred_row["core_id"]],
-                    src_ts_end,
-                    task_to_event_id.get((pred_id, pred_row["core_id"])),
-                    4,
-                    core_to_tid[succ_row["core_id"]],
-                    dst_ts_start,
-                    task_to_event_id.get((succ_id, succ_row["core_id"])),
-                    input_task_count=input_task_count,
-                    output_task_count=output_task_count,
-                )
-                flow_id += 1
-                deps_flow_count += 1
-
-    if verbose:
-        if deps_edges is not None:
-            print(f"  Dependency flow events: {deps_flow_count} edges (source: deps.json)")
-            if spmd_task_ids:
-                print(
-                    f"  SPMD tasks: {len(spmd_task_ids)} logical task(s); "
-                    "dependency arrows anchor on min core_id subtask per core_type"
-                )
-        else:
-            print("  Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)")
-        if hb_violation_count > 0:
-            print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # AICPU Scheduler phase events (l2_swimlane_level >= 3)
     if scheduler_phases:
@@ -1383,10 +1424,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # Outer phases — mutually time-exclusive within an iter
             "complete": "good",  # green
             "dispatch": "terrible",  # red
+            "async_poll": "yellow",  # async-wait completion polling (split from complete)
             "release": "olive",  # deferred-release drain (on_task_release work)
-            "wire": "thread_state_running",  # drain_wiring_queue pass
             "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
+            # sync_start stop-the-world drain: outer bar time-contains the two
+            # inner staging passes, so Perfetto nests them by depth on the track.
+            "drain": "cq_build_running",  # handle_drain_mode outer
+            "drain_prepare": "cq_build_attempt_runnable",  # inner: cluster scan + build_payload
+            "drain_publish": "cq_build_attempt_passed",  # inner: MMIO write_reg per subtask (the cohort launch)
             # Inner phase — nests inside Complete or Dummy via time containment
             "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
             # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
@@ -1444,34 +1490,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 finishes_per_complete[id(t_comp)] += 1
 
-        # Worker View (pid=4) AICPU lanes: AICPU_N treated as a worker tier
-        # alongside AIC_N (matrix) and AIV_N (vector). DummyTask phases (per
-        # dummy DAG-node identity markers from the scheduler thread that
-        # drained them) and Alloc phases (per `alloc_tensors()` call from the
-        # orchestrator) both render on these lanes — they are the activities
-        # that an AICPU performs when it acts as a worker. The lane index is
-        # the AICPU id; with the current 1:1 sched-thread-to-AICPU mapping,
-        # `thread_idx` IS the AICPU id, and the single orch is on AICPU 0.
-        # Tids 19000+aicpu_id keep them visually grouped after the physical
-        # AIC/AIV lanes (which sit at 10000+core_id*10).
-        AICPU_TID_BASE = 19000  # noqa: N806
-        num_aicpu_lanes = max(len(scheduler_phases), len(orchestrator_phases or []))
-        for aicpu_id in range(num_aicpu_lanes):
-            events.append(
-                {
-                    "args": {"name": f"AICPU_{aicpu_id}"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 4,
-                    "tid": AICPU_TID_BASE + aicpu_id,
-                }
-            )
-
-        # Dummy task X event width — start/end on the device coincide
-        # (identification is a single MSR read); render as a 0.02 µs sliver
-        # so Perfetto picks it up instead of collapsing it to a hairline.
-        DUMMY_BAR_MIN_DUR_US = 0.02  # noqa: N806
+        # AICPU worker-marker width — start/end on the device coincide; render
+        # as a 0.02 us sliver so Perfetto does not collapse it to a hairline.
+        AICPU_WORKER_MARKER_MIN_DUR_US = 0.02  # noqa: N806
 
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
@@ -1505,28 +1526,43 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # that retired nothing; release = on_task_release drain). Genuine
             # spin emits no record and shows as a blank gap.
             #
-            # `dummy_task` is special: it does NOT live on the sched track —
-            # it represents a DAG fence node briefly inhabiting the AICPU as a
-            # virtual worker, so we route it to Worker View (pid=4) AICPU_N
-            # (where N = the AICPU id of the sched thread that drained it).
+            # Dependency-only task markers do NOT live on the sched track —
+            # they represent DAG nodes briefly inhabiting the AICPU as a
+            # virtual worker, so we route them to Worker View (pid=4) AICPU_N
+            # (where N = the AICPU id of the sched thread that drained them).
             for record in thread_records:
                 phase = record.get("phase", "unknown")
-                if phase == "dummy_task":
+                if phase in ("dummy_task", "predicated_skip"):
                     start_us = record["start_time_us"]
                     end_us = record["end_time_us"]
-                    dur = max(end_us - start_us, DUMMY_BAR_MIN_DUR_US)
-                    task_id_low32 = record.get("tasks_processed", 0)
+                    dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
+                    task_id = normalize_pto2_task_id_int(record.get("task_id"))
+                    task_label = format_task_display(task_id) if task_id is not None else "unknown"
+                    if phase == "dummy_task":
+                        event_name = f"dummy({task_label})"
+                    else:
+                        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
+                        event_name = _task_display_name(
+                            func_id,
+                            func_id_to_name,
+                            task_label,
+                            spmd=task_id in spmd_task_ids,
+                        )
+                    event_args = {
+                        "loop_iter": record.get("loop_iter", 0),
+                        "task_id": task_id,
+                        "event-hint": event_name,
+                    }
+                    if phase == "dummy_task":
+                        event_args["phase"] = phase
+                    else:
+                        event_args["predicated_pass"] = False
                     events.append(
                         {
-                            "args": {
-                                "phase": "dummy_task",
-                                "loop_iter": record.get("loop_iter", 0),
-                                "dummy_task_id_low32": task_id_low32,
-                                "event-hint": f"dummy(t{task_id_low32})",
-                            },
+                            "args": event_args,
                             "cat": "event",
-                            "cname": "grey",
-                            "name": f"dummy(t{task_id_low32})",
+                            "id": event_id,
+                            "name": event_name,
                             "ph": "X",
                             "pid": 4,
                             "tid": AICPU_TID_BASE + thread_idx,
@@ -1534,8 +1570,31 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                             "dur": dur,
                         }
                     )
+                    if task_id is not None:
+                        aicpu_worker_anchor_map[task_id].append(
+                            {
+                                "task_id": task_id,
+                                "start_time_us": start_us,
+                                "end_time_us": start_us + dur,
+                                "receive_time_us": start_us,
+                                "trace_tid": AICPU_TID_BASE + thread_idx,
+                                "event_id": event_id,
+                            }
+                        )
+                    event_id += 1
                     continue
-                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch", "wire", "dummy"):
+                if phase not in (
+                    "complete",
+                    "async_poll",
+                    "dispatch",
+                    "release",
+                    "resolve",
+                    "early_dispatch",
+                    "dummy",
+                    "drain",
+                    "drain_prepare",
+                    "drain_publish",
+                ):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -1687,41 +1746,33 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "orch_fanin": "rail_animation",
         }
 
-        # Build the regular-task and dummy-task id sets so the orch-phase loop
-        # below can identify which orch_submit envelopes belong to
-        # `alloc_tensors()` calls (no AICore record, no DummyTask phase — purely
-        # inline-completed by the orchestrator on host CPU). Those get a
-        # parallel ALLOC bar on Worker View pid=4 so the DAG node is visible.
+        # Build the runtime task-id sets so the orch-phase loop can distinguish
+        # alloc_tensors() calls from submitted tasks. deps.json remains the
+        # identity source when a runtime timing record is missing.
         regular_task_ids = {int(t.get("task_id", -1)) for t in tasks}
-        dummy_low32 = set()
+        dummy_task_ids = set()
+        predicated_skip_task_ids = set()
         if scheduler_phases:
             for thread_records in scheduler_phases:
                 for rec in thread_records:
-                    if rec.get("phase") == "dummy_task":
-                        dummy_low32.add(rec.get("tasks_processed", 0))
-
-        # Alloc bars land on the same AICPU_N lane that hosts the orchestrator
-        # (one AICPU lane per AICPU; the orch is on AICPU 0 in the single-orch
-        # case). The AICPU lane metadata is emitted by the scheduler_phases
-        # block above (via AICPU_TID_BASE). If there are orch records but no
-        # sched records (level=4 with no SCHED_PHASES data), emit them here so
-        # the alloc bars below have valid lane metadata.
-        AICPU_TID_BASE = 19000  # noqa: N806
-        if not scheduler_phases:
-            for orch_idx in range(len(orchestrator_phases)):
-                events.append(
-                    {
-                        "args": {"name": f"AICPU_{orch_idx}"},
-                        "cat": "__metadata",
-                        "name": "thread_name",
-                        "ph": "M",
-                        "pid": 4,
-                        "tid": AICPU_TID_BASE + orch_idx,
-                    }
-                )
+                    phase = rec.get("phase")
+                    if phase in ("dummy_task", "predicated_skip"):
+                        task_id = normalize_pto2_task_id_int(rec.get("task_id"))
+                        if task_id is not None:
+                            if phase == "dummy_task":
+                                dummy_task_ids.add(task_id)
+                            else:
+                                predicated_skip_task_ids.add(task_id)
+        deps_dummy_task_ids = {
+            task_id
+            for task_id, kernel_ids in (deps_kernel_map or {}).items()
+            if all(kernel_id < 0 for kernel_id in kernel_ids)
+        }
+        missing_dummy_record_warnings = set()
 
         for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
+            orch_worker_thread_idx = orchestrator_thread_base + orch_idx
             for record in thread_records:
                 phase = record.get("phase", "unknown")
                 start_us = record["start_time_us"]
@@ -1752,17 +1803,25 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 }
                 events.append(event)
 
-                # Classification: orch_submit envelopes whose task_id is NOT in
-                # the AICore record set AND NOT in DummyTask phases are
-                # alloc_tensors() calls. Render a parallel "alloc(...)" bar on
-                # the Worker View AICPU_{orch_idx} lane so the DAG node is
-                # visible (matches the dummy treatment — both are AICPU acting
-                # as worker).
+                # deps.json identifies submitted tasks independently of the
+                # timing buffers. Runtime records provide the fallback for
+                # captures without task metadata.
                 if phase == "orch_submit" and task_id >= 0:
-                    is_regular = task_id in regular_task_ids
-                    task_low32 = task_id & 0xFFFFFFFF
-                    is_dummy = task_low32 in dummy_low32
-                    if not is_regular and not is_dummy:
+                    if deps_kernel_map is not None and task_id in deps_kernel_map:
+                        is_dummy = task_id in deps_dummy_task_ids
+                        is_regular = not is_dummy
+                        if is_dummy and task_id not in dummy_task_ids and task_id not in missing_dummy_record_warnings:
+                            print(
+                                f"Warning: dummy({format_task_display(task_id)}) has no dummy_task scheduler record; "
+                                "its Worker View bar cannot be rendered.",
+                                file=sys.stderr,
+                            )
+                            missing_dummy_record_warnings.add(task_id)
+                    else:
+                        is_regular = task_id in regular_task_ids
+                        is_dummy = task_id in dummy_task_ids
+                    is_predicated_skip = task_id in predicated_skip_task_ids
+                    if not is_regular and not is_dummy and not is_predicated_skip:
                         events.append(
                             {
                                 "args": {
@@ -1772,14 +1831,99 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                                 },
                                 "cat": "event",
                                 "cname": "olive",
+                                "id": event_id,
                                 "name": f"alloc({format_task_display(task_id)})",
                                 "ph": "X",
                                 "pid": 4,
-                                "tid": AICPU_TID_BASE + orch_idx,
+                                "tid": AICPU_TID_BASE + orch_worker_thread_idx,
                                 "ts": start_us,
                                 "dur": max(dur, 0.02),
                             }
                         )
+                        aicpu_worker_anchor_map[task_id].append(
+                            {
+                                "task_id": task_id,
+                                "start_time_us": start_us,
+                                "end_time_us": start_us + max(dur, 0.02),
+                                "receive_time_us": start_us,
+                                "trace_tid": AICPU_TID_BASE + orch_worker_thread_idx,
+                                "event_id": event_id,
+                            }
+                        )
+                        event_id += 1
+
+    # Flow events (Flow events "s" and "f" for dependencies). Edges come from
+    # deps.json (dep_gen replay); without one we emit no flow events at all,
+    # since the device hot path no longer carries fanout (PR #863).
+    # SPMD logical tasks anchor Worker View dependency arrows on the earliest
+    # visible kernel slice per (func_id, task_id). Dummy/alloc DAG nodes have no
+    # kernel row, so their arrows anchor on the AICPU worker slice emitted above.
+    for pred_id, succ_ids in edges_by_pred.items():
+        if pred_id not in task_map and pred_id not in aicpu_worker_anchor_map:
+            continue
+
+        for succ_id in succ_ids:
+            if succ_id not in task_map and succ_id not in aicpu_worker_anchor_map:
+                if verbose:
+                    print(
+                        f"Warning: Task {format_task_display(pred_id)} (raw {pred_id}) "
+                        f"references non-existent successor {format_task_display(succ_id)} (raw {succ_id})"
+                    )
+                continue
+
+            row_pairs = _flow_row_pairs(
+                pred_id,
+                succ_id,
+                task_map,
+                spmd_task_ids,
+                _worker_flow_anchor_rows,
+                aicpu_worker_anchor_map,
+            )
+            if not row_pairs:
+                continue
+
+            output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
+            input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
+            for pred_row, succ_row in row_pairs:
+                src_bar_start_us = _task_slice_start_us(pred_row)
+                src_end_us = pred_row["end_time_us"]
+                dst_ts_start = _task_slice_start_us(succ_row)
+                hb_violated = src_end_us > dst_ts_start
+                flow_name = "hb_violation" if hb_violated else "dependency"
+                if hb_violated:
+                    hb_violation_count += 1
+                src_tid, src_event_id = worker_flow_endpoint(pred_row)
+                dst_tid, dst_event_id = worker_flow_endpoint(succ_row)
+                _append_dependency_flow_pair(
+                    events,
+                    flow_id,
+                    flow_name,
+                    4,
+                    src_tid,
+                    src_bar_start_us,
+                    src_event_id,
+                    4,
+                    dst_tid,
+                    dst_ts_start,
+                    dst_event_id,
+                    input_task_count=input_task_count,
+                    output_task_count=output_task_count,
+                )
+                flow_id += 1
+                deps_flow_count += 1
+
+    if verbose:
+        if deps_edges is not None:
+            print(f"  Dependency flow events: {deps_flow_count} edges (source: deps.json)")
+            if spmd_task_ids:
+                print(
+                    f"  SPMD tasks: {len(spmd_task_ids)} logical task(s); "
+                    "dependency arrows independently anchor on each view's earliest visible slice per function"
+                )
+        else:
+            print("  Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)")
+        if hb_violation_count > 0:
+            print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # Scheduler View dependency mirror (AICPU timestamps).
     if has_aicpu_data:
@@ -1791,22 +1935,28 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if succ_id not in task_map:
                     continue
 
-                row_pairs = _dependency_flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids)
+                row_pairs = _flow_row_pairs(
+                    pred_id,
+                    succ_id,
+                    task_map,
+                    spmd_task_ids,
+                    _scheduler_flow_anchor_rows,
+                )
                 if not row_pairs:
                     continue
 
                 output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
                 input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
                 for pred_row, succ_row in row_pairs:
+                    src_dispatch_us = pred_row.get("dispatch_time_us", 0)
                     src_finish_us = pred_row.get("finish_time_us", 0)
                     dst_dispatch_us = succ_row.get("dispatch_time_us", 0)
                     dst_finish_us = succ_row.get("finish_time_us", 0)
                     # Skip when AICPU timestamps are missing or zero (matches Scheduler
                     # View bar emission, which rejects finish_us <= 0).
-                    if src_finish_us <= 0 or dst_dispatch_us < 0 or dst_finish_us <= 0:
+                    if src_dispatch_us < 0 or src_finish_us <= 0 or dst_dispatch_us < 0 or dst_finish_us <= 0:
                         continue
-                    src_ts = src_finish_us - flow_epsilon
-                    aicpu_hb_violated = (src_ts + flow_epsilon) > dst_dispatch_us
+                    aicpu_hb_violated = src_finish_us > dst_dispatch_us
                     aicpu_flow_name = "hb_violation" if aicpu_hb_violated else "dependency"
                     _append_dependency_flow_pair(
                         events,
@@ -1816,7 +1966,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         task_to_aicpu_tid.get(
                             (pred_row["task_id"], pred_row["core_id"]), core_to_tid[pred_row["core_id"]]
                         ),
-                        src_ts,
+                        src_dispatch_us,
                         task_to_aicpu_event_id.get((pred_row["task_id"], pred_row["core_id"])),
                         3,
                         task_to_aicpu_tid.get(
@@ -1842,12 +1992,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # completed_subtasks counter inside whatever complete phase happened to
     # poll them; only the LAST subtask's finish actually completes the
     # task. So per task: take max(finish_time_us) across its subtasks and
-    # find the complete phase that CONTAINS that time. The visual arrow starts
-    # on the same earliest-start Worker View subtask slice used by SPMD
-    # dependency arrows, then lands at the last subtask's AICPU finish
-    # timestamp inside the complete phase. This keeps the related SPMD flow
-    # arrows anchored on one visible record without changing completion
-    # attribution semantics.
+    # find the complete phase that CONTAINS that time. Each task view starts
+    # its visual arrow on the same independently selected anchor it uses for
+    # SPMD dependency arrows, then lands at the last subtask's AICPU finish
+    # timestamp inside the complete phase. This keeps related SPMD flows
+    # consistent within each view without changing completion attribution.
     #
     # Outbound: per-consumer, gated on full fanin. Each consumer in
     # deps.json has multiple producer fanin edges; refcount += 1 fires
@@ -1876,21 +2025,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # For each task: completion = LAST subtask's finish observation.
         # The owning thread is determined by core_to_thread of that last
         # subtask's core — typical case is the same thread observed
-        # earlier subtasks too, but we don't assume. The flow starts on the
-        # earliest-start Worker View subtask slice and ends at the LAST
-        # subtask's AICPU finish timestamp, preserving completion attribution
-        # while keeping related SPMD arrows on the same record.
+        # earlier subtasks too, but we don't assume. Each task view selects its
+        # own earliest visible subtask slice; both flows end at the LAST
+        # subtask's AICPU finish timestamp, preserving completion attribution.
         task_to_complete: dict[int, dict] = {}
         task_last_subtask: dict[int, tuple[float, float, int]] = {}  # tid -> (last_end_us, last_finish_us, core_id)
-        task_anchor_subtasks: dict[int, list[dict]] = {}
+        task_worker_anchors: dict[int, list[dict]] = {}
+        task_scheduler_anchors: dict[int, list[dict]] = {}
         for tid, recs in tasks_by_id.items():
             valid_finishes = [
                 (r.get("finish_time_us"), r.get("end_time_us"), r["core_id"])
                 for r in recs
                 if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
             ]
-            anchor_rows = _dependency_flow_anchor_rows(tid, task_map, spmd_task_ids)
-            if not valid_finishes or not anchor_rows:
+            worker_anchors = _worker_flow_anchor_rows(tid, task_map, spmd_task_ids)
+            scheduler_anchors = _scheduler_flow_anchor_rows(tid, task_map, spmd_task_ids)
+            if not valid_finishes or not worker_anchors:
                 continue
             last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
             if last_cid >= len(core_to_thread):
@@ -1899,7 +2049,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if owning_thread < 0 or owning_thread >= len(complete_phases_by_thread):
                 continue
             task_last_subtask[tid] = (last_end_us, last_finish_us, last_cid)
-            task_anchor_subtasks[tid] = anchor_rows
+            task_worker_anchors[tid] = worker_anchors
+            task_scheduler_anchors[tid] = scheduler_anchors
             # Find the complete phase that CONTAINS this last_finish_us.
             # Fall back to the next-starting complete if none contains
             # (rare: AICore reported the finish but the scheduler hadn't
@@ -1918,15 +2069,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if chosen is not None:
                 task_to_complete[tid] = chosen
 
-        # ---- Inbound: one arrow per anchor, mirrored on Worker View and Scheduler View ----
+        # ---- Inbound: one arrow per independently selected view anchor ----
         # Source ts = <bar end> - epsilon so it lands INSIDE the task X event
-        # selected by _dependency_flow_anchor_rows(). Without this anchoring
-        # Perfetto can't bind the flow to a slice and the arrow is invisible
-        # when you click the task. Same convention as the `dependency` arrows,
-        # and — like the Scheduler View dependency mirror — the complete flow
-        # is drawn in both task views so clicking the task in either lands the
-        # arrow. The pid=2 endpoint (thread + ts) is identical for both mirrors,
-        # so completion attribution is unchanged; only the source view differs.
+        # selected for that view. Without this anchoring Perfetto can't bind the
+        # flow to a slice and the arrow is invisible when you click the task.
+        # The pid=2 endpoint (thread + ts) is identical for both views, so
+        # completion attribution is unchanged; only the visual source differs.
         FLOW_EPSILON_US = 0.01
         for tid, comp in task_to_complete.items():
             _last_end_us, last_finish_us, last_cid = task_last_subtask[tid]
@@ -1935,7 +2083,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             dst_ts = comp["start_time_us"]
             if comp["start_time_us"] <= last_finish_us <= comp["end_time_us"]:
                 dst_ts = last_finish_us
-            for anchor in task_anchor_subtasks[tid]:
+            for anchor in task_worker_anchors[tid]:
                 # Worker View (pid=4): anchor on the kernel slice (end_time_us).
                 src_tid = core_to_tid[anchor["core_id"]]
                 src_event_id = task_to_event_id.get((tid, anchor["core_id"]))
@@ -1965,8 +2113,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 )
                 flow_id += 1
 
-                # Scheduler View (pid=3): mirror on the AICPU dispatch→finish
-                # bar (source ts = finish_time_us). Skip when this anchor has
+            for anchor in task_scheduler_anchors[tid]:
+                # Scheduler View (pid=3): anchor on the AICPU dispatch→finish
+                # bar (source ts = finish_time_us). Skip when the anchor has
                 # no AICPU finish — its pid=3 bar doesn't exist to bind to.
                 anchor_finish_us = anchor.get("finish_time_us")
                 if anchor_finish_us is None or anchor_finish_us <= 0:
@@ -2323,7 +2472,10 @@ Examples:
     )
     parser.add_argument(
         "--func-names",
-        help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
+        help=(
+            "Path to name_map*.json for func_id to function name mapping. "
+            "Defaults to a unique sibling name_map*.json next to the input."
+        ),
     )
     parser.add_argument(
         "--deps-json",
@@ -2409,16 +2561,36 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _load_func_names(args):
-    """Load func_id→name mapping from --func-names JSON or -k kernel_config.py.
+def _find_sibling_name_map(input_path):
+    """Return the unique sibling ``name_map*.json``, if one exists."""
+    candidates = sorted(path for path in Path(input_path).parent.glob("name_map*.json") if path.is_file())
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        candidate_names = ", ".join(path.name for path in candidates)
+        print(
+            f"Warning: multiple sibling name maps found next to {input_path}: {candidate_names}; "
+            "pass --func-names explicitly.",
+            file=sys.stderr,
+        )
+    return None
+
+
+def _load_func_names(args, input_path):
+    """Load func_id→name mapping from an explicit or sibling source.
 
     Returns:
         tuple: (func_id_to_name dict, orchestrator_name str or None)
     """
-    if args.func_names:
+    func_names_path = Path(args.func_names) if args.func_names else None
+    if func_names_path is None and not args.kernel_config:
+        func_names_path = _find_sibling_name_map(input_path)
+
+    if func_names_path is not None:
         if args.verbose:
-            print(f"Loading func names from: {args.func_names}")
-        func_names, orchestrator_name = load_func_names_json(args.func_names)
+            source = "Auto-discovered" if not args.func_names else "Loading"
+            print(f"{source} func names from: {func_names_path}")
+        func_names, orchestrator_name = load_func_names_json(func_names_path)
         if args.verbose:
             print(f"  Loaded {len(func_names)} function name mappings:")
             for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
@@ -2455,7 +2627,7 @@ def main():
         data = read_perf_data(input_path)
         _print_verbose_data_info(data, args.verbose)
 
-        func_names, orchestrator_name = _load_func_names(args)
+        func_names, orchestrator_name = _load_func_names(args, input_path)
 
         output_path = _resolve_output_path(args, input_path)
 
@@ -2505,7 +2677,7 @@ def main():
         print(f"  Output: {output_path}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
-        print_task_statistics(data["tasks"], func_names)
+        print_task_statistics(data["tasks"], func_names, l2_swimlane_level=data["l2_swimlane_level"])
 
         # Scheduler-overhead deep-dive is a SEPARATE manual tool now: it needs
         # the task DAG (deps.json) captured in its own --enable-dep-gen run

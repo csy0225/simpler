@@ -113,7 +113,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
         if (set_scheduler_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor PTO2_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
+            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
             // the scheduler keeps its compile-time default. Sim skips the
             // op/stream ordering check (validate_runtime_timeout_order is onboard).
             RuntimeTimeoutParseStatus sched_status;
@@ -258,21 +258,21 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     runtime.set_aicpu_thread_num(launch_aicpu_num);
 
     int num_aic = block_dim;
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_args_) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     }
     if (enable_l2_swimlane_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
     }
     if (enable_pmu_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     }
     if (enable_dep_gen_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
     if (enable_scope_stats_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     }
 
     Handshake *workers = runtime.get_workers();
@@ -318,10 +318,10 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
-    if (enable_dump_tensor_) {
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -411,7 +411,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         set_orch_device_id_func_(device_id_);
     }
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_dump_args_enabled_func_(enable_dump_tensor_);
+    set_dump_args_enabled_func_(enable_dump_args_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table_func_(kernel_args_.l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
@@ -429,7 +429,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     if (enable_l2_swimlane_) {
         l2_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.start(thread_factory);
     }
     if (enable_pmu_) {
@@ -461,9 +461,15 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // — no C++ thread_local. Local buffer: sim runs in-process so its lifetime
     // spans the join below; reduced into device_phase_ns_ after.
     constexpr int kPhaseThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    std::vector<AicpuPhaseRecord> phase_buf(
-        static_cast<size_t>(kPhaseThreads) * NUM_AICPU_PHASES, AicpuPhaseRecord{kPhaseUnset, 0}
-    );
+    constexpr size_t kPhaseRecs = static_cast<size_t>(kPhaseThreads) * NUM_AICPU_PHASES;
+    constexpr size_t kTailRecs = static_cast<size_t>(task_timing_buffer_slots(kPhaseThreads));
+    // One 16-byte-record vector backs the phase region plus the task-timing tail
+    // (both records are 16 bytes; {kPhaseUnset, 0} initializes an AicpuPhaseRecord
+    // start/end and a TaskTimingRecord dispatch/finish identically). The AICPU SO
+    // resolves the tail at base + task_timing_tail_offset(), so it must be part of
+    // the same published buffer.
+    static_assert(sizeof(AicpuPhaseRecord) == sizeof(TaskTimingRecord), "phase/tail records must share size");
+    std::vector<AicpuPhaseRecord> phase_buf(kPhaseRecs + kTailRecs, AicpuPhaseRecord{kPhaseUnset, 0});
     set_platform_phase_base_func_(reinterpret_cast<uint64_t>(phase_buf.data()));
 
     for (int i = 0; i < over_launch; i++) {
@@ -537,6 +543,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
     device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)] = device_wall_ns_;
 
+    // Resolve the task-timing tail on the phase `origin` timeline (shared logic
+    // in device_phase.h). Sim-specific here: the tail lives inline in phase_buf
+    // (in-process, no D2H) and `cyc_to_ns` uses the sim sys-counter frequency.
+    const TaskTimingRecord *tail = reinterpret_cast<const TaskTimingRecord *>(phase_buf.data() + kPhaseRecs);
+    resolve_task_timing_slots_ns(tail, kPhaseThreads, origin, cyc_to_ns, task_slot_dispatch_ns_, task_slot_finish_ns_);
+
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
@@ -552,7 +564,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.export_swimlane_json();
     }
 
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.stop();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
@@ -700,8 +712,8 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id) {
     int rc = l2_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr,
-        prof_free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb,
+        /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_swimlane_data_base =
@@ -712,12 +724,12 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return rc;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_,
-        dump_tensor_level_
+        dump_args_level_
     );
     if (rc != 0) {
         return rc;

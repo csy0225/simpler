@@ -23,6 +23,24 @@ from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolcha
 logger = logging.getLogger(__name__)
 
 
+_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
+
+
+def _sdma_workspace_enabled() -> bool:
+    """Whether the a5 PTO SDMA workspace overlay is opted in.
+
+    Mirrors the CMake ``option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ... OFF)`` in
+    src/a5/platform/onboard/host/CMakeLists.txt. Set the env var of the same
+    name to a truthy value (1/ON/TRUE/YES) to enable the overlay at build time.
+    """
+    return os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in _WORKSPACE_TRUTHY
+
+
+def _urma_workspace_enabled() -> bool:
+    """Whether the a5 PTO URMA workspace overlay is opted in."""
+    return os.environ.get("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "").upper() in _WORKSPACE_TRUTHY
+
+
 class BuildTarget:
     """CMake build target: composes a Toolchain with a source directory and output name.
 
@@ -101,6 +119,10 @@ class RuntimeCompiler:
     def __init__(self, platform: str = "a2a3"):
         self.platform = platform
         self.project_root = PROJECT_ROOT
+        # Pin-resolved pto-isa checkout path when this platform's host embeds
+        # pto-isa headers; None otherwise. Passed to CMake as -DPTO_ISA_ROOT=
+        # by RuntimeBuilder (#1403) — never via os.environ.
+        self.pto_isa_root: Optional[str] = None
 
         # Map platform name to architecture path
         if platform == "a2a3":
@@ -133,13 +155,12 @@ class RuntimeCompiler:
         env_manager.ensure("ASCEND_HOME_PATH")
         # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
         # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
-        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Use the same pinned
-        # managed checkout as kernel compilation and expose it through
-        # PTO_ISA_ROOT for the existing CMake/build_config surface.
+        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve the pinned managed
+        # checkout once; RuntimeBuilder passes it to CMake as -DPTO_ISA_ROOT=
+        # (#1403 — do not smuggle via os.environ).
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
-        env_manager.ensure("PTO_ISA_ROOT")
+        self.pto_isa_root = ensure_pto_isa_root(verbose=True)
 
         # AICore: Bisheng CCE compiler
         ccec = CCECToolchain(platform="a2a3")
@@ -171,6 +192,15 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
+        # The PTO async workspace overlays (SDMA / URMA) are opt-in until the
+        # CI CANN package exposes the required primitives reliably; see #1315.
+        # When either is opted in the host build embeds pto-isa headers and
+        # must use the same pinned managed checkout as a2a3 (#1351). Path is
+        # stored for RuntimeBuilder to pass as -DPTO_ISA_ROOT= (#1403).
+        if _sdma_workspace_enabled() or _urma_workspace_enabled():
+            from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+            self.pto_isa_root = ensure_pto_isa_root(verbose=True)
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")

@@ -25,9 +25,8 @@
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
  *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
- *                   get_aicpu_dlopen_count, get_host_dlopen_count
- *   - L3-L2 orch:   l3_l2_orch_comm_init_ctx,
- *                   l3_l2_orch_comm_shutdown_ctx
+ *                   get_aicpu_dlopen_count, get_host_dlopen_count,
+ *                   simpler_provision_dma_workspace
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
@@ -64,7 +63,7 @@ enum {
 
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
- * gated on SIMPLER_PROFILING) — parse with simpler_setup.tools.strace_timing.
+ * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
  * See docs/dfx/host-trace.md. */
 
 /* ===========================================================================
@@ -122,11 +121,19 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      simpler_run invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
- * Returns 0 on success, negative on attach failure.
+ *   4. When `prewarm_config` is non-null, build + upload + cache the prebuilt
+ *      runtime-arena for its `runtime_env` ring sizing (tensormap_and_ringbuffer;
+ *      a no-op for runtimes without a prebuilt arena). The device is up by this
+ *      point, so the first simpler_run with matching sizing skips the (~800ms)
+ *      cold build. The sizing is fork-constant, so it rides init rather than a
+ *      separate call. Only `prewarm_config->runtime_env` is read.
+ *
+ * Returns 0 on success, negative on attach or prewarm-build failure.
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *prewarm_config
 );
 
 /**
@@ -134,15 +141,6 @@ int simpler_init(
  * Must be called before destroy_device_context() / dlclose().
  */
 int finalize_device(DeviceContextHandle ctx);
-
-/**
- * Start / stop the independent L3-L2 orchestrator communication service.
- * `control_block` points at a shared L3L2OrchCommControlBlock mapped by both
- * parent and child. Normal in-flight commands are submitted through that
- * block, not through the task-dispatch mailbox.
- */
-int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size);
-int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx);
 
 /* ===========================================================================
  * Per-callable_id preparation
@@ -242,6 +240,16 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
  * the device.
  */
 size_t get_host_dlopen_count(DeviceContextHandle ctx);
+
+/**
+ * Provision the async-DMA workspaces named in `required_mask` (a bitmask of
+ * DmaWorkspaceKind bits) once at Worker init, latching their device addresses
+ * into the resident KernelArgs so every subsequent run carries them. Called only
+ * for a Worker created with SDMA enabled. Bits unsupported by this
+ * platform/runtime are rejected, so a Worker opting into SDMA on sim / a5 / hbg
+ * fails fast. Returns 0 on success, negative on unsupported/failed provisioning.
+ */
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask);
 
 #ifdef __cplusplus
 }

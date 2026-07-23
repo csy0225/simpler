@@ -51,7 +51,7 @@
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
 #include "host/scope_stats_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "runtime.h"
 
@@ -106,8 +106,9 @@ public:
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
     int run(Runtime &runtime, const CallConfig &config) override;
+    bool can_accept_run() const override { return !device_unusable_; }
 
-    // `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
+    // `set_l2_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
     // `output_prefix()`, and `launch_aicpu_kernel` live on
     // `DeviceRunnerBase`.
@@ -177,9 +178,9 @@ private:
     // binaries_loaded_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
-    // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
+    // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
     // `host_dlopen_total_`) and inner struct types
-    // (`ChipCallableBuffer`, `CallableState`, `OrchSoBuffer`) are
+    // (`ChipCallableBuffer`, `CallableState`) are
     // inherited from `DeviceRunnerBase`.
 
     // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
@@ -246,14 +247,14 @@ private:
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
 
     /**
-     * Initialize tensor dump device buffers.
+     * Initialize args dump device buffers.
      *
      * @param runtime Runtime instance to configure
      * @param num_aicore Number of AICore instances (unused)
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_tensor_dump(Runtime &runtime, int device_id);
+    int init_args_dump(Runtime &runtime, int device_id);
 
     /**
      * Initialize PMU profiling device buffers.
@@ -262,7 +263,7 @@ private:
      * publishes the data-header pointer into kernel_args.pmu_data_base.
      * Signature matches a2a3 for cross-platform consistency.
      */
-    // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
+    // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_args_`,
     // `enable_pmu_`, `enable_scope_stats_`, `l2_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //

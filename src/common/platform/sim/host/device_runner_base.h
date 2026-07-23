@@ -46,9 +46,8 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/memory_allocator.h"
-#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
@@ -56,7 +55,7 @@
 struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
 struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
 
-class SimDeviceRunnerBase : public L3L2OrchCommBackend {
+class SimDeviceRunnerBase {
 public:
     SimDeviceRunnerBase() :
         gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
@@ -65,7 +64,7 @@ public:
 
     // Public virtual dtor so c_api_shared can `delete` a SimDeviceRunnerBase *
     // (destroy_device_context entrypoint).
-    ~SimDeviceRunnerBase() override = default;
+    virtual ~SimDeviceRunnerBase() = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     virtual int run(Runtime &runtime, const CallConfig &config) = 0;
@@ -101,15 +100,22 @@ public:
     void set_retained_temp_buffer(void *addr, size_t size);
     void clear_temporary_buffer();
 
-    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
-    int l3_l2_orch_comm_shutdown();
+    // On sim, allocate_tensor returns a plain host pointer, so the "device"
+    // address is already host-readable — register is identity, unregister a
+    // no-op. Mirrors the onboard DeviceRunnerBase API (separate class trees).
+    void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
+        (void)bytes;
+        return dev_ptr;
+    }
+    void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     int record_device_orch_callable(
-        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
+        size_t orch_so_size, const char *func_name, const char *config_name,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int record_host_orch_callable(
-        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int unregister_callable(int32_t callable_id);
@@ -124,6 +130,7 @@ public:
         const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
     );
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    int release_chip_callable_buffer(uint64_t hash);
     int launch_device_register(int32_t callable_id);
     int commit_device_register(int32_t callable_id);
 
@@ -145,14 +152,18 @@ public:
     uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
         return device_phase_start_ns_[static_cast<int>(phase)];
     }
+    // Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
+    // as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
+    uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
+    uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
     void set_l2_swimlane_enabled(int level) {
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(int level) {
-        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
-        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    void set_dump_args_enabled(int level) {
+        dump_args_level_ = static_cast<DumpArgsLevel>(level);
+        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
     }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -252,6 +263,10 @@ protected:
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns().
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
+    // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
+    uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};
+    uint64_t task_slot_finish_ns_[NUM_TASK_TIMING_SLOTS] = {0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash. Each entry owns a host scratch holding the ChipCallable with each
@@ -262,6 +277,7 @@ protected:
         uint64_t chip_dev{0};  // (uint64_t)host_scratch
         uint8_t *host_scratch{nullptr};
         size_t total_size{0};
+        int refcount{0};
         std::vector<void *> dlopen_handles;
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
@@ -270,6 +286,7 @@ protected:
     struct CallableState {
         // trb path
         uint64_t hash{0};
+        uint64_t chip_buffer_hash{0};
         uint64_t dev_orch_so_addr{0};
         size_t dev_orch_so_size{0};
         std::string func_name;
@@ -281,13 +298,7 @@ protected:
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
     };
-    struct OrchSoBuffer {
-        void *dev_addr{nullptr};
-        size_t capacity{0};
-        int refcount{0};
-    };
     std::unordered_map<int32_t, CallableState> callables_;
-    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
@@ -308,30 +319,19 @@ protected:
 
     // Performance / diagnostics collectors shared across arches.
     L2SwimlaneCollector l2_swimlane_collector_;
-    TensorDumpCollector dump_collector_;
+    ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
     // Enablement flags. Written via setters before run(); read inside run().
     bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
+    bool enable_dump_args_{false};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
-
-private:
-    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
-    void l3_l2_free_region_bytes(void *ptr) override;
-    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
-    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
-    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
-
-    L3L2OrchCommService l3_l2_orch_comm_service_;
-    std::mutex l3_l2_alloc_mu_;
-    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 namespace simpler::common::sim_host {

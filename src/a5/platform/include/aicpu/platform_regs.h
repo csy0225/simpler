@@ -29,8 +29,9 @@
 #ifndef PLATFORM_AICPU_PLATFORM_REGS_H_
 #define PLATFORM_AICPU_PLATFORM_REGS_H_
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include "aicpu/cache_maintenance.h"
 #include "common/platform_config.h"
 
 #ifdef __cplusplus
@@ -73,6 +74,20 @@ uint64_t get_platform_regs();
  * @return Volatile pointer to the 32-bit register
  */
 volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg);
+
+/**
+ * Register-cell synchronizing accessors for the AICPU<->AICore handshake gate
+ * (COND / DATA_MAIN_BASE). Implemented per-variant:
+ *   sim/aicpu/inner_platform_regs.cpp     -- atomic acquire/release. The
+ *       simulated registers are plain host memory shared across host threads,
+ *       so the access itself must carry inter-thread happens-before (and be
+ *       visible to ThreadSanitizer) against the AICore side.
+ *   onboard/aicpu/inner_platform_regs.cpp -- plain Device-nGnRnE MMIO load/store
+ *       (atomics are not valid on Device memory); ordering is the caller's
+ *       explicit rmb()/wmb(), so the hardware path is the legacy behavior.
+ */
+uint32_t reg_load_acquire(const volatile uint32_t *p);
+void reg_store_release(volatile uint32_t *p, uint32_t v);
 
 /**
  * Read a register value from an AICore's register block
@@ -148,32 +163,5 @@ uint64_t inner_get_deinit_timeout_ticks();
  * @return Physical core count (exclusive upper bound)
  */
 uint32_t platform_get_physical_cores_count();
-
-/**
- * Invalidate data cache for a memory range.
- *
- * On ARM64 AICPU, DMA writes from the host (rtMemcpy) go directly to HBM
- * without invalidating the AICPU's data cache.  When rtMalloc returns the
- * same device address across rounds, the AICPU may read stale cached data
- * instead of the fresh values written by the host.
- *
- * On real hardware (onboard): performs DC CIVAC per cache line + DSB/ISB.
- * On simulation (sim): no-op.
- *
- * @param addr  Start address of the memory range
- * @param size  Size of the memory range in bytes
- */
-void cache_invalidate_range(const void *addr, size_t size);
-
-/**
- * Clean data cache for a memory range back to global memory.
- *
- * On real hardware (onboard): performs DC CVAC per cache line + DSB/ISB.
- * On simulation (sim): no-op.
- *
- * @param addr  Start address of the memory range
- * @param size  Size of the memory range in bytes
- */
-void cache_flush_range(const void *addr, size_t size);
 
 #endif  // PLATFORM_AICPU_PLATFORM_REGS_H_

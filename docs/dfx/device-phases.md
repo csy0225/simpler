@@ -44,7 +44,7 @@ already-measured window into the host buffer, the host reduces across threads
 (`Sched` = `min(start)..max(end)` over the scheduler threads) and emits them as
 markers. The verbose per-thread `orch_start=…` / `sched_start=…` / `Scheduler
 summary` (loops, tasks_scheduled) device-log lines are gated behind
-`PTO2_ORCH_PROFILING` / `PTO2_SCHED_PROFILING` (default off) as an opt-in
+`SIMPLER_ORCH_PROFILING` / `SIMPLER_SCHED_PROFILING` (default off) as an opt-in
 deep-dive — see [l2-timing.md](l2-timing.md).
 
 ### Buffer layout & flow
@@ -68,18 +68,18 @@ deep-dive — see [l2-timing.md](l2-timing.md).
   `[STRACE]` marker nested under `simpler_run.runner_run.device_wall`
   (see [host-trace.md](host-trace.md)).
 
-### Gating: `SIMPLER_DEVICE_PROFILING` (host/device split)
+### Gating: `SIMPLER_DEVICE_STRACE_ENABLE` (host/device split)
 
 The device markers can be turned off independently of the host spans so a
 deployment can profile the two domains separately:
 
-* **Device** (`clk=dev` markers): the runtime env `SIMPLER_DEVICE_PROFILING`,
+* **Device** (`clk=dev` markers): the runtime env `SIMPLER_DEVICE_STRACE_ENABLE`,
   read once by `emit_device_phase_markers` in the host `c_api_shared`. `=0`
   suppresses the whole device-phase emit; any other value (or unset) keeps it on
   (**default on**). It does not affect the on-device stamping cost (cheap plain
   stores) — only whether the host re-emits the readback as markers.
 * **Host** (`simpler_run` / `bind` / `runner_run` / `validate` spans): no new
-  knob — they ride the compile-time `SIMPLER_PROFILING` macro and the log level
+  knob — they ride the compile-time `SIMPLER_HOST_STRACE` macro and the log level
   (`LOG_INFO_V9`), so raising the log threshold drops them.
 
 `RunWall` is the whole on-NPU wall (the former `RunTiming.device_wall`); it is
@@ -157,6 +157,66 @@ and publishes it with `platform_aicpu_affinity_set_thread_idx()` before any
 stamping, so the per-thread phase-record slot resolves correctly inside the SO.
 A phase whose measured duration rounds to 0 (e.g. preamble / graph_build on a
 trivial example) is simply not emitted.
+
+## Selective task-timing slots (implemented)
+
+A lightweight way to measure a specific task's (or an interval's) AICPU
+dispatch→finish window **without** enabling the L2 swimlane — no collector
+threads, no per-task AICore records, works in `SIMPLER_DFX=0`. See
+[l2-timing.md](l2-timing.md) for how it relates to the swimlane's `finish_time`.
+
+* **Opt-in is per task, by tagging.** Orchestration calls
+  `L0TaskArgs::set_task_timing_slot(id)` (`id` in `0..15`; forwarded by
+  `L0TaskArgsWithDeps`). Untagged is the default sentinel
+  (`TASK_TIMING_SLOT_NONE = -1`); an out-of-range id fails through the standard
+  invalid-arg path. **No env var and no compile gate** — tagging is the only
+  switch. An untagged task's only added hot-path cost is one cache-hot sentinel
+  compare; it never reads `get_sys_cnt_aicpu()`.
+* **Transport reuses this same buffer.** The id rides the scheduler's hot
+  `PTO2TaskSlotState` in the `TaskAttrs` byte (bit 3 `is_timed` + bits 4-7 the
+  0..15 tag), co-located with the other per-task scheduling flags. The 16 slots
+  are a fixed `TaskTimingRecord[16]` **tail** appended after the `AicpuPhaseRecord`
+  region in the same device buffer — same base pointer, same per-run H2D reset
+  and post-sync D2H readback. It is a distinct record type (dispatch/finish, not
+  start/end) reduced by **min(dispatch) / max(finish)**, not an `AicpuPhase`
+  (those fire once per run/thread; a slot takes many block/subtask events).
+* **Boundaries (match the L2 swimlane).** `dispatch` = the earliest Scheduler
+  publication of `DATA_MAIN_BASE` (after payload publish, immediately before the
+  register write; the initial gated publication for early/speculative dispatch,
+  not the doorbell release). `finish` = the latest Scheduler FIN observation
+  across every required block/subtask (after the COND load + `rmb()`, before
+  fanin/fanout/**deferred-completion** processing) — not the AICore kernel-end.
+* **Aggregation is intentional.** For each slot the host reduces
+  `min(dispatch)` / `max(finish)` across Scheduler threads. **Reusing one slot**
+  for several tagged tasks yields the window from the earliest tagged dispatch to
+  the latest tagged finish (**duplicate-slot** = merged window). **Distinct
+  slots** keep each task's own window, so tooling recovers
+  `finish(B) − dispatch(A)`. A **MIX** task's AIC/AIV0/AIV1 subtasks and an
+  **SPMD** task's blocks (dispatched by different Scheduler threads) all fold
+  into the one tagged slot.
+* **Emission & reset.** Every complete slot (dispatch set, finish > dispatch) is
+  emitted as a stable `clk=dev` span
+  `simpler_run.runner_run.device_wall.task_slot_<N>`, retaining start and
+  duration so cross-slot intervals are recoverable; `Worker.run()` still returns
+  `None`. All slots are reset every run, so a failed/short run cannot leak stale
+  data; unset or incomplete slots are skipped. Slots share the phase timeline's
+  `origin` when phases were stamped, and fall back to the earliest tagged
+  dispatch when they were not (e.g. `host_build_graph`, whose device side stamps
+  no orch/sched phases).
+* **Thread index.** The fold uses the **Scheduler's own thread index** (not
+  `platform_aicpu_affinity_thread_idx()`): `host_build_graph` hands its schedulers
+  a local index because the sim affinity gate leaves the affinity idx `-1`, so
+  resolving via affinity there would drop every write. Any distinct valid index
+  per thread yields the same min/max reduction.
+* **Dummy tasks.** `alloc_tensors` builds a kernel-less descriptor that never
+  dispatches; its `TaskAttrs` start cleared (untagged) so a recycled ring slot
+  cannot leak a stale tag.
+
+Seams: `common/device_phase.h` (`TaskTimingRecord`, `reduce_task_timing_slots`,
+buffer-layout helpers), `aicpu/device_phase_aicpu.h`
+(`aicpu_task_timing_dispatch/finish(slot, thread_idx)`), the a2a3
+`scheduler_dispatch.cpp` / `scheduler_completion.cpp` fold points, and the
+host reset/readback/emit in the onboard + sim runners and `c_api_shared`.
 
 ## Variable phases (design, not yet implemented)
 

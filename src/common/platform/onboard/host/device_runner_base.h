@@ -51,17 +51,17 @@
 #include "arg_direction.h"
 #include "callable.h"
 #include "common/device_phase.h"
+#include "common/dma_workspace.h"
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
-#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "prepare_callable_common.h"
 
 struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
@@ -76,7 +76,7 @@ struct CallConfig;  // task_interface/call_config.h — per-run config threaded 
  * `destroy_device_context` sees, so the non-virtual `~DeviceRunnerBase`
  * is safe — it never runs as a virtual base destructor.
  */
-class DeviceRunnerBase : public L3L2OrchCommBackend {
+class DeviceRunnerBase {
 public:
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
@@ -96,8 +96,22 @@ public:
     void get_retained_temp_buffer(void **addr, std::size_t *size);
     void set_retained_temp_buffer(void *addr, std::size_t size);
     void clear_temporary_buffer();
-    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
-    int l3_l2_orch_comm_shutdown();
+    /**
+     * Map a device buffer into the host address space and return a
+     * host-readable VA (or nullptr on failure); the paired unregister releases
+     * it. The returned VA may differ from dev_ptr, so callers must use it, not
+     * dev_ptr, for host access. Register/unregister must be paired (unregister
+     * before free_tensor). On a2a3 onboard this wraps
+     * halHostRegister(DEV_SVM_MAP_HOST); a5 onboard has no host-map path and
+     * uses the base default. Base default: unsupported (returns nullptr /
+     * no-op); a2a3 overrides.
+     */
+    virtual void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+        (void)dev_ptr;
+        (void)bytes;
+        return nullptr;
+    }
+    virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
@@ -238,6 +252,13 @@ public:
     }
 
     /**
+     * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
+     * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
+     */
+    uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
+    uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
+
+    /**
      * Upload an entire ChipCallable buffer to device memory in one shot.
      * Walks child_offsets_ to compute total byte size, allocates device
      * GM once, fixes up each child's resolved_addr_ in an internal host
@@ -247,9 +268,8 @@ public:
      *
      * Pool-managed: identical buffer bytes (FNV-1a 64-bit content hash)
      * hit the dedup cache and return the cached chip_dev without
-     * reallocating. All chip buffers are bulk-freed by the subclass's
-     * `finalize()` — there is no explicit free API, mirroring the
-     * per-fid binary pool semantics.
+     * reallocating. Each successful upload retains one reference; ownership is
+     * transferred into a CallableState or released on registration failure.
      *
      * Callers compute child addresses as
      *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
@@ -258,20 +278,20 @@ public:
      * before each run.
      *
      * @param callable  Host-side ChipCallable pointer.
-     * @return Device GM address of the ChipCallable header, or 0 on
-     *         failure (also returns 0 when callable->child_count() == 0).
+     * @return Device GM address of the ChipCallable header, or 0 on failure.
      */
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    int release_chip_callable_buffer(uint64_t hash);
 
     /**
-     * Stage a per-callable_id orchestration SO into device memory and
+     * Stage a per-callable_id orchestration SO from the retained ChipCallable and
      * remember the supporting metadata (entry/config symbol names,
-     * kernel func_id ↔ dev_addr table). Identical SO bytes across two
-     * callable_ids share one device buffer (refcounted by hash) so the
-     * worst case for an N-cid pool is N distinct device buffers, not
-     * N copies of the same SO.
+     * kernel func_id ↔ dev_addr table). The orchestration SO is the leading
+     * slice of ChipCallable::storage_ inside the retained chip buffer.
      *
      * @param callable_id   Caller-stable id, must be in [0, MAX_REGISTERED_CALLABLE_IDS).
+     * @param chip_buffer_hash  FNV-1a hash of the retained ChipCallable buffer.
+     * @param chip_dev      Device GM address of the retained ChipCallable header.
      * @param orch_so_data  Host pointer to orchestration SO bytes (owned by caller).
      * @param orch_so_size  Size of orchestration SO in bytes.
      * @param func_name     Entry symbol name (copied).
@@ -283,8 +303,9 @@ public:
      * @return 0 on success, negative on failure.
      */
     int record_device_orch_callable(
-        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
+        size_t orch_so_size, const char *func_name, const char *config_name,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
@@ -298,16 +319,14 @@ public:
      * dlclose'd by `unregister_callable`. Increments `host_dlopen_total_`.
      */
     int record_host_orch_callable(
-        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
-     * Drop the registered state for `callable_id`. trb path: decrement
-     * the orch SO buffer's hash-keyed refcount and free when it hits
-     * zero. hbg path: dlclose the host dlopen handle. Kernel binaries
-     * are shared across callables and only released by the subclass's
-     * `finalize()`.
+     * Drop the registered state for `callable_id`. Decrements the retained
+     * chip buffer's hash-keyed refcount and frees when it hits zero. hbg path
+     * also dlcloses the host dlopen handle.
      *
      * @return 0 on success or if the id was not registered.
      */
@@ -319,6 +338,19 @@ public:
      * calls without a matching `simpler_register_callable`.
      */
     bool has_callable(int32_t callable_id) const;
+
+    /**
+     * Provision the async-DMA workspaces named in `required_mask` once at Worker
+     * init and latch their device addresses into the resident KernelArgs so every
+     * subsequent run carries them (AICPU injects them into GlobalContext via
+     * get_dma_workspace). Called only for a Worker created with SDMA enabled;
+     * `required_mask` bits outside dma_workspace_supported_mask() are rejected, so
+     * a platform/runtime without SDMA fails fast. The provider handle is released
+     * by finalize_common().
+     *
+     * @return 0 on success, negative on unsupported/failed provisioning.
+     */
+    int provision_dma_workspace(uint32_t required_mask);
 
     /**
      * Content-derived stable identity for a registered callable: the
@@ -396,6 +428,14 @@ public:
     // (an arch without dep_gen keeps the base no-op default).
 
     /**
+     * Whether this runner may start another run without first being finalized.
+     * The shared c_api checks this before attaching the thread or provisioning
+     * optional resources, so a poisoned runner cannot create SDMA streams on
+     * its way to the arch-specific run() fail-fast guard.
+     */
+    virtual bool can_accept_run() const = 0;
+
+    /**
      * Execute a Runtime. Each arch implements its own `run()` — the bodies
      * are too divergent for a shared implementation (FFTS / dep_gen / ACL
      * register init on a2a3; MIX core handling on a5). See the subclass
@@ -420,8 +460,6 @@ public:
      * The base default is a no-op for any arch that does not implement dep_gen.
      */
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
-
-    virtual bool l3_l2_orch_comm_supported() const { return true; }
 
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
@@ -479,9 +517,9 @@ public:
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(int level) {
-        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
-        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    void set_dump_args_enabled(int level) {
+        dump_args_level_ = static_cast<DumpArgsLevel>(level);
+        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
     }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -546,9 +584,9 @@ protected:
     int ensure_binaries_loaded();
 
     /**
-     * Per-device one-shot launch of `simpler_aicpu_init`, latching the
-     * invariants (orch device id, log config) into the resident AICPU SO
-     * globals. Idempotent via `aicpu_init_launched_`; called from
+     * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
+     * device id, log config) into the resident AICPU SO globals. Idempotent via
+     * `aicpu_init_launched_`; called from
      * `ensure_device_initialized()` after the binaries are loaded.
      *
      * @return 0 on success, error code on failure.
@@ -697,7 +735,6 @@ protected:
      *   - rtStreamDestroy for both persistent streams
      *   - aicore_bin_handle_ + binaries_loaded_ reset
      *   - chip_callable_buffers_ free + clear
-     *   - orch_so_dedup_ free + clear
      *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
      *   - 3 arenas release + cached size reset
      *   - device_wall_dev_ptr_ free (before mem_alloc_.finalize)
@@ -732,26 +769,27 @@ protected:
     // the ChipCallable bytes. Each entry owns one device GM allocation
     // holding the entire ChipCallable buffer (header + storage_, with
     // each child's resolved_addr_ fixed up to its post-H2D device
-    // address). Pool-managed: identical buffer bytes share one entry
-    // across cids; the map is bulk-freed by the subclass's `finalize()`.
+    // address). Identical buffer bytes share one entry across cids; refcount
+    // drops on unregister and finalize bulk-frees any leftovers.
     struct ChipCallableBuffer {
         uint64_t chip_dev{0};  // device GM address of the ChipCallable header
         size_t total_size{0};  // byte size of the device allocation
+        int refcount{0};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Per-callable_id registered state.
     //
-    // `callables_` maps the caller-stable callable_id to the orch SO
-    // slice + symbol names needed to launch it. `orch_so_dedup_` shares
-    // device buffers across callable_ids whose orch SO bytes have the
-    // same ELF Build-ID hash (refcounted; freed when the count hits
-    // zero). `aicpu_seen_callable_ids_` tracks which ids have completed a
-    // successful AICPU SO load so `prepare_orch_so` can advertise either a
-    // cache hit or a first-load fallback without committing early.
+    // `callables_` maps the caller-stable callable_id to the chip buffer
+    // lease, orch SO slice + symbol names needed to launch it.
+    // `aicpu_seen_callable_ids_` tracks which ids have completed a successful
+    // AICPU SO load for the monotonic dlopen counter.
     struct CallableState {
         // trb path (AICPU dlopens orch SO from device buffer)
+        // Orchestration ELF Build-ID returned by callable_hash(); distinct from
+        // chip_buffer_hash, which keys the retained buffer.
         uint64_t hash{0};
+        uint64_t chip_buffer_hash{0};
         uint64_t dev_orch_so_addr{0};
         size_t dev_orch_so_size{0};
         std::string func_name;
@@ -763,13 +801,17 @@ protected:
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
     };
-    struct OrchSoBuffer {
-        void *dev_addr{nullptr};
-        size_t capacity{0};
-        int refcount{0};
-    };
     std::unordered_map<int32_t, CallableState> callables_;
-    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
+    // Opaque provider handle from dma_workspace_provision(), owned for the
+    // Worker's life and released by finalize_common(). Null unless the Worker
+    // was created with SDMA enabled.
+    void *dma_workspace_handle_{nullptr};
+    // Provisioned async-DMA workspace device addresses, indexed by
+    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
+    // so the resident AICPU SO latches them into g_dma_workspace_addr; the
+    // scheduler prefills each core's GlobalContext from there. All-zero until a
+    // Worker opts into SDMA via provision_dma_workspace().
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of successful AICPU dlopens (incremented after prewarm
     // or first-run fallback succeeds; never decremented). Diverges from
@@ -874,19 +916,22 @@ protected:
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns(). Populated alongside device_phase_ns_.
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
+    // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
+    uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};
+    uint64_t task_slot_finish_ns_[NUM_TASK_TIMING_SLOTS] = {0};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
-    // Per-device one-shot guard for the simpler_aicpu_init launch.
+    // Per-device guard for the initial simpler_aicpu_init launch.
     bool aicpu_init_launched_{false};
-
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     L2SwimlaneCollector l2_swimlane_collector_;
-    TensorDumpCollector dump_collector_;
+    ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
@@ -894,24 +939,13 @@ protected:
     // Written by the c_api entry point via `set_*_enabled()` before
     // `run()`, read inside `run()` and its helpers.
     bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
+    bool enable_dump_args_{false};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
-
-private:
-    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
-    void l3_l2_free_region_bytes(void *ptr) override;
-    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
-    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
-    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
-
-    L3L2OrchCommService l3_l2_orch_comm_service_;
-    std::mutex l3_l2_alloc_mu_;
-    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 #endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

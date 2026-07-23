@@ -51,7 +51,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding
@@ -101,6 +101,20 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     } catch (...) {
         return -1;
     }
+}
+
+static void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
+    try {
+        return current_runner()->register_device_memory_to_host(dev_ptr, bytes);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void unregister_device_memory_from_host(void *dev_ptr) {
+    try {
+        current_runner()->unregister_device_memory_from_host(dev_ptr);
+    } catch (...) {}
 }
 
 static int device_memset(void *dev_ptr, int value, size_t size) {
@@ -196,11 +210,21 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
 // filled table is valid for every runner and every run. Build it once at load
 // time rather than reassembling the pointer table on each simpler_run. Passed by
 // address into bind_callable_to_runtime_impl / validate_runtime_impl.
+
+// Weak no-op default lives in device_runner_base.cpp; tensormap_and_ringbuffer
+// links a strong override that builds + caches the prebuilt runtime-arena.
+// simpler_init calls it directly for the fork-constant ring sizing.
+extern "C" int prewarm_config_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+);
+
 static const HostApi g_host_api = {
     .device_malloc = device_malloc,
     .device_free = device_free,
     .copy_to_device = copy_to_device,
     .copy_from_device = copy_from_device,
+    .register_device_memory_to_host = register_device_memory_to_host,
+    .unregister_device_memory_from_host = unregister_device_memory_from_host,
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
@@ -259,11 +283,7 @@ int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
         SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
-        int rc = runner->l3_l2_orch_comm_shutdown();
-        int finalize_rc = runner->finalize();
-        if (rc == 0) {
-            rc = finalize_rc;
-        }
+        int rc = runner->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
             pto_cpu_sim_release_device(dev);
@@ -274,27 +294,10 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
-int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
-    if (ctx == NULL || control_block == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_init(control_block, control_block_size);
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
-    if (ctx == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_shutdown();
-    } catch (...) {
-        return -1;
-    }
-}
-
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *prewarm_config
 ) {
     // Sim has no AICPU dispatcher (the simulator runs AICPU in-process). Accept
     // the parameters for ABI parity with the onboard implementation and ignore
@@ -306,6 +309,14 @@ int simpler_init(
     if (ctx == NULL) return -1;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+    // HostApi callbacks, including the prewarm path below, recover their
+    // DeviceRunner from this thread-local binding.
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    auto tsd_guard = RAIIScopeGuard([]() {
+        pthread_setspecific(g_runner_key, nullptr);
+    });
+
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
@@ -328,6 +339,21 @@ int simpler_init(
         return -1;
     }
     // No CANN dlog on sim. HostLogger is owned by libsimpler_log.so.
+
+    // Prebuilt runtime-arena prewarm for the fork-constant ring sizing, now that
+    // the runner is attached. trb links a strong prewarm_config_impl; other
+    // runtimes link the weak no-op. Only the ring sizing is read.
+    if (prewarm_config != NULL) {
+        try {
+            rc = prewarm_config_impl(
+                &g_host_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
+                prewarm_config->runtime_env.ring_dep_pool
+            );
+        } catch (...) {
+            return -1;
+        }
+        if (rc != 0) return rc;
+    }
     return 0;
 }
 
@@ -344,6 +370,11 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 
     try {
         CallableArtifacts artifacts;
+        auto chip_buffer_guard = RAIIScopeGuard([runner, &artifacts]() {
+            if (artifacts.chip_buffer_hash != 0) {
+                runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
+            }
+        });
         int rc = register_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
@@ -366,18 +397,21 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->record_host_orch_callable(
-                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
-                std::move(artifacts.signature)
+                callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+                std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
                 host_dlopen_guard.dismiss();
+                chip_buffer_guard.dismiss();
             }
         } else {
             rc = runner->record_device_orch_callable(
-                callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
+                callable_id, artifacts.chip_buffer_hash, artifacts.chip_buffer_dev, artifacts.orch_so_data,
+                artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
+                std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
+                chip_buffer_guard.dismiss();
                 needs_aicpu_register = true;
             }
         }
@@ -395,14 +429,14 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
     }
 }
 
-// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_PROFILING=0
+// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_STRACE_ENABLE=0
 // suppresses the device (clk=dev) markers so a deployment can profile host and
 // device independently; any other value (or unset) keeps them on. Host-side
-// [STRACE] spans are unaffected — they ride SIMPLER_PROFILING + the log level.
+// [STRACE] spans are unaffected — they ride SIMPLER_HOST_STRACE + the log level.
 // Read once and cached (process-lifetime config knob).
 static bool device_profiling_enabled() {
     static const bool enabled = [] {
-        const char *v = std::getenv("SIMPLER_DEVICE_PROFILING");
+        const char *v = std::getenv("SIMPLER_DEVICE_STRACE_ENABLE");
         return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     return enabled;
@@ -442,6 +476,31 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
         if (ns != 0) {
             STRACE_DEV_SPAN_AT(
                 p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
+                3
+            );
+        }
+    }
+
+    // Selective task-timing slots: one span per complete slot, start = dispatch
+    // and duration = finish - dispatch, both on the phase timeline so cross-slot
+    // intervals (e.g. finish(slot_1) - dispatch(slot_0)) stay recoverable.
+    // Untagged / incomplete slots read back 0/0 and are skipped.
+    static const char *const kTaskSlotNames[NUM_TASK_TIMING_SLOTS] = {
+        "simpler_run.runner_run.device_wall.task_slot_0",  "simpler_run.runner_run.device_wall.task_slot_1",
+        "simpler_run.runner_run.device_wall.task_slot_2",  "simpler_run.runner_run.device_wall.task_slot_3",
+        "simpler_run.runner_run.device_wall.task_slot_4",  "simpler_run.runner_run.device_wall.task_slot_5",
+        "simpler_run.runner_run.device_wall.task_slot_6",  "simpler_run.runner_run.device_wall.task_slot_7",
+        "simpler_run.runner_run.device_wall.task_slot_8",  "simpler_run.runner_run.device_wall.task_slot_9",
+        "simpler_run.runner_run.device_wall.task_slot_10", "simpler_run.runner_run.device_wall.task_slot_11",
+        "simpler_run.runner_run.device_wall.task_slot_12", "simpler_run.runner_run.device_wall.task_slot_13",
+        "simpler_run.runner_run.device_wall.task_slot_14", "simpler_run.runner_run.device_wall.task_slot_15",
+    };
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        const uint64_t dispatch_ns = runner->last_task_slot_dispatch_ns(s);
+        const uint64_t finish_ns = runner->last_task_slot_finish_ns(s);
+        if (finish_ns > dispatch_ns) {
+            STRACE_DEV_SPAN_AT(
+                kTaskSlotNames[s], static_cast<long long>(dispatch_ns), static_cast<long long>(finish_ns - dispatch_ns),
                 3
             );
         }
@@ -491,9 +550,9 @@ int simpler_run(
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
@@ -503,14 +562,14 @@ int simpler_run(
             rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+            rc = validate_runtime_impl(r, &g_host_api, 0);
         }
         pthread_setspecific(g_runner_key, nullptr);
         emit_device_phase_markers(runner);
@@ -546,6 +605,13 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
     } catch (...) {
         return 0;
     }
+}
+
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+    // Simulation provides no async-DMA workspaces; a non-empty request fails
+    // fast so an SDMA-enabled Worker cannot come up on sim.
+    (void)ctx;
+    return required_mask == 0 ? 0 : -1;
 }
 
 }  // extern "C"

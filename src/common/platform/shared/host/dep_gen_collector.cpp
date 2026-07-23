@@ -49,10 +49,17 @@ int DepGenCollector::init(
         LOG_ERROR("DepGenCollector already initialized");
         return -1;
     }
-    if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
-        LOG_ERROR("DepGenCollector::init: invalid arguments");
+    if (num_threads <= 0 || num_threads > PLATFORM_MAX_AICPU_THREADS || alloc_cb == nullptr || free_cb == nullptr) {
+        LOG_ERROR(
+            "DepGenCollector::init: invalid arguments (num_threads=%d, valid range: 1-%d)", num_threads,
+            PLATFORM_MAX_AICPU_THREADS
+        );
         return -1;
     }
+
+    // Must precede the recycled-lane seeding below: push_recycled() folds its
+    // shard argument modulo the manager's shard count.
+    set_aicpu_thread_num(num_threads);
 
     num_threads_ = num_threads;
     total_collected_ = 0;
@@ -91,6 +98,7 @@ int DepGenCollector::init(
     const size_t buf_size = sizeof(DepGenBuffer);
     DepGenBufferState *state = get_dep_gen_buffer_state(shm_host_local, 0);
 
+    const int owner_shard = (num_threads > 0) ? (num_threads - 1) : 0;
     for (int b = 0; b < PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE; b++) {
         void *host_ptr = nullptr;
         void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
@@ -108,7 +116,9 @@ int DepGenCollector::init(
             state->free_queue.tail = tail + 1;
             wmb();
         } else {
-            manager_.push_recycled(0, dev_ptr);
+            if (!manager_.push_recycled(0, dev_ptr, owner_shard)) {
+                (void)manager_.retire_unqueued_buffer(0, dev_ptr, owner_shard);
+            }
         }
     }
 
@@ -284,8 +294,8 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
         state->free_queue.head = tail;
     }
 
-    // Release framework-owned buffers (recycled pool, ready_queue,
-    // done_queue). release_owned_buffers also frees their host shadows.
+    // Release framework-owned device allocations (recycled pool,
+    // ready_queue, done_queue). Host shadows are freed by clear_mappings().
     manager_.release_owned_buffers([&](void *p) {
         release_dev_once(p);
     });

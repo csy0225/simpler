@@ -37,12 +37,18 @@
 #endif
 
 #include "aicpu/dump_arg_selection.h"
+#include "common/device_phase.h"
 #include "data_type.h"
 #include "profiling_config.h"
 #include "pto_submit_types.h"
 #include "task_args.h"
 #include "tensor.h"
 #include "tensor_create_info.h"  // runtime-only TensorCreateInfo + materialization helpers
+
+// TaskAttrs packs the timing tag into a 4-bit field and reports "untagged" as
+// -1, so the tag domain must fit 0..15 and the untagged sentinel must be -1.
+static_assert(NUM_TASK_TIMING_SLOTS <= 16, "timing tag must fit TaskAttrs' 4-bit field");
+static_assert(TASK_TIMING_SLOT_NONE == -1, "TaskAttrs::timing_slot() reports untagged as -1");
 
 typedef enum {
     ASYNC_ENGINE_SDMA = 0,
@@ -196,6 +202,27 @@ public:
  *   TaskOutputTensors outs = rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
  */
+
+// Operand of a dispatch predicate (L0 layer): locates one element of a tensor —
+// tensor + ndims + indices, mirroring get_tensor_data. The tensor is borrowed and
+// must outlive submit; its buffer must be allocated by then, and its producer must
+// be a dependency of the predicated task so the value is current at dispatch.
+struct L0PredicateOperand {
+    const Tensor *tensor{nullptr};
+    uint32_t ndims{0};
+    uint32_t indices[MAX_TENSOR_DIMS]{};
+};
+
+// Dispatch predicate carried on an Arg: operand OP target (e.g. count[i] > 0).
+// op == NONE means "no predicate — always dispatch". Submit resolves the operand
+// into the payload's DispatchPredicate (an absolute GM address). Read in-process;
+// never crosses the wire.
+struct L0TaskPredicate {
+    L0PredicateOperand operand;
+    PredicateOp op{PredicateOp::NONE};
+    int64_t target{0};
+};
+
 template <size_t MaxT, size_t MaxS>
 struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     using Base = TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType>;
@@ -220,13 +247,49 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
+    // Early-dispatch hint (codegen-author set, off by default). When
+    // true, the scheduler may stage this task on an idle core before its producer
+    // finishes, gating execution on the DATA_MAIN_BASE doorbell — only safe when
+    // the author knows the task's data dependencies allow it. Read in-process by
+    // the runtime; never crosses the wire format.
+    bool allow_early_resolve_{false};
+    void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
+    bool allow_early_resolve() const { return allow_early_resolve_; }
+
+    // Dispatch predicate (codegen-author set; default op == NONE = always
+    // dispatch). A FALSE result at the dispatch point retires the task inline
+    // through the dep-only path — never dispatched to an AICore — while still
+    // resolving fanin/fanout so consumers unlock. The predicate tensor's producer
+    // MUST be a dependency of this task so the value is current when the task
+    // becomes ready. Read in-process; never crosses the wire.
+    L0TaskPredicate predicate_;
+    void set_predicate(const L0TaskPredicate &pred) { predicate_ = pred; }
+    const L0TaskPredicate &predicate() const { return predicate_; }
+
+    // Selective task-timing slot: tag this task to have the scheduler record its
+    // AICPU dispatch/finish cycles into fixed slot `slot` (0..15). Untagged by
+    // default. An out-of-range id fails through the standard invalid-arg path so
+    // the scheduler never stamps out of bounds.
+    int32_t task_timing_slot_{TASK_TIMING_SLOT_NONE};
+    void set_task_timing_slot(int32_t slot) {
+        if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) {
+            set_error("task_timing_slot out of range (valid: 0..15)");
+            return;
+        }
+        task_timing_slot_ = slot;
+    }
+    int32_t task_timing_slot() const { return task_timing_slot_; }
+
     void clear() {
         Base::clear();
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear();
 #endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        allow_early_resolve_ = false;
+        predicate_ = L0TaskPredicate{};
+        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
     }
 
     void reset() {
@@ -244,7 +307,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
     template <typename... Args>
     void dump(Args &&...args) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
             "dump: temporaries are not allowed — pass tensors/scalars already added to this Arg"
@@ -263,7 +326,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     uint64_t dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
     uint64_t dump_arg_index_ambiguous_mask() const { return dump_arg_selection_.dump_arg_index_ambiguous_mask(); }
 #else
@@ -381,7 +444,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
         scalar_count_ += count;
@@ -416,7 +479,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
         scalar_count_ += count;
@@ -436,13 +499,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
         scalar_count_ += count;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     const uint8_t *scalar_dtypes() const { return dump_arg_selection_.scalar_dtypes(); }
 #else
     const uint8_t *scalar_dtypes() const { return nullptr; }
@@ -450,12 +513,12 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     DumpArgSelection dump_arg_selection_;
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     template <typename T>
     static constexpr bool is_supported_dump_arg_v =
         std::is_same_v<std::decay_t<T>, Tensor> || std::is_same_v<std::decay_t<T>, TensorCreateInfo> ||
@@ -477,7 +540,7 @@ private:
     template <typename T>
     void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         uintptr_t scalar_source_ptr = 0;
         if constexpr (std::is_lvalue_reference_v<T>) {
             scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
@@ -489,7 +552,7 @@ private:
         scalar_count_++;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // No-arg dump(): mark every arg already added to this Arg.
     void mark_all_dump_args() {
         if (tensor_count_ == 0 && scalar_count_ == 0) {

@@ -15,11 +15,12 @@
 #include <mutex>
 
 #include "aicpu/device_log.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/memory_barrier.h"
@@ -66,7 +67,7 @@ struct AicpuExecutor {
     // Fast lookup: core_id -> reg_addr
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Physical core ids keyed by logical worker id. Populated by discover_cores()
     // and handed to pmu_aicpu_init() so the platform can resolve per-core PMU
     // MMIO bases from `get_platform_regs()`.
@@ -111,8 +112,8 @@ struct AicpuExecutor {
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
-    // ===== Dump tensor state =====
-    Runtime *runtime_{nullptr};  // Cached for dump_tensor access in try_dispatch_task
+    // ===== Args dump state =====
+    Runtime *runtime_{nullptr};  // Cached for args dump access in try_dispatch_task
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -130,8 +131,8 @@ struct AicpuExecutor {
     // Helper functions (inline to avoid linker issues, not always_inline to preserve barriers)
     //
     // resolve_task_dependencies also handles post-completion profiling hooks
-    // (AFTER_COMPLETION tensor dump + per-task PMU record) so that callers
-    // walk one boundary instead of sprinkling three #if PTO2_PROFILING blocks
+    // (AFTER_COMPLETION args dump + per-task PMU record) so that callers
+    // walk one boundary instead of sprinkling three #if SIMPLER_DFX blocks
     // after every resolve site. core_id / core_type are only read when the
     // relevant profiling flag is enabled.
     inline void resolve_task_dependencies(
@@ -148,7 +149,7 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 static int
 collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint64_t *buffer_addrs, int max_count) {
     int found = 0;
@@ -169,7 +170,7 @@ collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint6
 // ===== Helper Function Implementations =====
 
 // Resolve dependencies: decrement fanin and enqueue newly ready tasks.
-// Also handles post-completion profiling hooks (AFTER_COMPLETION tensor dump
+// Also handles post-completion profiling hooks (AFTER_COMPLETION args dump
 // + per-task PMU record) so callers don't need to re-check profiling flags.
 inline void AicpuExecutor::resolve_task_dependencies(
     Task *task, Runtime &runtime, int thread_idx, int core_id, CoreType core_type, int *cur_ready_queue_aic,
@@ -179,7 +180,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
         return;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
@@ -191,7 +192,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
             dump_args_for_task(
                 thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
-                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
+                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::AFTER_COMPLETION
             );
         }
     }
@@ -260,7 +261,7 @@ inline bool AicpuExecutor::try_dispatch_task(
         running_task_ids_[core_id]
     );
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         Task *task = runtime_->get_task(task_id);
         if (task != nullptr) {
@@ -274,7 +275,7 @@ inline bool AicpuExecutor::try_dispatch_task(
                     collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
                 dump_args_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
-                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
+                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::BEFORE_DISPATCH
                 );
             }
         }
@@ -302,6 +303,14 @@ inline bool AicpuExecutor::try_dispatch_task(
     // immediately before the DATA_MAIN_BASE write.
     if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
+
+    // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+    // task, folded as min. Untagged tasks pay only this cache-hot compare and
+    // never read the sys counter. Independent of L2 swimlane level.
+    if (Task *timed = runtime_->get_task(task_id);
+        timed != nullptr && timed->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+        aicpu_task_timing_dispatch(timed->task_timing_slot, thread_idx);
     }
 
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
@@ -370,7 +379,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->worker_count);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(aicpu_thread_num_);
     }
@@ -480,7 +489,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         physical_core_ids_[i] = physical_core_id;
 #endif
 
@@ -674,6 +683,17 @@ int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *
 /**
  * Resolve dependencies and dispatch tasks using fast-path scheduling
  */
+// Task-timing finish: fold a completed task's FIN observation into its slot as
+// max. No-op for untagged tasks / invalid ids. Called at each completion point
+// (independent of L2 swimlane, so it works in SIMPLER_DFX=0 builds).
+static inline void fold_task_finish(Runtime &runtime, int task_id, int thread_idx) {
+    if (task_id == AICPU_TASK_INVALID) return;
+    Task *t = runtime.get_task(task_id);
+    if (t != nullptr && t->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+        aicpu_task_timing_finish(t->task_timing_slot, thread_idx);
+    }
+}
+
 int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
     Handshake *hank = reinterpret_cast<Handshake *>(runtime.workers);
 
@@ -746,6 +766,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int completed_task_id = pending_task_ids_[core_id];
                 int prev_running_id = running_task_ids_[core_id];
+
+                // Both the pending task (FIN observed here) and the running task
+                // (implicitly done — AICore overwrote COND before its FIN) complete.
+                // Fold the implicitly-done running task first: it finished earlier, so
+                // it must take the earlier sys-cycle stamp (fold_task_finish reads the
+                // counter at call time and folds as max).
+                fold_task_finish(runtime, prev_running_id, thread_idx);
+                fold_task_finish(runtime, completed_task_id, thread_idx);
 
                 // Profiling: when prev_running_id exists, its AICore timing was
                 // written to wip[id & 1] first, so complete it BEFORE the
@@ -843,6 +871,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int prev_running_id = running_task_ids_[core_id];
 
+                // The ACK promotes pending to running; the old running task is
+                // implicitly complete.
+                fold_task_finish(runtime, prev_running_id, thread_idx);
+
                 // Move pending to running
                 running_task_ids_[core_id] = pending_task_ids_[core_id];
                 pending_task_ids_[core_id] = AICPU_TASK_INVALID;
@@ -894,6 +926,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 );
 
                 int completed_task_id = running_task_ids_[core_id];
+
+                // Running task FIN observed here.
+                fold_task_finish(runtime, completed_task_id, thread_idx);
 
                 if (l2_swimlane_enabled) {
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
@@ -1104,7 +1139,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_flush(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
@@ -1113,7 +1148,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     }
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
     if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cur_thread_cores, thread_cores_num_[thread_idx]);

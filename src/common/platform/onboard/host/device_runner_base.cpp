@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -42,8 +43,10 @@
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/acl_error_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "platform_comm/comm.h"
 #include "pto_runtime_c_api.h"
 #include "task_args.h"
 #include "utils/elf_build_id.h"
@@ -68,25 +71,25 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
     if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
-        const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+        const char *op_env = std::getenv(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %llu", PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
+            "%s=%s invalid, using default %llu", SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
             (unsigned long long)order_defaults.op_execute_timeout_us
         );
     }
 
     if (parse_status.stream_sync_env_set && !parse_status.stream_sync_valid) {
-        const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
+        const char *sync_env = std::getenv(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
+            "%s=%s invalid, using default %d", SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
             order_defaults.stream_sync_timeout_ms
         );
     }
 
     if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
-        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        const char *sched_env = std::getenv(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
+            "%s=%s invalid, using default %d", SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
             order_defaults.scheduler_timeout_ms
         );
     }
@@ -158,64 +161,6 @@ void DeviceRunnerBase::clear_temporary_buffer() {
         retained_temp_addr_ = nullptr;
         retained_temp_size_ = 0;
     }
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
-    if (!l3_l2_orch_comm_supported()) {
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    }
-    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_shutdown() {
-    if (!l3_l2_orch_comm_supported()) {
-        return 0;
-    }
-    return l3_l2_orch_comm_service_.stop();
-}
-
-void *DeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
-        return nullptr;
-    }
-    void *ptr = allocate_tensor(static_cast<size_t>(bytes));
-    if (ptr == nullptr) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    l3_l2_allocations_.insert(ptr);
-    return ptr;
-}
-
-void DeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
-    if (ptr == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    auto it = l3_l2_allocations_.find(ptr);
-    if (it == l3_l2_allocations_.end()) {
-        return;
-    }
-    free_tensor(ptr);
-    l3_l2_allocations_.erase(it);
-}
-
-int DeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
-}
-
-int DeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
-}
-
-std::thread DeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
-    return create_thread(std::move(fn));
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
@@ -378,6 +323,7 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
         LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -422,6 +368,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicpu_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             return rc;
         }
         aicpu_created_here = true;
@@ -430,6 +377,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicore_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             // Roll back only the AICPU stream we just created, not a
             // pre-existing persistent one.
             if (aicpu_created_here) {
@@ -451,10 +399,6 @@ int DeviceRunnerBase::ensure_device_initialized() {
 }
 
 int DeviceRunnerBase::ensure_aicpu_init_launched() {
-    // Per-device one-shot: latch the invariants (orch device id, log config)
-    // into the resident AICPU SO globals via simpler_aicpu_init, so exec /
-    // record_device_orch_callable launches no longer carry them. The inner SO stays
-    // dlopen'd across launches, so a single init holds for the runner's life.
     if (aicpu_init_launched_) {
         return 0;
     }
@@ -466,6 +410,13 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    // Publish the provisioned async-DMA workspace addresses (all-zero until a
+    // Worker opts into SDMA). provision_dma_workspace() re-launches this entry to
+    // re-latch them; the AICPU SO stays resident, so the latest values survive
+    // every subsequent per-task launch.
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        init_args.dma_workspace_addr[kind] = dma_workspace_addr_[kind];
+    }
 
     LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
@@ -481,7 +432,6 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
         LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
     }
-
     aicpu_init_launched_ = true;
     return 0;
 }
@@ -625,7 +575,7 @@ void DeviceRunnerBase::print_handshake_results() {
 // =============================================================================
 
 uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
-    if (callable == nullptr || callable->child_count() == 0) {
+    if (callable == nullptr) {
         return 0;
     }
     if (stream_aicpu_ == nullptr) {
@@ -638,9 +588,10 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // Content-hash dedup: identical bytes → return cached chip_dev.
     auto it = chip_callable_buffers_.find(layout.content_hash);
     if (it != chip_callable_buffers_.end()) {
+        it->second.refcount++;
         LOG_DEBUG(
-            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev, it->second.total_size,
-            layout.content_hash
+            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx, refcount=%d", it->second.chip_dev,
+            it->second.total_size, layout.content_hash, it->second.refcount
         );
         return it->second.chip_dev;
     }
@@ -664,16 +615,37 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size});
+    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size, 1});
     LOG_DEBUG(
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, layout.total_size,
         callable->child_count(), layout.content_hash
     );
     return chip_dev;
+}
+
+int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
+    if (hash == 0) {
+        return 0;
+    }
+    auto it = chip_callable_buffers_.find(hash);
+    if (it == chip_callable_buffers_.end()) {
+        LOG_WARN("release_chip_callable_buffer: hash=0x%lx not found", hash);
+        return 0;
+    }
+    if (--it->second.refcount <= 0) {
+        mem_alloc_.free(reinterpret_cast<void *>(it->second.chip_dev));
+        LOG_DEBUG(
+            "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
+            it->second.total_size, hash
+        );
+        chip_callable_buffers_.erase(it);
+    }
+    return 0;
 }
 
 int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
@@ -769,6 +741,7 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     }
     if (rc != 0) {
         LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -776,8 +749,9 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
 }
 
 int DeviceRunnerBase::record_device_orch_callable(
-    int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
+    const char *func_name, const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs,
+    std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -793,6 +767,10 @@ int DeviceRunnerBase::record_device_orch_callable(
         LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0 || chip_dev == 0) {
+        LOG_ERROR("record_device_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
@@ -800,52 +778,25 @@ int DeviceRunnerBase::record_device_orch_callable(
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
 
-    // Hash dedup: share device buffer across callable_ids that carry the same
-    // SO bytes. Refcount drops in unregister_callable; we only free when the
-    // count hits zero.
-    auto buf_it = orch_so_dedup_.find(hash);
-    uint64_t dev_addr = 0;
-    if (buf_it == orch_so_dedup_.end()) {
-        void *buf = mem_alloc_.alloc(orch_so_size);
-        if (buf == nullptr) {
-            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
-            return -1;
-        }
-        int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
-        if (rc != 0) {
-            LOG_ERROR("record_device_orch_callable: rtMemcpy failed: %d", rc);
-            mem_alloc_.free(buf);
-            return rc;
-        }
-        OrchSoBuffer entry;
-        entry.dev_addr = buf;
-        entry.capacity = orch_so_size;
-        entry.refcount = 1;
-        orch_so_dedup_.emplace(hash, entry);
-        dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
-    } else {
-        buf_it->second.refcount++;
-        dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
-    }
-
     CallableState state;
     state.hash = hash;
-    state.dev_orch_so_addr = dev_addr;
+    state.chip_buffer_hash = chip_buffer_hash;
+    state.dev_orch_so_addr = chip_dev + offsetof(ChipCallable, storage_);
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
+    LOG_INFO_V0(
+        "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
+        chip_buffer_hash, orch_so_size
+    );
     return 0;
 }
 
 int DeviceRunnerBase::record_host_orch_callable(
-    int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+    int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
@@ -858,12 +809,17 @@ int DeviceRunnerBase::record_host_orch_callable(
         LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0) {
+        LOG_ERROR("record_host_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
     CallableState state;
+    state.chip_buffer_hash = chip_buffer_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
@@ -882,24 +838,59 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
+    release_chip_callable_buffer(state.chip_buffer_hash);
 
     if (state.host_dlopen_handle != nullptr) {
-        // hbg path: no orch SO refcount, just dlclose the host handle.
+        // hbg path: no device-side orch SO handle, just dlclose the host handle.
         dlclose(state.host_dlopen_handle);
         return 0;
-    }
-
-    auto buf_it = orch_so_dedup_.find(state.hash);
-    if (buf_it != orch_so_dedup_.end()) {
-        if (--buf_it->second.refcount <= 0) {
-            mem_alloc_.free(buf_it->second.dev_addr);
-            orch_so_dedup_.erase(buf_it);
-        }
     }
     return 0;
 }
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
+
+int DeviceRunnerBase::provision_dma_workspace(uint32_t required_mask) {
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((required_mask & ~supported) != 0) {
+        LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
+        return -1;
+    }
+    if (dma_workspace_handle_ != nullptr) {
+        LOG_ERROR("provision_dma_workspace: workspace already provisioned");
+        return -1;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+        dma_workspace_addr_[kind] = 0;
+
+    // The provisioned addresses are stable for the Worker's life.
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+
+    // Re-latch the resident AICPU globals: simpler_aicpu_init publishes the
+    // provisioned addresses into g_dma_workspace_addr, which the scheduler
+    // prefills into every core's GlobalContext (get_dma_workspace). The AICPU SO
+    // stays dlopen'd, so the values survive every subsequent per-task launch.
+    aicpu_init_launched_ = false;
+    rc = ensure_aicpu_init_launched();
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: re-latch of simpler_aicpu_init failed: %d", rc);
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        return rc;
+    }
+    return 0;
+}
 
 uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
     auto it = callables_.find(callable_id);
@@ -929,9 +920,8 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     const auto &state = it->second;
 
     // Replay each prepared kernel address into runtime.func_id_to_addr_.
-    // The kernel binaries are owned by the shared DeviceRunner pool and
-    // survive across runs — freed only by `finalize()`, never by
-    // validate_runtime_impl or `unregister_callable`.
+    // The kernel binaries live in the retained ChipCallable buffer for this
+    // callable_id and stay valid until `unregister_callable` or `finalize`.
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
@@ -955,9 +945,22 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     );
 }
 
+// Eager prebuilt-arena warm-up. A runtime that has a prebuilt runtime arena
+// (tensormap_and_ringbuffer) provides a strong prewarm_config_impl in its
+// runtime_maker.cpp that overrides this weak no-op default. Runtimes without one
+// (host_build_graph, or an arch that has not implemented it yet) link this weak
+// default and treat prewarm as a no-op. simpler_init calls it directly for the
+// fork-constant ring sizing once the device is up.
+extern "C" __attribute__((weak)) int prewarm_config_impl(
+    const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
+    const uint64_t * /*ring_dep_pool*/
+) {
+    return 0;
+}
+
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_l2_swimlane_enabled(config.enable_l2_swimlane);
-    set_dump_tensor_enabled(config.enable_dump_tensor);
+    set_dump_args_enabled(config.enable_dump_args);
     set_pmu_enabled(config.enable_pmu);
     // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
     // without dep_gen falls through to the base no-op.
@@ -1005,8 +1008,6 @@ int DeviceRunnerBase::finalize_common() {
     // raw_base_ flag) so the eventual destructor no-ops. Any new member owning
     // an RTS/device resource must be released here, with an idempotent
     // destructor as the backstop. See issue #1197.
-    capture(l3_l2_orch_comm_shutdown());
-
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
     // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
@@ -1023,6 +1024,14 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicore_ = nullptr;
     }
 
+    // Release the async-DMA provider (SDMA STARS streams + workspace) while RTS
+    // is live, before the subclass device reset. Null unless the Worker was
+    // created with SDMA enabled; idempotent so a reused runner re-provisions.
+    if (dma_workspace_handle_ != nullptr) {
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+    }
+
     // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it
     // here while RTS is live so ~LoadAicpuOp's idempotent Finalize() no-ops
     // instead of unloading after aclFinalize (see the invariant above).
@@ -1037,8 +1046,7 @@ int DeviceRunnerBase::finalize_common() {
     // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
     aicpu_init_launched_ = false;
 
-    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
-    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    // Release any chip callable buffers callers forgot to unregister.
     for (auto &kv : chip_callable_buffers_) {
         mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
         LOG_DEBUG(
@@ -1048,15 +1056,6 @@ int DeviceRunnerBase::finalize_common() {
     }
     chip_callable_buffers_.clear();
 
-    // Release any registered-callable orch SO buffers that callers forgot to
-    // unregister. Refcounts no longer matter at this point — the device is
-    // about to be reset.
-    for (auto &kv : orch_so_dedup_) {
-        if (kv.second.dev_addr != nullptr) {
-            mem_alloc_.free(kv.second.dev_addr);
-        }
-    }
-    orch_so_dedup_.clear();
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister
     // each callable_id, so without this loop the host process leaks one
@@ -1128,6 +1127,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
         int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
         if (rc != RT_ERROR_NONE) {
             LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             aicore_bin_handle_ = nullptr;
             return rc;
         }
@@ -1148,6 +1148,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1176,8 +1177,12 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     // buffer is allocated once (lazy) but RESET every run so a stale prior run
     // cannot leak into the reduction.
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
-    constexpr size_t kBytes = static_cast<size_t>(kRecords) * sizeof(AicpuPhaseRecord);
+    // Phase region followed by the task-timing tail. Both records are 16 bytes and
+    // share the {kPhaseUnset, 0} reset, so one AicpuPhaseRecord init array covers
+    // both; the AICPU SO resolves the tail at base + task_timing_tail_offset().
+    static_assert(sizeof(AicpuPhaseRecord) == sizeof(TaskTimingRecord), "phase/tail records must share size");
+    constexpr int kRecords = kThreads * NUM_AICPU_PHASES + task_timing_buffer_slots(kThreads);
+    constexpr size_t kBytes = device_phase_buffer_bytes(kThreads);
     if (device_wall_dev_ptr_ == nullptr) {
         device_wall_dev_ptr_ = allocate_tensor(kBytes);
         if (device_wall_dev_ptr_ != nullptr) {
@@ -1187,8 +1192,8 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     if (device_wall_dev_ptr_ != nullptr) {
         AicpuPhaseRecord init[kRecords];
         for (int i = 0; i < kRecords; ++i) {
-            init[i].start_cycle = kPhaseUnset;  // start: sentinel so min()/unset-check ignore unused slots
-            init[i].end_cycle = 0;              // end: 0 so max() ignores unused slots
+            init[i].start_cycle = kPhaseUnset;  // start/dispatch: sentinel so min()/unset-check ignore unused slots
+            init[i].end_cycle = 0;              // end/finish: 0 so max() ignores unused slots
         }
         if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
             // Reset failed — disable capture for this run so stale slot data
@@ -1270,10 +1275,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1284,10 +1291,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     return 0;
@@ -1304,6 +1313,10 @@ void DeviceRunnerBase::read_device_wall_ns() {
     for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
         device_phase_ns_[p] = 0;
         device_phase_start_ns_[p] = 0;
+    }
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        task_slot_dispatch_ns_[s] = 0;
+        task_slot_finish_ns_[s] = 0;
     }
     if (device_wall_dev_ptr_ == nullptr) return;
 
@@ -1340,6 +1353,26 @@ void DeviceRunnerBase::read_device_wall_ns() {
         }
     }
     device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
+
+    // Task-timing tail: D2H the per-slot records that follow the phase region,
+    // then resolve them on the phase `origin` timeline (shared logic in
+    // device_phase.h). Platform-specific here: the rtMemcpy and the cycle→ns
+    // conversion (real-silicon sys-counter frequency).
+    constexpr int kTailRecords = task_timing_buffer_slots(kThreads);
+    TaskTimingRecord tail[kTailRecords] = {};
+    const void *tail_src = reinterpret_cast<const uint8_t *>(device_wall_dev_ptr_) + task_timing_tail_offset(kThreads);
+    int tail_rc = rtMemcpy(tail, sizeof(tail), tail_src, sizeof(tail), RT_MEMCPY_DEVICE_TO_HOST);
+    if (tail_rc != 0) {
+        LOG_WARN("rtMemcpy(task_timing) D2H failed: %d", tail_rc);
+        return;
+    }
+    resolve_task_timing_slots_ns(
+        tail, kThreads, origin,
+        [](uint64_t cyc) {
+            return static_cast<uint64_t>(cycles_to_us(cyc) * 1000.0);
+        },
+        task_slot_dispatch_ns_, task_slot_finish_ns_
+    );
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
@@ -1364,7 +1397,7 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
     if (enable_l2_swimlane_) {
         l2_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.start(thread_factory);
     }
     if (enable_pmu_) {
@@ -1387,7 +1420,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
         l2_swimlane_collector_.export_swimlane_json();
     }
 
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.stop();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();

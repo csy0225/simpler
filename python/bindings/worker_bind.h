@@ -402,18 +402,23 @@ inline void bind_worker(nb::module_ &m) {
             "add_remote_l3_socket",
             [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
                const std::string &host, uint16_t port, const std::string &health_host, uint16_t health_port,
-               double timeout_s) {
+               double attach_timeout_s, double runtime_timeout_s) {
                 nb::gil_scoped_release release;
                 self.add_remote_l3_socket(
-                    worker_id, session_id, transport_name, host, port, health_host, health_port, timeout_s
+                    worker_id, session_id, transport_name, host, port, health_host, health_port, attach_timeout_s,
+                    runtime_timeout_s
                 );
             },
             nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("host"), nb::arg("port"),
-            nb::arg("health_host"), nb::arg("health_port"), nb::arg("timeout_s") = 30.0,
-            "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
+            nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
+            nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
 
-        .def("init", &Worker::init, "Start the Scheduler thread.")
+        // Release the GIL while starting the Scheduler thread so another Python
+        // thread can run during it — e.g. a concurrent close() observing
+        // INITIALIZING and failing fast. init/close remain same-thread-only
+        // (enforced by Worker.close()).
+        .def("init", &Worker::init, nb::call_guard<nb::gil_scoped_release>(), "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
 
         .def(
@@ -724,9 +729,14 @@ inline void bind_worker(nb::module_ &m) {
             "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
         )
         .def(
-            "control_l3_l2_orch_comm_init", &Worker::control_l3_l2_orch_comm_init, nb::arg("worker_id"),
-            nb::arg("control_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_ORCH_COMM_INIT."
+            "control_l3_l2_region_create", &Worker::control_l3_l2_region_create, nb::arg("worker_id"),
+            nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_CREATE."
+        )
+        .def(
+            "control_l3_l2_region_release", &Worker::control_l3_l2_region_release, nb::arg("worker_id"),
+            nb::arg("region_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_RELEASE."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);

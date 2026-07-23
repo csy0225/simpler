@@ -11,6 +11,8 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -52,14 +54,42 @@ public:
     // Lifecycle
     // =========================================================================
 
-    // Initialize scheduler state from the given runtime and thread layout.
-    // - Discovers cores via handshake_all_cores()
-    // - Assigns cores to scheduler threads
-    // - Resets task counters, payloads, per-core GlobalContext
-    // - Binds func_id_to_addr_ / initial sched_ (if rt is already known)
-    // - Captures AICore-register base (consumed by handshake_all_cores())
-    // Returns 0 on success, negative on failure (handshake / assignment error).
-    int32_t init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    // Initialize scheduler state from the given runtime and thread layout. Split
+    // into three parts so the per-core AICore handshake — a serial, MMIO-bound
+    // loop that dominates preamble (~217 µs of ~283 µs for 72 cores) — can run in
+    // parallel across all AICPU threads. Orchestrated by AicpuExecutor::init:
+    // the leader runs pre_handshake_init, every thread handshakes a disjoint
+    // slice of cores via handshake_partition, then the leader runs
+    // post_handshake_init after a barrier.
+    //
+    // Leader-only: per-core state + config + swimlane buffers + core count. Must
+    // be published before any thread enters handshake_partition. Returns 0 on
+    // success, negative on failure.
+    int32_t
+    pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    // All threads: handshake this thread's contiguous slice [lo, hi) of cores
+    // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
+    void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Handshake exactly the cores this scheduler thread will later manage:
+    // clusters {tidx, tidx+active, ...}, cluster ci =
+    // {ci, N/3+2ci, N/3+2ci+1} (blocked layout: [0,N/3) AIC, [N/3,N) AIV). Matches
+    // assign_cores_to_threads' round-robin so handshake warms the same
+    // core_exec_states_ the thread later dispatches from.
+    void handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads);
+    // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
+    // its own CoreTracker + per-core sub_block_id for the clusters it owns, right
+    // after handshaking them — no all-thread barrier or leader post_handshake_init.
+    void assign_own_clusters(int32_t tidx);
+    // Latch completion + shutdown cores on a handshake failure seen without the
+    // barrier (non-DFX path). Idempotent.
+    void abort_and_shutdown(Runtime *runtime);
+    // Leader-only profiling-subsystem init (DFX builds); called behind a barrier
+    // in the barrier-free path since pmu_aicpu_init needs all physical_core_ids_.
+    void post_handshake_profiling_init();
+    bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
+    // Leader-only, after the handshake barrier: build worker-id lists, assign
+    // cores, init profiling subsystems, read task counts, init payloads.
+    int32_t post_handshake_init(Runtime *runtime);
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
@@ -73,12 +103,12 @@ public:
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (PTO2_PROFILING) before deinit when enabled.
+    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
     // Run all post-orchestration scheduler bookkeeping:
-    //  - publishes core assignments to the perf collector (PTO2_PROFILING)
+    //  - publishes core assignments to the perf collector (SIMPLER_DFX)
     //  - latches submitted task count from PTO2 shared memory
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
@@ -91,9 +121,8 @@ public:
     // mode where rt is created by the orchestrator thread after init().
     void bind_runtime(PTO2Runtime *rt);
 
-    // Serial orch->sched mode pre-dispatch wait. Thread 0 may drain deferred
-    // wiring to keep the bounded wiring queue from back-pressuring orchestration,
-    // but no AICore dispatch happens before orchestrator_done_.
+    // Serial orch->sched mode pre-dispatch wait. No AICore dispatch happens
+    // before orchestrator_done_.
     void wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // =========================================================================
@@ -102,6 +131,7 @@ public:
 
     int32_t aic_count() const { return aic_count_; }
     int32_t aiv_count() const { return aiv_count_; }
+    int32_t cores_total_num() const { return cores_total_num_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
@@ -134,7 +164,7 @@ private:
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
     // Cached once at init() from get_l2_swimlane_level(), AFTER
     // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
@@ -155,16 +185,26 @@ private:
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
-    // Cluster-ordered worker_id lists, populated by handshake_all_cores().
+    // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
 
-#if PTO2_PROFILING
+    // Compact per-core CoreType, packed contiguously (~2 cache lines total) so
+    // post_handshake_init's ordered discovery scan reads it instead of taking a
+    // per-core volatile GM load from the 64B-aligned Handshake struct. Filled by
+    // each handshake thread for its own [lo,hi) slice during the parallel sweep.
+    uint8_t core_type_compact_[RUNTIME_MAX_WORKER]{};
+
+    // Set by any thread whose slice hits an invalid physical_core_id in
+    // handshake_partition; checked by the leader in post_handshake_init.
+    std::atomic<bool> handshake_failed_{false};
+
+#if SIMPLER_DFX
     // Physical core ids keyed by logical worker id. Populated by
     // handshake_all_cores() and handed to pmu_aicpu_init() so the platform
-    // can resolve per-core PMU MMIO bases. Only needed when PTO2_PROFILING=1
+    // can resolve per-core PMU MMIO bases. Only needed when SIMPLER_DFX=1
     // — without it, PMU is compiled out and core_exec_states_ already
     // carries the field.
     uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
@@ -176,9 +216,6 @@ private:
     // =========================================================================
     // Core management (scheduler_cold_path.cpp)
     // =========================================================================
-
-    // Handshake with all AICore workers; populates core_exec_states_, worker id lists.
-    int32_t handshake_all_cores(Runtime *runtime);
 
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();
@@ -212,22 +249,51 @@ private:
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        const AsyncCtx &async_ctx, int32_t block_idx
+        const AsyncCtx &async_ctx, int32_t block_idx, bool force_gate = false
     );
 
-    void dispatch_subtask_to_core(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2SubtaskSlot subslot, bool to_pending, int32_t block_idx
+    // Batched-dispatch primitives. prepare_* builds the payload and per-core
+    // state; publish_* issues the MMIO register write. Callers must wmb()
+    // between the prepare batch and the publish batch, then sample
+    // get_sys_cnt_aicpu() once and pass it to publish_* for every handle.
+    //
+    // dispatch_timestamp_slot points to the CoreExecState slot
+    // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
+    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // dispatch timestamp is being recorded.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+        uint64_t *dispatch_timestamp_slot;
+        int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+    };
+
+    PublishHandle prepare_subtask_to_core(
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+        bool to_pending, int32_t block_idx, bool force_gate = false
     );
 
-    void dispatch_mix_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending,
-        int32_t block_idx
-    );
+    // `thread_idx` is the publishing Scheduler thread's index, used to select the
+    // per-thread task-timing record; every call site already has it in scope.
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
+        if (h.dispatch_timestamp_slot != nullptr) {
+            *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+        // task, folded as min. Untagged tasks pay only this cache-hot compare and
+        // never read the sys counter. Independent of L2 swimlane level.
+        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
+        }
+        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+    }
 
-    void dispatch_block(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2ResourceShape shape, bool to_pending, int32_t block_idx
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
     void dispatch_shape(
@@ -252,6 +318,16 @@ private:
         bool &try_pushed
     );
 
+    // Phase 4b: early-dispatch onto spare cores after normal dispatch.
+    int32_t try_early_dispatch(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    );
+    int32_t early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase);
+
     // Returns true if any *other* scheduler thread currently has an idle core
     // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
     // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
@@ -261,25 +337,29 @@ private:
     // True if mix tasks remain in the global MIX ready queue. Approximate —
     // PTO2ReadyQueue::size() (see pto_scheduler.h) snapshots its enqueue/dequeue
     // positions with std::memory_order_relaxed and may interleave with concurrent
-    // push/pop. Don't confuse with PTO2SpscQueue::size(), which uses acquire
-    // loads — that one isn't on this path. A stale read here causes at most one
+    // push/pop. A stale read here causes at most one
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
+
+    bool has_residual_early_mix() const {
+        return sched_->early_dispatch_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
     // =========================================================================
     // Completion & drain (scheduler_completion.cpp)
     // =========================================================================
 
-    static SlotTransition
-    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id);
+    static SlotTransition decide_slot_transition(
+        int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
+    );
 
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
 #endif
@@ -294,9 +374,9 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
-    void drain_worker_dispatch(Runtime *runtime, int32_t block_num);
-    void handle_drain_mode(Runtime *runtime, int32_t thread_idx);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending = false);
+    int32_t drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated);
+    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
@@ -359,13 +439,13 @@ private:
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
         int32_t last_progress_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         ,
         uint64_t sched_start_ts
 #endif
     );
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 

@@ -119,7 +119,7 @@ are silicon-agnostic. The precheck is purely about onboard invocations.
 ## Device logs: redirect them out of the shared default
 
 The AICPU/CCECPU device log (where `report_deadlock`, `HandleTaskTimeout`,
-stall diagnostics, AICore faults, and the `PTO2_PROFILING` Total/Orch/Sched
+stall diagnostics, AICore faults, and the `SIMPLER_DFX` Total/Orch/Sched
 markers land — the ground truth behind a host-side `507018`) defaults to:
 
 ```text
@@ -164,6 +164,12 @@ Then read it directly (`$LOGDIR/device-*/device-*.log`) — no more `grep`-ing
 "deadlock" or "OOM" from the host error alone — **read the device log and grep
 for the signature that actually fired:**
 
+> The host log now names the code and the device-side error class it masks — grep
+> for `error detail:` / `orch_error_code=` / `sched_error_code=` / `sub_class=`
+> before opening the device log at all. The full code reference and the per-code
+> debugging notes are in
+> [docs/troubleshooting/device-error-codes.md](../../docs/troubleshooting/device-error-codes.md).
+
 | device-log signature | mechanism | note |
 | -------------------- | --------- | ---- |
 | `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | ring/heap or dep-pool **deadlock** (alloc can't reclaim) | AICPU detector: 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`) or immediate structural `head_blocked_on_scope_end`. Real capacity/scope deadlock. |
@@ -179,7 +185,7 @@ look for a race or just-too-slow, not "the ring is too small". For the
 host/device timing breakdown of a (completed) run, parse its `[STRACE]` markers
 with `python -m simpler_setup.tools.strace_timing <log> --rounds-table` (see
 `simpler_setup/tools/README.md`); for the per-thread `loops`/`tasks_scheduled`
-deep-dive, rebuild with `PTO2_SCHED_PROFILING=1` and read the device log
+deep-dive, rebuild with `SIMPLER_SCHED_PROFILING=1` and read the device log
 directly.
 
 ## Anti-patterns

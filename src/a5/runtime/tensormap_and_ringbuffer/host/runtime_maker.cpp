@@ -45,6 +45,7 @@
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
+#include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "callable.h"
 #include "common/platform_config.h"
@@ -391,7 +392,9 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in register_callable_impl", callable->child_count());
-    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
+    if (upload_and_collect_child_addrs(
+            callable, upload_fn, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash
+        ) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
     }
@@ -562,25 +565,20 @@ static bool stage_device_args(
             return false;
         }
 
-        // Pure write-only OUTPUT buffers carry no meaningful host content, so
-        // the H2D copy-in is wasted. Zero them on-device instead (cheap HBM
-        // memset, no PCIe) so any region the kernel leaves unwritten reads as 0
-        // rather than pooled-allocator garbage. INOUT (read-before-write)
-        // and IN keep the H2D copy. Falls back to copy_to_device if a backend
-        // did not wire device_memset.
+        // Pure write-only OUTPUT buffers are never read by the kernel and hold
+        // no meaningful host content, so they need no device staging — the
+        // kernel defines what it writes and any unwritten bytes are undefined.
+        // IN / INOUT (read-before-write) are staged H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        int rc;
-        if (is_pure_output && api->device_memset != nullptr) {
-            rc = api->device_memset(dev_ptr, 0, size);
-        } else {
-            rc = api->copy_to_device(dev_ptr, host_ptr, size);
-        }
-        if (rc != 0) {
-            LOG_ERROR("Failed to stage tensor %d to device", i);
-            if (release_kind == TensorReleaseKind::Free) {
-                api->device_free(dev_ptr);
+        if (!is_pure_output) {
+            int rc = api->copy_to_device(dev_ptr, host_ptr, size);
+            if (rc != 0) {
+                LOG_ERROR("Failed to stage tensor %d to device", i);
+                if (release_kind == TensorReleaseKind::Free) {
+                    api->device_free(dev_ptr);
+                }
+                return false;
             }
-            return false;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
@@ -607,7 +605,7 @@ static bool stage_device_args(
 // runtime. Behavior-only env reads (no new gates); kept here so the args and
 // image steps stay free of unrelated state.
 static void apply_orch_sched_env_flags(Runtime *runtime) {
-    const char *serial_env = std::getenv("PTO2_SERIAL_ORCH_SCHED");
+    const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     runtime->dev.serial_orch_sched =
         serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
     LOG_INFO_V0(
@@ -829,13 +827,14 @@ extern "C" int bind_callable_to_runtime_impl(
     // device_malloc). The buffer itself lives on the runner across runs; here we
     // just grow it to this run's packed size and bump-slice from it.
     RetainedTempBump bump;
-    bool use_temporary_buffer =
-        api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
+    bool use_temporary_buffer = api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
     if (use_temporary_buffer && !bump.begin(api, orch_args)) {
         return -1;
     }
 
-    auto bind_cleanup = RAIIScopeGuard([&]() { release_tensor_leases(runtime, api); });
+    auto bind_cleanup = RAIIScopeGuard([&]() {
+        release_tensor_leases(runtime, api);
+    });
 
     ChipStorageTaskArgs device_args;
     if (!stage_device_args(
@@ -897,10 +896,11 @@ extern "C" int bind_callable_to_runtime_impl(
  * 2. Releases recorded tensor leases
  * 3. Clears tensor lease state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -920,22 +920,18 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
     LOG_INFO_V0("Tensor leases to process: %d", tensor_lease_count);
 
-    // PTO2 (device orchestration): graph output may be in packed buffer
-    uint64_t graph_out_ptr = 0;
-    uint64_t graph_out_size = 0;
-    bool skip_tensor_copy_back = false;
+    bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    if (execution_rc != 0) {
+        runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    }
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-        LOG_ERROR(
-            "PTO2 runtime failed: orch_error_code=%d sched_error_code=%d runtime_status=%d", orch_error_code,
-            sched_error_code, runtime_status
-        );
+        LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.
@@ -954,19 +950,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
                 host_header.sched_stall_core.load(std::memory_order_relaxed)
             );
         }
-        skip_tensor_copy_back = true;
-    } else {
-        graph_out_ptr = host_header.graph_output_ptr;
-        graph_out_size = host_header.graph_output_size;
-        if (graph_out_ptr != 0) {
-            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
-        }
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        bool first_output_tensor = true;
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];
 
@@ -990,18 +978,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
                 continue;
             }
 
-            void *src_ptr = lease.dev_ptr;
-            size_t copy_size = lease.size;
-
-            // Use graph_output_ptr for the first output tensor if available
-            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-                copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
-                first_output_tensor = false;
-            }
-
-            int copy_rc = api->copy_from_device(lease.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;

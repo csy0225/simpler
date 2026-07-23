@@ -41,9 +41,21 @@ public:
     /// unified_log_* (and, on sim, sim_context_*) symbols against those
     /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
     /// mode=RTLD_GLOBAL)`.
+    /// `prewarm_config`, when non-null, builds + caches the prebuilt
+    /// runtime-arena for its ring sizing right after the device comes up (the
+    /// sizing is fork-constant, delivered by COW into init). A no-op for
+    /// runtimes without a prebuilt arena.
+    /// `dma_workspace_mask` (a bitmask of DmaWorkspaceKind bits, 0 = none)
+    /// provisions those async-DMA workspaces once at init, so kernels can use
+    /// get_dma_workspace. Empty by default; a Worker that does not opt in creates
+    /// no SDMA streams. Provisioning fails fast (init throws) on a
+    /// platform/runtime that does not support a requested engine. The mask stays
+    /// a raw integer here so this platform-agnostic worker needs no platform
+    /// headers; the binding derives it from the DmaWorkspaceKind enum.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &dispatcher_path, int device_id
+        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
+        uint32_t dma_workspace_mask = 0
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -82,8 +94,6 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
-    void l3_l2_orch_comm_init(uint64_t control_block_addr, size_t control_block_size);
-    void l3_l2_orch_comm_shutdown();
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
@@ -142,15 +152,15 @@ private:
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync. Reads the current log level off HostLogger itself.
-    using SimplerInitFn =
-        int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
+    using SimplerInitFn = int (*)(
+        void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *
+    );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
+    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
     using FinalizeDeviceFn = int (*)(void *);
-    using L3L2OrchCommInitFn = int (*)(void *, void *, size_t);
-    using L3L2OrchCommShutdownFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
@@ -196,9 +206,8 @@ private:
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
+    SimplerProvisionDmaWorkspaceFn simpler_provision_dma_workspace_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
-    L3L2OrchCommInitFn l3_l2_orch_comm_init_fn_ = nullptr;
-    L3L2OrchCommShutdownFn l3_l2_orch_comm_shutdown_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;

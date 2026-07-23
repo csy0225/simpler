@@ -11,15 +11,19 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "aicpu/platform_regs.h"
+#include "aicpu/cache_maintenance.h"
 
-void cache_invalidate_range(const void *addr, size_t size) {
+namespace aicpu_cache_maintenance {
+
+#if defined(__aarch64__)
+
+void invalidate_range_impl(const void *addr, size_t size) {
     if (size == 0) {
         return;
     }
     const size_t kCacheLineSize = 64;
-    uintptr_t start = (uintptr_t)addr & ~(kCacheLineSize - 1);
-    uintptr_t end = ((uintptr_t)addr + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
     for (uintptr_t p = start; p < end; p += kCacheLineSize) {
         __asm__ __volatile__("dc civac, %0" ::"r"(p) : "memory");
     }
@@ -27,16 +31,30 @@ void cache_invalidate_range(const void *addr, size_t size) {
     __asm__ __volatile__("isb" ::: "memory");
 }
 
-void cache_flush_range(const void *addr, size_t size) {
+void flush_range_impl(const void *addr, size_t size) {
     if (size == 0) {
         return;
     }
     const size_t kCacheLineSize = 64;
-    uintptr_t start = (uintptr_t)addr & ~(kCacheLineSize - 1);
-    uintptr_t end = ((uintptr_t)addr + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
     for (uintptr_t p = start; p < end; p += kCacheLineSize) {
         __asm__ __volatile__("dc cvac, %0" ::"r"(p) : "memory");
     }
     __asm__ __volatile__("dsb sy" ::: "memory");
     __asm__ __volatile__("isb" ::: "memory");
 }
+
+#else
+
+// host_build_graph runs orchestration on the host CPU, which reaches device
+// memory only through driver H2D DMA (cache-coherent on x86). The manual
+// AICPU-side cache maintenance the aarch64 path performs has no host-side
+// referent here, so both operations are inert.
+void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
+
+void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+#endif
+
+}  // namespace aicpu_cache_maintenance

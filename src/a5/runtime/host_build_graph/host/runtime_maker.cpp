@@ -149,6 +149,10 @@ void runtime_add_successor(OrchestrationRuntime *runtime, int from_task, int to_
     unwrap_runtime(runtime)->add_successor(from_task, to_task);
 }
 
+void runtime_set_task_timing_slot(OrchestrationRuntime *runtime, int task_id, int32_t slot) {
+    unwrap_runtime(runtime)->set_task_timing_slot(task_id, slot);
+}
+
 void runtime_record_tensor_pair(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size) {
     unwrap_runtime(runtime)->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
 }
@@ -175,7 +179,7 @@ int runtime_copy_to_device(OrchestrationRuntime *runtime, void *dev_ptr, const v
 const OrchestrationRuntimeOps k_orchestration_runtime_ops = {
     runtime_add_task,       runtime_set_tensor_info_to_task, runtime_add_successor, runtime_record_tensor_pair,
     runtime_get_task_count, runtime_print_runtime,           runtime_device_malloc, runtime_device_free,
-    runtime_copy_to_device,
+    runtime_copy_to_device, runtime_set_task_timing_slot,
 };
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
@@ -317,7 +321,9 @@ int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(c
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in register_callable_impl", callable->child_count());
-    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
+    if (upload_and_collect_child_addrs(
+            callable, upload_fn, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash
+        ) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
     }
@@ -460,10 +466,11 @@ int bind_callable_to_runtime_impl(
  * 2. Frees device memory for recorded tensors
  * 3. Clears tensor pair state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -481,15 +488,19 @@ int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
     int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
-    for (int i = 0; i < tensor_pair_count; i++) {
-        const TensorPair &pair = tensor_pairs[i];
-        int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
-        if (copy_rc != 0) {
-            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
-            rc = copy_rc;
-            // Continue with cleanup anyway
-        } else {
-            LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
+    if (execution_rc != 0) {
+        LOG_WARN("Skipping tensor copy-back because execution failed");
+    } else {
+        for (int i = 0; i < tensor_pair_count; i++) {
+            const TensorPair &pair = tensor_pairs[i];
+            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+            if (copy_rc != 0) {
+                LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
+                rc = copy_rc;
+                // Continue with cleanup anyway
+            } else {
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
+            }
         }
     }
 

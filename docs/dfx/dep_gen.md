@@ -71,7 +71,7 @@ race — which is why deps.json now fully replaces the removed `fanout[]`.
 ## 3. How to Enable
 
 `dep_gen` is gated by `CallConfig.enable_dep_gen` (alongside
-`enable_l2_swimlane`, `enable_dump_tensor`, `enable_pmu`). The CLI flag
+`enable_l2_swimlane`, `enable_dump_args`, `enable_pmu`). The CLI flag
 is `--enable-dep-gen`:
 
 ```bash
@@ -210,9 +210,10 @@ observed task and tensor — that is not an error.
 
 `simpler_setup/tools/deps_viewer.py` turns `deps.json` into either a
 plain-text dependency view (default) or a self-contained pan/zoom HTML page
-(Graphviz SVG + inline vanilla-JS drag-pan + wheel-zoom). The text view is
-optimized for grep / diff / "what does task X depend on?" debugging; the HTML
-view stays available when you want a visual layout.
+(Graphviz SVG with inline vanilla-JS drag/scroll panning and Ctrl+scroll or
+pinch zooming). The text view is optimized for grep / diff / "what does task X
+depend on?" debugging; the HTML view stays available when you want a visual
+layout.
 
 ```bash
 # Newest deps.json under outputs/ -> deps_viewer.txt
@@ -241,7 +242,7 @@ The default text output contains:
   - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
   - `func_name_map`: `yes` when at least one task label resolved to a named `func_name`
     from either an explicit `--func-names` file or an auto-discovered sibling
-    `name_map_*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
+    `name_map*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
     aligned 3-slot integer array in `[aic,aiv0,aiv1]` order; inactive slots remain
     `-1`. `func_name_map` stays `no` unless a real human-readable name was resolved.
 - `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique
@@ -273,7 +274,8 @@ and arg-port edge routing, rerun the HTML export with `--show-tensor-info`.
 Browser controls in the HTML viewer:
 
 - **drag** → pan
-- **wheel** → zoom about cursor
+- **scroll / two-finger swipe** → pan
+- **Ctrl+scroll / trackpad pinch** → zoom about cursor
 - **`f` key** → fit to view
 - **`r` key** → reset to 1:1
 
@@ -311,7 +313,9 @@ carries `fanout[]`, so there is no longer a `fanout ⊆ deps` cross-check —
 of flow events in the Perfetto trace, and flags any edge whose
 `pred.end_time > succ.start_time` as `hb_violation` (rendered as a
 distinct flow event name so Perfetto colors it apart from regular
-dependencies).
+dependencies). Dependency flows connect the source and destination
+bar starts; the completion timestamps are used only for the
+`hb_violation` classification, not for flow geometry.
 
 ---
 

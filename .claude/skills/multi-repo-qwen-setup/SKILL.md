@@ -1,6 +1,6 @@
 ---
 name: multi-repo-qwen-setup
-description: Concrete qwen3-14B guide on NPU against the current worktree's simpler. Points at simpler's own in-repo qwen3_14b_decode example (zero cross-repo), then covers the two cross-repo paths — the pypto-serving runner (prefill/decode TPOT) and the pypto-lib decode_layer kernel (scheduler-overhead DFX). Defers cross-repo clone/install to multi-repo-setup, then gives the exact run commands (batch-1 and batch-16), the prefill ring/timeout gotchas that otherwise surface as 507018, how to read the per-token timing layers, and the kernel-level overhead-analysis flow. Invoke when running qwen3 on simpler, measuring decode/prefill TPOT, reproducing a qwen3 perf number, running qwen3 decode_layer overhead analysis, or chasing a 507018 on the qwen3 path.
+description: Concrete qwen3-14B guide on NPU against the current worktree's simpler. Points at simpler's own in-repo qwen3_14b_decode example (zero cross-repo), then covers the two cross-repo paths — the pypto-serving runner (prefill/decode TPOT) and the pypto-lib decode_fwd kernel (device decode TPOT + scheduler DFX). Defers cross-repo clone/install to multi-repo-setup, then gives the exact run commands (batch-1 and batch-16), the prefill ring/timeout gotchas that otherwise surface as 507018, how to read the per-token timing layers, and the kernel-level device-timing / swimlane flow. Invoke when running qwen3 on simpler, measuring decode/prefill TPOT, reproducing a qwen3 perf number, running qwen3 decode_fwd device-timing or swimlane/overhead analysis, or chasing a 507018 on the qwen3 path.
 ---
 
 # Qwen3-14B on NPU: setup + TPOT / overhead measurement
@@ -8,8 +8,8 @@ description: Concrete qwen3-14B guide on NPU against the current worktree's simp
 This skill is the **qwen3-specific concrete guide**. It first points at
 simpler's own in-repo qwen3 example (the zero-cross-repo path), then covers
 the two cross-repo paths against the worktree's simpler: the **pypto-serving
-runner** (prefill/decode TPOT) and the **pypto-lib `decode_layer` kernel**
-(scheduler-overhead DFX). For the cross-repo paths it gives the exact run
+runner** (prefill/decode TPOT) and the **pypto-lib `decode_fwd` kernel**
+(device decode TPOT + scheduler DFX). For the cross-repo paths it gives the exact run
 commands, the prefill ring/timeout gotchas, and how to read per-token timing
 — distilled from real runs plus each upstream repo's own docs — sitting on
 top of [`multi-repo-setup`](../multi-repo-setup/SKILL.md), which owns the
@@ -20,12 +20,12 @@ generic repo-graph + clone + install steps this skill does not repeat.
 There are **three distinct qwen3 entry points with different invocation
 styles**. They measure different things; don't confuse them:
 
-| aspect | Path 0 (in-repo) | Path A (serving) | Path B (decode_layer) |
-| ------ | ---------------- | ---------------- | --------------------- |
+| aspect | Path 0 (in-repo) | Path A (serving) | Path B (decode_fwd) |
+| ------ | ---------------- | ---------------- | ------------------- |
 | repo | simpler (this) | pypto-serving | pypto-lib |
-| entry | qwen3_14b_decode | npu_generate.py | decode_layer.py |
+| entry | qwen3_14b_decode | npu_generate.py | decode_fwd.py |
 | cross-repo? | no | yes | yes |
-| measures | 2-layer decode correctness/timing | end-to-end TPOT | layer sched overhead |
+| measures | 2-layer decode correctness/timing | end-to-end TPOT | device decode TPOT + sched DFX |
 | see | this section | sections 2-5 | section 6 |
 
 - **Path 0 — in-repo example (simpler itself, NO cross-repo).** Start here
@@ -54,13 +54,14 @@ styles**. They measure different things; don't confuse them:
   `examples/model/qwen3_14b/npu_generate.py`, flags `--model-dir --prompt
   --max-seq-len --max-new-tokens --num-layers-override --profile[-verbose]`.
   Measures **end-to-end prefill/decode TPOT** for the whole model; read via
-  the `--profile` report + `device_log_timing` (§2–§5). Use it to reproduce
-  a serving perf number or chase a serving `507018`.
-- **Path B — `decode_layer` kernel (pypto-lib).** A single JIT case for one
-  decode layer, not the engine. Entry
-  `models/qwen3/14b/decode_layer.py`, flags `-p <platform> -d <device>`,
-  run in two rounds (`--no-dep-gen --enable-l2-swimlane`). Measures **one
-  layer's scheduler overhead** (Orch/Sched breakdown); read via
+  the `--profile` report + `strace_timing --rounds-table` (§2–§5). Use it
+  to reproduce a serving perf number or chase a serving `507018`.
+- **Path B — `decode_fwd` kernel (pypto-lib).** A single JIT case, not the
+  engine. Entry `models/qwen3/14b/decode_fwd.py`, flags `-p <platform> -d
+  <device>` plus `--validate-fwd --fwd-layers N --decode-steps M --max-seq`
+  (device TPOT) and `--enable-dep-gen` / `--enable-l2-swimlane <1-4>` (DFX,
+  two separate rounds). Measures **per-step device decode cost + scheduler
+  timeline** (per-op / Orch/Sched breakdown); read via
   `sched_overhead_analysis` / `swimlane_converter` (§6). Use it to dig into
   per-layer scheduling cost / the overhead model.
 
@@ -84,7 +85,7 @@ anything this skill doesn't cover:
 - **Path A** — `build/pypto-serving/.claude/skills/` (if present) and its
   `README.md` (engine config, model-dir layout, weights conversion).
 - **Path B** — `build/pypto-lib/.claude/skills/` / `README.md` and the
-  `decode_layer.py` docstring / `--help` (case flags, golden data).
+  `decode_fwd.py` docstring / `--help` (case flags, golden data).
 
 Then, from the worktree, the qwen runs assume this env:
 
@@ -117,15 +118,26 @@ task-submit --timeout 2400 --max-time 2400 --device auto --device-num 1 --run "\
 
 - `--num-layers-override 40` = full model; `--profile[-verbose]` prints the
   timing report (`api.run_decode` per-step = end-to-end TPOT, `kernel.decode_layer`
-  host wall, per-step layer breakdown).
+  host wall, per-step layer breakdown) plus `strace_timing --rounds-table`
+  (§2–§5).
 - Decode dispatches through the **L3 `DistributedWorker`**, which forks a
   **chip-child (L2)** that runs `run_prepared`. The per-step timing lives at
   **L2**: `run_prepared` computes both host (`host_wall`) and device
-  (`device_wall` = the fused-decode orchestrator wall, ~33 ms — nonzero) plus
-  the device orch/sched markers. The L3 parent's `Worker.run` returns
-  `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3 is a
-  dispatcher with no device wall of its own) and is **not** the source you
+  (`device_wall` = the fused-decode orchestrator wall, ~40 ms at 3.5k context —
+  nonzero) plus the device orch/sched markers. The L3 parent's `Worker.run`
+  returns `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3
+  is a dispatcher with no device wall of its own) and is **not** the source you
   read. Read L2 instead (next section).
+
+  > **Warmup skews single-invocation reads.** The pypto-serving profile warmup
+  > dispatches a tiny-KV decode step (`[warmup] decode dispatch … seq_len≈257`,
+  > `device_wall` ~28 ms) *before* the real 3.5k-context steps (~40 ms). Any
+  > tool that reports one invocation shows the warmup value. Decode is
+  > memory-bound: ~28 ms reads the 28 GB bf16 weights every step, +~12 ms reads
+  > the 3.3k-token KV for attention — the KV read is why warmup (short KV) is
+  > ~12 ms cheaper, not cold start. Trust `kernel.decode_layer avg` from
+  > `--profile` (excludes warmup) or `strace_timing --tree` (medians all
+  > invocations); do not read a single decode step.
 
 ## 3. Run decode (batch-16)
 
@@ -159,8 +171,8 @@ log to tell them apart**:
 
    ```bash
    # add to the task-submit --run, before the python call:
-   export PTO2_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
-   export PTO2_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
+   export SIMPLER_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
+   export SIMPLER_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
    ```
 
    The runtime reads these and overrides the compiled defaults
@@ -186,19 +198,19 @@ Redirect the CANN device log out of the shared default, then parse it:
 export ASCEND_PROCESS_LOG_PATH="$PWD/build/pypto-serving/build_output/ascend"
 mkdir -p "$ASCEND_PROCESS_LOG_PATH"
 # after the run (local, no device):
-$PY -m simpler_setup.tools.device_log_timing \
-    --device-log "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log"
+$PY -m simpler_setup.tools.strace_timing \
+    "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log" --rounds-table
 ```
 
-`device_log_timing` reports per-round **Total / Orch / Sched** from the
-`PTO2_PROFILING` markers (on by default, no swimlane needed). Round 0 is the
-prefill; the rest are decode steps. **Total ≈ on-device kernel makespan** =
-the "kernel run time" layer.
+`strace_timing --rounds-table` reports per-round **Device / Orch / Sched**
+from the `[STRACE]` markers (on by default, no swimlane needed). Round 0 is
+the prefill; the rest are decode steps. **Device ≈ on-device kernel
+makespan** = the "kernel run time" layer.
 
 For layers ②③④ — the host↔device and bind/validate spans — parse the
 `[STRACE]` host-trace markers with `strace_timing.py` (landed in
 [simpler #1177](https://github.com/hw-native-sys/simpler/pull/1177)). The
-markers are emitted at `LOG_INFO_V9` under `PTO2_PROFILING` (no new flag),
+markers are emitted at `LOG_INFO_V9` under `SIMPLER_DFX` (no new flag),
 so the same log captured above carries them:
 
 ```bash
@@ -214,7 +226,7 @@ The full per-token decomposition (what each layer means / how to get it):
 
 | layer | = | source |
 | ----- | - | ------ |
-| ① kernel run time | makespan | `device_log_timing` Total |
+| ① kernel run time | makespan | `strace_timing --rounds-table` Device |
 | ② device init/finalize | `device_wall − makespan` | `strace_timing` (`[STRACE]` markers) |
 | ③ host↔device handshake | `runner_run − device_wall` | `strace_timing` (`runner_run` span) |
 | ④ attach+bind+validate | `host_wall − runner_run` | `strace_timing` (`bind`/`validate` spans) |
@@ -222,9 +234,9 @@ The full per-token decomposition (what each layer means / how to get it):
 
 ②③④ come from the **L2 chip-child** `run_prepared`'s `host_wall` /
 `runner_run` / `device_wall`. `host_wall` and `device_wall` are already
-computed there (and `device_wall` is nonzero, ~33 ms — it is the L2 orchestrator
-wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3 parent drops
-the child's `RunTiming`, so they never reach a return value.
+computed there (and `device_wall` is nonzero, ~40 ms at 3.5k context — it is the
+L2 orchestrator wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3
+parent drops the child's `RunTiming`, so they never reach a return value.
 
 Simpler surfaces them instead as **`[STRACE]` host-trace markers** — one
 line per `run_prepared` stage
@@ -239,42 +251,89 @@ view); see
 grammar and span tree. The L3-side tensor-management ask is
 [pypto-serving #44](https://github.com/hw-native-sys/pypto-serving/issues/44).
 
-## 6. Path B — `decode_layer` kernel: scheduler-overhead DFX
+## 6. Path B — `decode_fwd.py` kernel: correctness, device TPOT, DFX
 
 *Path B is a different repo (**pypto-lib**) and a different entry point
 than §2–§5 — a single JIT kernel case, not the serving engine.*
 
-Path A above measures end-to-end TPOT through the serving runner. Path B
-instead digs into the **scheduler overhead** of the qwen3 decode kernel
-itself: run `build/pypto-lib/models/qwen3/14b/decode_layer.py` in two
-rounds and feed both into simpler's overhead tools. Onboard rules apply
-(per-die lock + `onboard-arch-precheck`).
+The entry is **`build/pypto-lib/models/qwen3/14b/decode_fwd.py`** (the old
+`decode_layer.py` is gone). One script, three workflows via flags. Onboard
+rules apply (per-die lock + `onboard-arch-precheck`), and every run wants
+the pinned PTO-ISA + a context length:
 
 ```bash
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
-cd "$PWD/build/pypto-lib/models/qwen3/14b"
-# Round 1 — dep_gen (topology); Round 2 — swimlane (clean timing). NEVER co-run:
-# dep_gen perturbs the timing the overhead analysis reads.
-task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE"
-task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE --no-dep-gen --enable-l2-swimlane"
+cd "$PWD/build/pypto-lib"
+# PTO-ISA is auto-resolved from simpler's pto_isa.pin via ensure_pto_isa_root();
+# do NOT export PTO_ISA_ROOT (#1403). An ambient path can drift off-pin and
+# simpler now rejects a checkout whose HEAD does not match the pin.
+export PTO2_MANUAL_MAX_SEQ=3338   # ctx length used by --max-seq
 ```
 
-Both write to `build_output/_jit_*/dfx_outputs/` (`deps.json` from round 1,
-`l2_swimlane_records.json` from round 2). Analyze from the simpler worktree
+**(a) Correctness — single-layer golden.** Bare invocation = one decode
+layer vs a torch golden (N==1):
+
+```bash
+task-submit --device auto --device-num 1 \
+  --run "python models/qwen3/14b/decode_fwd.py -p a2a3 -d \$TASK_DEVICE"
+```
+
+**(b) Device decode TPOT — the base-vs-X perf number.** `--validate-fwd`
+stacks N layers + LM head; `--decode-steps M` grows ctx one token/step for a
+device-cost sweep; `--max-seq` pins every seq to `PTO2_MANUAL_MAX_SEQ`:
+
+```bash
+task-submit --device 6 \
+  --run "python models/qwen3/14b/decode_fwd.py -p a2a3 -d \$TASK_DEVICE \
+         --validate-fwd --fwd-layers 40 --decode-steps 32 --max-seq"
+```
+
+Read the **per-step device makespan** from the `[STRACE] … device_wall`
+markers — one per `inv`, **`dur` is in nanoseconds**. Drop `inv=1` (warmup),
+mean the rest:
+
+```bash
+grep 'runner_run.device_wall ' <log> | sed -E 's/.*inv=([0-9]+).*dur=([0-9]+).*/\1 \2/'
+# inv dur(ns);  ns/1e6 = ms/step;  ~36 ms at 3.3k ctx / 40 layers
+```
+
+**(c) Swimlane / dep-graph — per-op + scheduler timeline.** Two rounds,
+**never co-run** (dep_gen perturbs the timing). Capture with a **small layer
+count** (`--fwd-layers 2`, *not* the 40-layer perf config): a full-model
+swimlane trace is huge (~MB/layer in Perfetto) and the SHM record buffer can
+overflow ("records dropped"). Two layers gives one warmup + one steady-state
+layer — enough to read per-op / scheduler structure.
+
+```bash
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d $DEV --validate-fwd --fwd-layers 2 --max-seq --enable-dep-gen        # topology -> deps.json
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d $DEV --validate-fwd --fwd-layers 2 --max-seq --enable-l2-swimlane 4  # 1=AICore 2=+dispatch 3=+sched 4=+orch
+```
+
+Both write `build_output/_jit_*/dfx_outputs/`: `deps.json`,
+`l2_swimlane_records.json`, and a ready-to-load **`merged_swimlane_*.json`**
+(Perfetto — drag into ui.perfetto.dev). Analyze from the simpler worktree
 (its `simpler_setup/tools` wins by cwd precedence):
 
 ```bash
-# ROUND1_DIR / ROUND2_DIR are the two build_output/_jit_*/dfx_outputs/ dirs above.
-$PY -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json "ROUND2_DIR/l2_swimlane_records.json" \
-    --deps-json "ROUND1_DIR/deps.json"
-# Visual: add the Overhead Analysis track to the Perfetto trace
-$PY -m simpler_setup.tools.swimlane_converter "ROUND2_DIR/l2_swimlane_records.json" \
-    --deps-json "ROUND1_DIR/deps.json" --overhead -o swimlane.json
+$PY -m simpler_setup.tools.swimlane_converter RECORDS.json --deps-json DEPS.json [--overhead] -o swim.json
+$PY -m simpler_setup.tools.sched_overhead_analysis --l2-swimlane-records-json RECORDS.json --deps-json DEPS.json
+$PY -m simpler_setup.tools.deps_viewer DEPS.json --format html --func-names NAME_MAP.json -o deps.html
 ```
 
 See [docs/dfx/sched-overhead-model.md](../../../docs/dfx/sched-overhead-model.md)
-for what the report and the overhead tracks mean.
+for the overhead model.
+
+**Perf gotchas (measured).**
+
+- A 3.3k-ctx 40-layer decode step (~36 ms) is **memory-bound** (weights + KV);
+  per-layer scheduling changes are sub-noise at this scale.
+- **Run-to-run noise is ~0.1 ms** on a shared box — *larger* than most
+  scheduler-level effects. For a sub-0.1 ms A/B (base vs a variant, stock vs a
+  patched `.so`), **interleave the variants in one session** in ABBA/palindrome
+  order so session drift cancels; a single before/after pair flips sign and
+  misleads. Swap the `.so` between invocations (each `python decode_fwd.py` is a
+  fresh process) rather than across separate `task-submit` jobs.
+- Use an **even die** and hold it exclusively.
 
 ## 7. When you change simpler C++ (instrumentation)
 
@@ -284,21 +343,30 @@ changes (new instrumentation, log lines), `pip install` may skip the runtime
 [`multi-repo-setup`](../multi-repo-setup/SKILL.md) Step 3 — arch-parametrized
 and python-version-agnostic, so it works on a2a3 / a5 and any venv layout):
 
+**Pick the target by where the code lives:** the host-orchestration / runtime
+entry is in `…/host/libhost_runtime.so`; the **AICPU scheduler, orchestrator,
+dispatch, drain, and early-dispatch** code (`runtime/scheduler/*`,
+`pto_orchestrator.cpp`) compiles into `…/aicpu/libaicpu_kernel.so`. Rebuild the
+one you touched:
+
 ```bash
-ARCH=a2a3   # or a5
-BD="build/cache/$ARCH/onboard/tensormap_and_ringbuffer/host"
+ARCH=a2a3                                     # or a5
+LIB=aicpu; SO=libaicpu_kernel.so              # scheduler/orch/dispatch  (host: LIB=host SO=libhost_runtime.so)
+BD="build/cache/$ARCH/onboard/tensormap_and_ringbuffer/$LIB"
 cmake --build "$BD" -j"$(nproc)"
-SO="$BD/libhost_runtime.so"
 # sync to every load location (build/lib AND the installed venv), no hardcoded
 # python version — the glob matches whatever site-packages path exists:
-for d in $(find .venv build/lib -path "*onboard*tensormap_and_ringbuffer*$(basename "$SO")"); do
-  cp -f "$SO" "$d"
+for d in $(find .venv build/lib -path "*onboard*tensormap_and_ringbuffer*$SO"); do
+  cp -f "$BD/$SO" "$d"
 done
-strings "$SO" | grep -m1 '<your-new-log-string>'   # confirm it baked in
+strings "$BD/$SO" | grep -m1 '<your-new-log-string>'   # confirm it baked in
 ```
 
-(`.venv/lib64` is a symlink to `lib`, so the `find` covers both.) Host-side
-instrumentation lives in the **host** lib; only that target needs rebuilding.
+(`.venv/lib64` is a symlink to `lib`, so the `find` covers both.) AICPU device
+logs land in `ASCEND_PROCESS_LOG_PATH/.../device-*/device-*.log` — set that var
+per run (see `running-onboard`) and note AICPU `LOG_INFO_V*` uses **inverted**
+verbosity: `v=9` is must-see (default threshold 5), `v=0` is filtered — use
+`LOG_INFO_V9` for a diagnostic you need to read back.
 
 ## Anti-patterns
 
@@ -306,8 +374,8 @@ instrumentation lives in the **host** lib; only that target needs rebuilding.
   prefill (50 s+ vs 16.7 s) and decode spikes. Hold the die exclusively.
 - ❌ Reading `507018` as "simpler bug" without the device log — it masks a
   heap deadlock, an op-timeout, and a forward-progress stall.
-- ❌ Editing `platform_config.h` to raise timeouts — use the `PTO2_OP_EXECUTE_TIMEOUT_US`
-  / `PTO2_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
+- ❌ Editing `platform_config.h` to raise timeouts — use the `SIMPLER_OP_EXECUTE_TIMEOUT_US`
+  / `SIMPLER_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
   doesn't change the default for everyone else.
 - ❌ Setting the timeout env but breaking the ordering (`stream_sync` ≤ `op_execute`,
   or `op_execute` ≤ scheduler 10 s, or `stream_sync` not clearing scheduler + 1.5 s

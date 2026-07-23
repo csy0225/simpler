@@ -47,8 +47,12 @@ region.free()
 
 The L3 handle exposes `descriptor_scalars`, `payload_write`, `payload_read`,
 `counter(offset)`, and `free`. Payload operations copy contiguous bytes between
-child-visible Host tensors and the region payload range. Counter handles expose
-`notify`, `test`, and `wait` over address-based `int32_t` counters.
+the caller's Host buffer and the region payload range. The steady-state data
+path runs in the L3 Host process on both simulation and onboard platforms.
+Simulation maps a shared POSIX backing object. Onboard imports the child-owned
+GM region through a VMM shareable handle and moves bytes with ACL copy
+operations. Counter handles expose `notify`, `test`, and `wait` over
+address-based `int32_t` counters.
 
 On L2, orchestration code consumes the descriptor and builds an endpoint:
 
@@ -57,14 +61,14 @@ L3L2OrchEndpoint ep(desc);
 
 uint64_t data_ready_addr = 0;
 uint64_t completion_addr = 0;
-ep.counter_addr(data_ready_offset, &data_ready_addr);
-ep.counter_addr(completion_offset, &completion_addr);
+ep.counter_addr(data_ready_offset, data_ready_addr);
+ep.counter_addr(completion_offset, completion_addr);
 
 int32_t observed = 0;
 bool ok = ep.signal_wait(
-              data_ready_addr, seq, L3L2OrchWaitCmp::GE, timeout, &observed) &&
-          ep.payload_read(input_offset, input_nbytes, &input) &&
-          ep.payload_read(output_offset, output_nbytes, &output);
+              data_ready_addr, seq, L3L2OrchWaitCmp::GE, timeout, observed) &&
+          ep.payload_read(input_offset, input_nbytes, input) &&
+          ep.payload_read(output_offset, output_nbytes, output);
 
 // The wrapper combines gm_addr/nbytes with task-level dtype and shape.
 launch_aicore(input, output);
@@ -74,7 +78,7 @@ ep.signal_notify(completion_addr, seq, L3L2OrchNotifyOp::Set);
 
 The L2 endpoint `signal_wait` timeout argument is in nanoseconds. The Python
 `counter.wait(..., timeout=timeout_s)` API takes seconds and converts them to
-nanoseconds before submitting the service command.
+nanoseconds before issuing the operation.
 
 `payload_read` on L2 returns a GM view. It does not copy tensor bytes. Large
 outputs should be written directly by AICore into an output view in the region.
@@ -99,7 +103,7 @@ scalar[i + 5] = counter_bytes
 | Field | Meaning |
 | ----- | ------- |
 | `magic_version` | Descriptor ABI marker and version. |
-| `region_id` | Region identifier for diagnostics and region-scoped errors. |
+| `region_id` | Region identifier; `0` is reserved as invalid. |
 | `payload_base` | Base GM address of the payload byte range. |
 | `payload_bytes` | Size of the payload byte range. |
 | `counter_base` | Base GM address of the signal counter range. |
@@ -124,47 +128,27 @@ counter_base .. counter_base + counter_bytes - 1
 `counter_base` is 64-byte aligned, and `counter_bytes` is a multiple of
 `sizeof(int32_t)`. Counter addresses must be 4-byte aligned and inside the
 registered counter range. The payload and counter ranges do not overlap.
+`payload_base == 0` and `counter_base == 0` are not validity sentinels; only
+the range sizes, alignment, overflow, overlap, and reserved `region_id == 0`
+checks determine descriptor validity.
 
 ## 3. Control Path
 
-The control path carries descriptors, offsets, Host pointers, counter
-addresses, operations, and completion status. Tensor payload bytes do not flow
-through the control path. L3 payload operations copy between child-visible Host
-tensor storage and Device GM; L2 payload operations expose GM views that
-orchestration code can pass to runtime tensor construction helpers.
+The lifecycle control path carries region create/release commands over the
+existing worker mailbox. Create returns the unchanged six-scalar L2 descriptor
+plus L3 Host-private transport metadata. Release is deferred until submitted L2
+work has drained.
 
-The existing task mailbox is bootstrap-only for this feature. On first use, L3
-creates a POSIX shared-memory control block and passes its name to the L2 chip
-child with `CTRL_L3_L2_ORCH_COMM_INIT`. The child attaches the same shared
-memory and starts a host-side `L3L2OrchCommService` thread under the chip
-child's `DeviceRunner`.
+Steady-state `payload_write`, `payload_read`, `SIGNAL_NOTIFY`, `SIGNAL_TEST`,
+and `SIGNAL_WAIT` run in the L3 Host against parent-private direct-access
+metadata. The descriptor still contains L2-side payload and counter addresses
+for the L2 AICPU endpoint; L3 Host operations do not dereference descriptor
+addresses.
 
-Normal in-flight commands use that independent shared-memory request/response
-block:
-
-```text
-state
-request  = L3L2OrchCommRequest
-response = L3L2OrchCommResponse
-```
-
-The state machine is:
-
-```text
-IDLE -> READY -> RUNNING -> DONE -> IDLE
-```
-
-The service handles `ALLOC_REGION`, `FREE_REGION`, `PAYLOAD_WRITE`,
-`PAYLOAD_READ`, `SIGNAL_NOTIFY`, `SIGNAL_TEST`, and `SIGNAL_WAIT`. It runs on
-the L2Host side, not inside the L2 AICPU orchestration task.
-
-Each worker has one L3-L2 client and one single-threaded service. All regions
-on the same worker therefore share one command lane. A long blocking
-`SIGNAL_WAIT` on one region can delay payload, notify, test, wait, and free
-commands for other regions on that worker. When other same-worker region
-commands need to make progress, prefer short wait timeouts with polling, place
-independent traffic on another worker, or wait for future multi-threaded
-service support.
+On onboard platforms, region create allocates one child-owned VMM GM range,
+exports it through a shareable handle, and returns the import metadata to the
+parent. The parent imports that region and closes the mapped VMM import before
+the child frees the physical allocation.
 
 ## 4. Signal Counters
 
@@ -186,9 +170,9 @@ addresses:
 
 ```cpp
 ep.signal_notify(counter_addr, value, L3L2OrchNotifyOp::Set);
-ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, &result);
+ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, result);
 ep.signal_wait(
-    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, &observed);
+    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, observed);
 ```
 
 `NotifyOp` supports:
@@ -197,10 +181,13 @@ ep.signal_wait(
 - `Add`: add the operand to the current counter value.
 
 `Add` is a convenience read-modify-write operation, not an atomic operation.
-The primitive layer requires only 4-byte counter-address alignment and does not
-force 64-byte counter offsets. This leaves room for one writer to pack a batch
-of related counters into the same cache line when that is the right protocol
-shape.
+On simulation, L3 counter reads and writes access the parent-side mapping
+directly. On onboard, L3 counter reads and writes use 4-byte ACL copy
+operations through the imported GM pointer; the parent does not CPU-dereference
+imported GM counters. The primitive layer requires only 4-byte counter-address
+alignment and does not force 64-byte counter offsets. This leaves room for one
+writer to pack a batch of related counters into the same cache line when that
+is the right protocol shape.
 
 The ownership invariant is still single-writer per 64-byte cache line: all
 counters in one cache line must have the same writer. Counters written by
@@ -226,8 +213,8 @@ observe point before reading protected data. A failed `signal_test` does not
 establish observe semantics.
 
 That contract is not provided by Host-side `atomic_thread_fence` calls alone.
-Cross-agent payload and counter visibility comes from successful payload
-command completion, backend DMA ordering, endpoint cache maintenance on onboard
+Cross-agent payload and counter visibility comes from successful parent-side
+direct transfers, backend DMA ordering, endpoint cache maintenance on onboard
 builds, and wrapper-level sequencing that publishes only after prior writes are
 complete.
 
@@ -251,8 +238,8 @@ L3:
 
 L2:
   signal_wait(data_ready_addr, seq, GE)
-  payload_read(input_offset, input_nbytes, &input_view)
-  payload_read(output_offset, output_nbytes, &output_view)
+  payload_read(input_offset, input_nbytes, input_view)
+  payload_read(output_offset, output_nbytes, output_view)
   submit AICore(input_view, output_view)
   wait for AICore completion
   signal_notify(completion_addr, seq, Set)
@@ -267,11 +254,9 @@ monotonic sequence or `Add` counters, because `EQ` can miss a target if the
 counter steps past it before the waiter observes the value. The primitive layer
 only applies the requested comparison.
 
-On onboard builds, correct payload/counter visibility depends on the endpoint
-cache maintenance helpers guarded by
-`L3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE`. Normal onboard orchestration
-builds define that macro through the toolchain; sim and non-aarch64 helper
-paths are no-ops. See
+On onboard builds, correct payload/counter visibility depends on the common
+`aicpu/cache_maintenance.h` helpers. The aarch64 path emits data-cache
+maintenance instructions; sim and non-aarch64 paths are no-ops. See
 [hardware/cache-coherency.md](hardware/cache-coherency.md).
 
 All waits must use finite timeouts. Unbounded waits hide protocol deadlocks.
@@ -296,34 +281,36 @@ them released, drains submitted work, and then releases the physical resources.
 
 ## 7. Host Buffer Requirements
 
-L3 payload buffers must be contiguous and visible to the chip child process, so
-the child runtime can DMA directly between Host DRAM and Device GM.
+L3 payload buffers must be contiguous and large enough for the requested
+transfer. On simulation platforms, the buffer only needs to be accessible from
+the L3 Host orchestration code: runtime Host tensors, `bytes`, `bytearray`, and
+writable contiguous memoryviews for reads are valid according to the
+operation's read/write direction.
 
-Supported sources depend on the active runtime, but the contract is:
-
-- the buffer must be child-visible before the payload command is issued;
-- the byte span must be contiguous and large enough for the requested transfer;
-- temporary Python bytes, ordinary private tensors, and unmapped post-fork
-  buffers are not valid payload sources.
+On onboard platforms, the L3 Host imports the child-owned region through ACL
+IPC and copies directly through ACL runtime primitives. Payload buffers must be
+ordinary contiguous L3 Host-accessible byte spans according to the operation's
+read/write direction.
 
 Small wrapper metadata is payload too. A header such as `{seq, DATA}` or
-`{seq, STOP}` must be stored in a valid Host buffer and copied through
-`payload_write`.
+`{seq, STOP}` is copied through `payload_write`; any staging needed for a
+backend is owned by the primitive payload transfer, not by the queue protocol.
 
 ## 8. Error Handling
 
 Primitive `SIGNAL_TEST` mismatch is success with `matched = false` and the
-current `observed` counter value; it does not poison the service region.
+current `observed` counter value; it does not poison the primitive region.
 Primitive `SIGNAL_WAIT` timeout reports the last observed counter value and
-does not poison the service region by itself.
+does not poison the primitive region by itself.
 
 Failures that may corrupt payload or region progress poison the corresponding
-Host-side region:
+L3 Host region:
 
 - DMA failure after a payload command is issued;
 - signal notify failure;
-- control-service response timeout waiting for `DONE`;
-- control-service fatal error after the region is live;
+- L3 Host transfer failure after operation issue;
+- direct L3 Host mapped-region failure after a payload or counter primitive is
+  issued;
 - L2 endpoint fatal error reported with a valid `region_id`;
 - explicit wrapper-level poison in future queue or stream abstractions.
 
@@ -332,7 +319,7 @@ Pre-command validation failures do not poison the region:
 - malformed API arguments;
 - invalid counter offset rejected by `region.counter(offset)`;
 - non-contiguous Host tensor;
-- child-invisible Host buffer detected before command issue;
+- unsupported Host buffer detected before command issue;
 - out-of-bounds payload offset detected before command issue;
 - descriptor extraction after release or poison.
 
@@ -341,17 +328,19 @@ and `descriptor_scalars`. `free` and orchestration cleanup remain valid.
 
 L2 endpoint errors own structured fields inside L2, including `region_id`,
 operation, counter address, operand, observed counter, kind, and message. The
-current Host-side poisoning path does not receive structured cross-process
-fatal metadata; it depends on the wrapper's canonical fatal text format:
+current L3 Host poisoning path does not receive structured cross-level fatal
+metadata; it depends on the wrapper's canonical fatal text format:
 `L3-L2 endpoint error ... region=<id>`. When multiple live regions exist, the
-Host poisons only the region parsed from that text.
+L3 Host poisons only the region parsed from that text.
 
 ## 9. Platform Support
 
 - `a2a3sim`: full API and protocol support.
 - `a5sim`: full API and protocol support.
-- `a2a3` onboard: full API and protocol support.
-- `a5` onboard: full API and protocol support.
+- `a2a3` onboard: full API support with direct L3 Host VMM payload and
+  counter operations.
+- `a5` onboard: full API support with direct L3 Host VMM payload and
+  counter operations.
 
 Simulation backends preserve the same API, ordering, timeout, and error
 semantics as onboard backends.
