@@ -2233,6 +2233,13 @@ class Worker:
         # free (and domain release) revokes BEFORE the native free, so an
         # interrupted op never leaves a freed address live. Cleared on close().
         self._child_alloc_prov: dict[tuple[int, int], _ChildProvEntry] = {}
+        # Zero-copy IPC-imported regions (import_ipc_all): the fork imports a
+        # whole consolidated pool per chip and carves interior views
+        # (DeviceTensor(peer_base + offset)) out of it, so a child_memory arg is
+        # a legitimate INTERIOR pointer, never the exact base. malloc/domain
+        # provenance is exact-match keyed; IPC pools are range-checked instead.
+        # Keyed by worker_id -> list of (base, end) live regions.
+        self._child_ipc_regions: dict[int, list[tuple[int, int]]] = {}
         self._child_prov_lock = threading.Lock()
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
@@ -5304,13 +5311,36 @@ class Worker:
             del self._child_alloc_prov[key]  # last role — delete directly, no empty state
 
     def _child_prov_require_live(self, worker_id: int, ptr: int, *, api: str) -> None:
-        """Require ``(worker_id, ptr)`` to be a live child pointer (malloc or domain)."""
+        """Require ``(worker_id, ptr)`` to be a live child pointer (malloc, domain,
+        or an interior pointer into a live IPC-imported region)."""
         entry = self._child_alloc_prov.get((worker_id, ptr))
-        if entry is None or not entry.is_live():
+        if (entry is None or not entry.is_live()) and not self._child_ptr_in_ipc_region(worker_id, ptr):
             raise ValueError(
                 f"Worker.{api}: device pointer 0x{ptr:x} is not a live allocation on worker "
                 f"{worker_id} (wrong worker, freed/stale, or an interior pointer)"
             )
+
+    def _child_ptr_in_ipc_region(self, worker_id: int, ptr: int) -> bool:
+        """True iff ``ptr`` falls inside a live IPC-imported region on ``worker_id``.
+
+        A zero-copy IPC pool is imported whole (import_ipc_all) and the caller
+        carves interior views out of it, so a legitimate child_memory pointer is
+        ``base + offset`` — never the exact base. malloc/domain use exact-match
+        keying; IPC pools are range-checked here."""
+        for base, end in self._child_ipc_regions.get(worker_id, ()):
+            if base <= ptr < end:
+                return True
+        return False
+
+    def _child_prov_record_ipc_region(self, worker_id: int, base: int, size: int) -> None:
+        """Record a live IPC-imported region ``[base, base+size)`` on ``worker_id``
+        (called after a successful import_ipc_all). Idempotent per (base,end)."""
+        if size <= 0 or base <= 0:
+            return
+        region = (int(base), int(base) + int(size))
+        regions = self._child_ipc_regions.setdefault(worker_id, [])
+        if region not in regions:
+            regions.append(region)
 
     def _child_prov_record_domain(self, worker_id: int, ptr: int, allocation_id: int) -> None:
         """Record a CommDomain window / buffer pointer at exact ``(worker_id, ptr)``."""
@@ -5375,7 +5405,7 @@ class Worker:
         target = next(iter(candidates))
         for ptr, arg_index in child_ptrs:
             entry = self._child_alloc_prov.get((target, ptr))
-            if entry is None or not entry.is_live():
+            if (entry is None or not entry.is_live()) and not self._child_ptr_in_ipc_region(target, ptr):
                 raise ValueError(
                     f"orch.{api}: child_memory argument (arg {arg_index}, ptr 0x{ptr:x}) is not a "
                     f"live allocation on target worker {target} (wrong worker, stale, or interior pointer)"
@@ -5385,6 +5415,7 @@ class Worker:
         """Drop the whole child-pointer provenance table (close-path hygiene)."""
         with self._child_prov_lock:
             self._child_alloc_prov.clear()
+            self._child_ipc_regions.clear()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
         """Range-check ``worker_id`` against the L3-level chip mailbox set.
@@ -5461,7 +5492,12 @@ class Worker:
     # Post-fork zero-copy host buffers
     # ------------------------------------------------------------------
 
-    def import_ipc_all(self, device_key_map: dict[int, bytes]) -> dict[int, int]:
+    def import_ipc_all(
+        self,
+        device_key_map: dict[int, bytes],
+        *,
+        region_bytes: "dict[int, int] | int | None" = None,
+    ) -> dict[int, int]:
         """Import one external ACL IPC allocation in every chip child.
 
         ``device_key_map`` is keyed by physical device id.  Each 256-byte key is
@@ -5469,6 +5505,14 @@ class Worker:
         the returned map contains child-valid device VAs.  This is a zero-copy
         ownership bridge: the exporter must keep every allocation alive until
         this Worker is closed.
+
+        ``region_bytes`` (optional) is the imported pool size — a dict keyed by
+        device id, or a single int applied to every device. When given, the
+        imported region ``[peer_va, peer_va + size)`` is recorded as a live child
+        allocation so the dispatch provenance guard accepts the INTERIOR pointers
+        (``DeviceTensor(peer_base + offset)``) that callers carve out of the pool.
+        Without it, imported VAs are returned but not provenance-registered, so a
+        later child_memory dispatch of an interior pointer is rejected.
         """
         if self._worker is None or not self._initialized:
             raise RuntimeError("import_ipc_all requires Worker.init()")
@@ -5514,6 +5558,15 @@ class Worker:
                         f"expected device={device_id}, got device={reply_device_id}, va=0x{va:x}"
                     )
                 imported[device_id] = va
+            if region_bytes is not None:
+                # Map physical device id -> chip worker id (== config device_ids
+                # order, the fork order the dispatch guard keys on), then record
+                # each imported pool as a live interior-addressable region.
+                device_to_chip = {dev: i for i, dev in enumerate(expected_devices)}
+                with self._child_prov_lock:
+                    for device_id, va in imported.items():
+                        size = region_bytes[device_id] if isinstance(region_bytes, dict) else int(region_bytes)
+                        self._child_prov_record_ipc_region(device_to_chip[device_id], int(va), int(size))
             return imported
         finally:
             reply.close()
