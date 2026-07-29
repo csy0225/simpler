@@ -283,6 +283,13 @@ _IPC_REPLY_RECORD = struct.Struct("<IQ")
 _IPC_REQUEST_NAME_LEN = struct.Struct("<H")
 _IPC_REQUEST_COUNT = struct.Struct("<I")
 _IPC_REQUEST_RECORD = struct.Struct("<I")
+# Zero one device range per chip child in place.  The memset must run in the
+# child that owns the ACL context, and it leaves the range in the same state
+# `alloc_domain` produces (the backend zeroes a freshly mapped window), so a
+# caller restoring a retained window needs no host-to-device traffic.
+_CTRL_MEMSET = 19
+_MEMSET_COUNT = struct.Struct("<I")
+_MEMSET_RECORD = struct.Struct("<IQQ")
 
 # MAP_HOST payload: token (u64), parent_va (u64), nbytes (u64), then the
 # NUL-free host-buffer shm name as the trailing bytes. UNMAP_HOST payload is the
@@ -660,6 +667,66 @@ def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
     nul = raw.find(b"\x00")
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _encode_memset_payload(device_ranges: dict[int, tuple[int, int]]) -> bytes:
+    """Encode ``<u32 count><count * (u32 device, u64 base, u64 nbytes)>``."""
+    parts = [_MEMSET_COUNT.pack(len(device_ranges))]
+    for device_id in sorted(device_ranges):
+        base, nbytes = device_ranges[device_id]
+        parts.append(_MEMSET_RECORD.pack(int(device_id), int(base), int(nbytes)))
+    return b"".join(parts)
+
+
+def _decode_memset_payload(payload: bytes) -> dict[int, tuple[int, int]]:
+    """Inverse of :func:`_encode_memset_payload`."""
+    (count,) = _MEMSET_COUNT.unpack_from(payload, 0)
+    offset = _MEMSET_COUNT.size
+    ranges: dict[int, tuple[int, int]] = {}
+    for _ in range(count):
+        device_id, base, nbytes = _MEMSET_RECORD.unpack_from(payload, offset)
+        offset += _MEMSET_RECORD.size
+        ranges[int(device_id)] = (int(base), int(nbytes))
+    return ranges
+
+
+def _handle_ctrl_memset(buf: memoryview, device_id: int) -> None:
+    """Zero this chip's staged device range in place.
+
+    Staged request payload:
+    ``<u32 count><count * (u32 device, u64 base, u64 nbytes)>``.
+
+    A payload carrying no record for this device is a no-op: the broadcast
+    reaches every chip child, but a range set may cover only the subset of
+    chips that participate in the caller's domain.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        if payload_size <= 0 or payload_size > staged.size:
+            raise RuntimeError(f"memset payload size mismatch: payload={payload_size}, shm={staged.size}")
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    ranges = _decode_memset_payload(payload)
+
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtMemset.restype = ctypes.c_int
+    acl.aclrtMemset.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_size_t]
+
+    entry = ranges.get(device_id)
+    if entry is None:
+        return
+    base, nbytes = entry
+    if nbytes <= 0:
+        return
+    if base <= 0:
+        raise RuntimeError(f"memset range for device_id={device_id} has a null base")
+    rc = acl.aclrtMemset(ctypes.c_void_p(base), ctypes.c_size_t(nbytes), 0, ctypes.c_size_t(nbytes))
+    if rc != 0:
+        raise RuntimeError(f"aclrtMemset rc={rc} device_id={device_id} base=0x{base:x} nbytes={nbytes}")
 
 
 def _shm_base_addr(shm: SharedMemory) -> int:
@@ -1703,6 +1770,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_IMPORT_IPC:
                         _handle_ctrl_import_ipc(buf, device_id)
+                    elif sub_cmd == _CTRL_MEMSET:
+                        _handle_ctrl_memset(buf, device_id)
                     elif sub_cmd == _CTRL_L3_L2_REGION_CREATE:
                         _handle_ctrl_l3_l2_region_create(cw, buf, chip_platform, l3_l2_region_store)
                     elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
@@ -5685,6 +5754,57 @@ class Worker:
         finally:
             reply.close()
             reply.unlink()
+
+    @property
+    def device_memset_available(self) -> bool:
+        """True when chip children can zero device memory in place.
+
+        The sim platform has no ACL runtime to call, so callers there must move
+        zeros through :meth:`copy_to` instead of :meth:`memset_all`.
+        """
+        return not str(self._config.get("platform", "")).endswith("sim")
+
+    def memset_all(self, worker_ranges: dict[int, tuple[int, int]]) -> None:
+        """Zero one device range per chip child, on the device, in parallel.
+
+        ``worker_ranges`` maps chip worker id to ``(device_base, nbytes)``. Each
+        range is zeroed by ``aclrtMemset`` inside the child that owns the ACL
+        context, so no bytes cross PCIe. Chip children absent from the map are
+        left untouched. Blocks until every child has finished, so the zeroing is
+        ordered before any work the caller submits afterwards.
+
+        Requires :attr:`device_memset_available`.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("memset_all requires Worker.init()")
+        if not self.device_memset_available:
+            raise RuntimeError(
+                f"memset_all is unavailable on platform {self._config.get('platform', '')!r}: "
+                "no ACL runtime to call"
+            )
+        device_ids = [int(device_id) for device_id in self._config.get("device_ids", [])]
+        ranges: dict[int, tuple[int, int]] = {}
+        for worker_id, (base, nbytes) in worker_ranges.items():
+            if not 0 <= int(worker_id) < len(device_ids):
+                raise ValueError(
+                    f"memset_all worker id {worker_id} is out of range for {len(device_ids)} chip children"
+                )
+            ranges[device_ids[int(worker_id)]] = (int(base), int(nbytes))
+        if not ranges:
+            return
+        with self._child_prov_lock:
+            for worker_id, (base, nbytes) in worker_ranges.items():
+                self._child_prov_require_live(int(worker_id), int(base), api="memset_all", size=int(nbytes))
+        results = self._worker.broadcast_control_all(
+            WorkerType.NEXT_LEVEL,
+            int(_CTRL_MEMSET),
+            _encode_memset_payload(ranges),
+            None,
+            timeout_s=self._py_control_timeout_s,
+        )
+        errors = self._control_errors(list(results))
+        if errors:
+            raise RuntimeError(f"memset_all failed on {len(errors)} chip children; first: {errors[0]}")
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
         """Allocate a born-shared host buffer, attached into every local L3 child,
