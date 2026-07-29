@@ -437,8 +437,8 @@ class _ChildProvEntry:
     window / carved buffer pointer can legally alias the same device address.
     The key is live while ``malloc_owned or domain_allocation_ids``; only an
     exact ``malloc`` base is ``free``-able, while a domain pointer is revoked by
-    its domain's release. Interior pointers are never recorded, so a pointer
-    that merely lands inside a live allocation has no entry and is rejected.
+    its domain's release. malloc interior pointers remain invalid; CommDomain
+    interiors are validated separately against their worker-local live window.
     """
 
     __slots__ = ("malloc_owned", "domain_allocation_ids")
@@ -453,6 +453,15 @@ class _ChildProvEntry:
         entry momentarily left empty (e.g. an interrupted revoke) never
         re-authorizes a freed pointer."""
         return self.malloc_owned or bool(self.domain_allocation_ids)
+
+
+@dataclass(frozen=True)
+class _ChildDomainRange:
+    """One live CommDomain window range owned by a child worker."""
+
+    base: int
+    end: int
+    allocation_id: int
 
 
 @dataclass
@@ -2236,10 +2245,16 @@ class Worker:
         # Zero-copy IPC-imported regions (import_ipc_all): the fork imports a
         # whole consolidated pool per chip and carves interior views
         # (DeviceTensor(peer_base + offset)) out of it, so a child_memory arg is
-        # a legitimate INTERIOR pointer, never the exact base. malloc/domain
+        # a legitimate INTERIOR pointer, never the exact base. malloc
         # provenance is exact-match keyed; IPC pools are range-checked instead.
         # Keyed by worker_id -> list of (base, end) live regions.
         self._child_ipc_regions: dict[int, list[tuple[int, int]]] = {}
+        # CommDomain windows also have legitimate interior pointers: persistent
+        # reset clears them in chunks at ``local_window_base + offset`` and
+        # kernels may use carved child_memory views.  Track the whole live
+        # window, tied to its allocation id, so range checks remain worker-local
+        # and release revokes exact pointers plus interior views atomically.
+        self._child_domain_ranges: dict[int, list[_ChildDomainRange]] = {}
         self._child_prov_lock = threading.Lock()
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
@@ -5085,7 +5100,12 @@ class Worker:
         # not by the deferred marker — so the deferred window stays dispatchable.
         with self._child_prov_lock:
             for chip_idx, ctx in contexts.items():
-                self._child_prov_record_domain(chip_idx, int(ctx.local_window_base), allocation_id)
+                self._child_prov_record_domain(
+                    chip_idx,
+                    int(ctx.local_window_base),
+                    allocation_id,
+                    size=int(ctx.actual_window_size),
+                )
                 for buf_ptr in ctx.buffer_ptrs.values():
                     self._child_prov_record_domain(chip_idx, int(buf_ptr), allocation_id)
         return handle
@@ -5310,27 +5330,94 @@ class Worker:
         else:
             del self._child_alloc_prov[key]  # last role — delete directly, no empty state
 
-    def _child_prov_require_live(self, worker_id: int, ptr: int, *, api: str) -> None:
+    def _child_prov_require_live(
+        self,
+        worker_id: int,
+        ptr: int,
+        *,
+        api: str,
+        size: int = 1,
+    ) -> None:
         """Require ``(worker_id, ptr)`` to be a live child pointer (malloc, domain,
-        or an interior pointer into a live IPC-imported region)."""
+        or an interior pointer into a live IPC-imported/domain region).
+
+        Range-backed allocations validate the complete ``[ptr, ptr+size)``
+        span. Exact malloc entries remain base-only because this guard does not
+        currently retain their native allocation sizes.
+        """
+        if size < 0:
+            raise ValueError(f"Worker.{api}: size must be non-negative, got {size}")
+        span_end = int(ptr) + max(int(size), 1)
         entry = self._child_alloc_prov.get((worker_id, ptr))
-        if (entry is None or not entry.is_live()) and not self._child_ptr_in_ipc_region(worker_id, ptr):
+        exact_malloc_live = entry is not None and entry.malloc_owned
+        tracked_domain_ids = self._child_tracked_domain_ids(worker_id, entry)
+        exact_domain_ids = set() if entry is None else entry.domain_allocation_ids - tracked_domain_ids
+        exact_domain_live = bool(exact_domain_ids) or (
+            bool(tracked_domain_ids)
+            and self._child_span_in_domain_range(
+                worker_id,
+                int(ptr),
+                span_end,
+                allocation_ids=tracked_domain_ids,
+            )
+        )
+        if (
+            not exact_malloc_live
+            and not exact_domain_live
+            and not self._child_span_in_ipc_region(worker_id, int(ptr), span_end)
+            and not self._child_span_in_domain_range(worker_id, int(ptr), span_end)
+        ):
             raise ValueError(
                 f"Worker.{api}: device pointer 0x{ptr:x} is not a live allocation on worker "
-                f"{worker_id} (wrong worker, freed/stale, or an interior pointer)"
+                f"{worker_id} (wrong worker, freed/stale, or an out-of-bounds interior span)"
             )
 
-    def _child_ptr_in_ipc_region(self, worker_id: int, ptr: int) -> bool:
-        """True iff ``ptr`` falls inside a live IPC-imported region on ``worker_id``.
+    def _child_span_in_ipc_region(self, worker_id: int, ptr: int, span_end: int) -> bool:
+        """True iff ``[ptr, span_end)`` is inside a live IPC-imported region.
 
         A zero-copy IPC pool is imported whole (import_ipc_all) and the caller
         carves interior views out of it, so a legitimate child_memory pointer is
-        ``base + offset`` — never the exact base. malloc/domain use exact-match
-        keying; IPC pools are range-checked here."""
-        for base, end in self._child_ipc_regions.get(worker_id, ()):
-            if base <= ptr < end:
+        ``base + offset`` — never the exact base. IPC pools are range-checked
+        here; CommDomain windows have a separate allocation-id-aware range."""
+        for base, limit in self._child_ipc_regions.get(worker_id, ()):
+            if base <= ptr and span_end <= limit:
                 return True
         return False
+
+    def _child_ptr_in_ipc_region(self, worker_id: int, ptr: int) -> bool:
+        """Compatibility helper for single-address IPC provenance checks."""
+        return self._child_span_in_ipc_region(worker_id, int(ptr), int(ptr) + 1)
+
+    def _child_span_in_domain_range(
+        self,
+        worker_id: int,
+        ptr: int,
+        span_end: int,
+        *,
+        allocation_ids: set[int] | None = None,
+    ) -> bool:
+        """True iff ``[ptr, span_end)`` is inside a live CommDomain window."""
+        for region in self._child_domain_ranges.get(worker_id, ()):
+            if allocation_ids is not None and region.allocation_id not in allocation_ids:
+                continue
+            if region.base <= ptr and span_end <= region.end:
+                return True
+        return False
+
+    def _child_ptr_in_domain_range(self, worker_id: int, ptr: int) -> bool:
+        """True iff one address falls inside a live CommDomain window."""
+        return self._child_span_in_domain_range(worker_id, int(ptr), int(ptr) + 1)
+
+    def _child_tracked_domain_ids(
+        self,
+        worker_id: int,
+        entry: _ChildProvEntry | None,
+    ) -> set[int]:
+        """Return entry domain ids that have a full range on ``worker_id``."""
+        if entry is None or not entry.domain_allocation_ids:
+            return set()
+        ranged_ids = {region.allocation_id for region in self._child_domain_ranges.get(worker_id, ())}
+        return entry.domain_allocation_ids & ranged_ids
 
     def _child_prov_record_ipc_region(self, worker_id: int, base: int, size: int) -> None:
         """Record a live IPC-imported region ``[base, base+size)`` on ``worker_id``
@@ -5342,17 +5429,39 @@ class Worker:
         if region not in regions:
             regions.append(region)
 
-    def _child_prov_record_domain(self, worker_id: int, ptr: int, allocation_id: int) -> None:
-        """Record a CommDomain window / buffer pointer at exact ``(worker_id, ptr)``."""
+    def _child_prov_record_domain(
+        self,
+        worker_id: int,
+        ptr: int,
+        allocation_id: int,
+        *,
+        size: int | None = None,
+    ) -> None:
+        """Record a CommDomain pointer and, for a window base, its full range."""
         entry = self._child_alloc_prov.get((worker_id, ptr))
         if entry is None:
             entry = _ChildProvEntry()
             self._child_alloc_prov[(worker_id, ptr)] = entry
         entry.domain_allocation_ids.add(allocation_id)
+        if size is not None and size > 0:
+            region = _ChildDomainRange(
+                base=int(ptr),
+                end=int(ptr) + int(size),
+                allocation_id=int(allocation_id),
+            )
+            ranges = self._child_domain_ranges.setdefault(int(worker_id), [])
+            if region not in ranges:
+                ranges.append(region)
 
     def _child_prov_drop_domain(self, allocation_id: int) -> None:
         """Drop every pointer recorded by a CommDomain allocation (at the start of
         its physical release, before the backend free — see _release_domain_now)."""
+        for worker_id, ranges in list(self._child_domain_ranges.items()):
+            kept = [region for region in ranges if region.allocation_id != allocation_id]
+            if kept:
+                self._child_domain_ranges[worker_id] = kept
+            else:
+                del self._child_domain_ranges[worker_id]
         for key in list(self._child_alloc_prov):
             entry = self._child_alloc_prov[key]
             if allocation_id not in entry.domain_allocation_ids:
@@ -5405,7 +5514,11 @@ class Worker:
         target = next(iter(candidates))
         for ptr, arg_index in child_ptrs:
             entry = self._child_alloc_prov.get((target, ptr))
-            if (entry is None or not entry.is_live()) and not self._child_ptr_in_ipc_region(target, ptr):
+            if (
+                (entry is None or not entry.is_live())
+                and not self._child_ptr_in_ipc_region(target, ptr)
+                and not self._child_ptr_in_domain_range(target, ptr)
+            ):
                 raise ValueError(
                     f"orch.{api}: child_memory argument (arg {arg_index}, ptr 0x{ptr:x}) is not a "
                     f"live allocation on target worker {target} (wrong worker, stale, or interior pointer)"
@@ -5416,6 +5529,7 @@ class Worker:
         with self._child_prov_lock:
             self._child_alloc_prov.clear()
             self._child_ipc_regions.clear()
+            self._child_domain_ranges.clear()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
         """Range-check ``worker_id`` against the L3-level chip mailbox set.
@@ -5468,7 +5582,7 @@ class Worker:
             if self.level == 2:
                 assert self._chip_worker is not None
                 with self._child_prov_lock:
-                    self._child_prov_require_live(0, int(dst), api="copy_to")
+                    self._child_prov_require_live(0, int(dst), api="copy_to", size=int(size))
                     self._chip_worker.copy_to(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
@@ -5481,7 +5595,7 @@ class Worker:
             if self.level == 2:
                 assert self._chip_worker is not None
                 with self._child_prov_lock:
-                    self._child_prov_require_live(0, int(src), api="copy_from")
+                    self._child_prov_require_live(0, int(src), api="copy_from", size=int(size))
                     self._chip_worker.copy_from(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
