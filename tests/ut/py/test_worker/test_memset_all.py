@@ -28,7 +28,7 @@ def _initialized_worker(device_ids=(8, 9), platform="a2a3"):
     worker._config = {"device_ids": list(device_ids), "platform": platform}
     worker._py_control_timeout_s = 30.0
     worker._child_prov_lock = MagicMock()
-    worker._child_prov_require_live = MagicMock()
+    worker._child_prov_require_live_range = MagicMock()
     return worker
 
 
@@ -52,8 +52,8 @@ def test_memset_all_maps_worker_ids_to_device_ids():
 
     worker._worker.broadcast_control_all.side_effect = broadcast
     worker.memset_all({0: (0x1000, 64), 1: (0x2000, 128)})
-    worker._child_prov_require_live.assert_any_call(0, 0x1000, api="memset_all", size=64)
-    worker._child_prov_require_live.assert_any_call(1, 0x2000, api="memset_all", size=128)
+    worker._child_prov_require_live_range.assert_any_call(0, 0x1000, 64, api="memset_all")
+    worker._child_prov_require_live_range.assert_any_call(1, 0x2000, 128, api="memset_all")
 
 
 def test_memset_all_rejects_unknown_worker_id():

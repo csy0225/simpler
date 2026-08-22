@@ -17,6 +17,7 @@ from simpler.worker import (
     _CTRL_IMPORT_IPC,
     _IPC_REPLY_HEADER,
     _IPC_REPLY_RECORD,
+    _Lifecycle,
     _decode_ipc_import_payload,
     _encode_ipc_import_payload,
 )
@@ -25,7 +26,7 @@ from simpler.worker import (
 def _initialized_worker(device_ids=(8, 9)):
     worker = Worker.__new__(Worker)
     worker._worker = MagicMock()
-    worker._initialized = True
+    worker._lifecycle = _Lifecycle.READY
     worker._config = {"device_ids": list(device_ids)}
     worker._py_control_timeout_s = 30.0
     return worker
@@ -87,6 +88,6 @@ def test_import_ipc_all_requires_exact_worker_device_set():
 
 def test_import_ipc_all_requires_initialized_worker():
     worker = _initialized_worker()
-    worker._initialized = False
+    worker._lifecycle = _Lifecycle.CLOSED
     with pytest.raises(RuntimeError, match=r"Worker\.init"):
         worker.import_ipc_all({8: b"a" * 256, 9: b"b" * 256})
