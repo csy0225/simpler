@@ -548,9 +548,29 @@ _CTRL_OP_NAMES = {
 _CTRL_WORKER_CHIP_REGION_CREATE = 16
 _CTRL_WORKER_CHIP_REGION_RELEASE = 17
 _CTRL_COMMITTED_DEVICE_MEMORY = 18
+
+# Import one external ACL IPC key in each chip child and return the imported
+# device VA through a reply shm.  The import must run in the child that owns the
+# ACL context; importing in the parent would produce an unusable pointer.
+_CTRL_IMPORT_IPC = 25
+_IPC_KEY_BYTES = 256
+_IPC_REPLY_HEADER = struct.Struct("<I")
+_IPC_REPLY_RECORD = struct.Struct("<IQ")
+_IPC_REQUEST_NAME_LEN = struct.Struct("<H")
+_IPC_REQUEST_COUNT = struct.Struct("<I")
+_IPC_REQUEST_RECORD = struct.Struct("<I")
+# Zero one device range per chip child in place.  The memset must run in the
+# child that owns the ACL context, and it leaves the range in the same state
+# `alloc_domain` produces (the backend zeroes a freshly mapped window), so a
+# caller restoring a retained window needs no host-to-device traffic.
+_CTRL_MEMSET = 26
+_MEMSET_COUNT = struct.Struct("<I")
+_MEMSET_RECORD = struct.Struct("<IQQ")
 # L4-to-local-L3 envelope for the Global CommDomain control protocol. The
 # enclosed command uses remote_l3_protocol.ControlName; values 18-23 belong to
-# chip-child controls.
+# chip-child controls.  _CTRL_IMPORT_IPC / _CTRL_MEMSET sit at 25/26 rather than
+# inside 18-23 because 18 is _CTRL_COMMITTED_DEVICE_MEMORY; 25+ is past every
+# allocated opcode, so neither can alias this envelope nor a ControlName value.
 _CTRL_GLOBAL_DOMAIN_NODE = 24
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
 _CTRL_OP_NAMES[_CTRL_GLOBAL_DOMAIN_NODE] = "global_domain"
@@ -1647,6 +1667,188 @@ def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
     nul = raw.find(b"\x00")
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _normalize_ipc_device_key_map(device_key_map: dict[int, bytes]) -> dict[int, bytes]:
+    if not isinstance(device_key_map, dict) or not device_key_map:
+        raise ValueError("import_ipc_all requires a non-empty device_id -> 256-byte key map")
+    normalized: dict[int, bytes] = {}
+    for raw_device_id, raw_key in device_key_map.items():
+        if isinstance(raw_device_id, bool) or not isinstance(raw_device_id, int) or raw_device_id < 0:
+            raise TypeError(f"IPC device id must be a non-negative int, got {raw_device_id!r}")
+        try:
+            key = bytes(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"IPC key for device {raw_device_id} must be bytes-like") from exc
+        if len(key) != _IPC_KEY_BYTES:
+            raise ValueError(
+                f"IPC key for device {raw_device_id} must be exactly {_IPC_KEY_BYTES} bytes, got {len(key)}"
+            )
+        normalized[raw_device_id] = key
+    return normalized
+
+
+def _encode_ipc_import_payload(reply_name: str, device_key_map: dict[int, bytes]) -> bytes:
+    normalized = _normalize_ipc_device_key_map(device_key_map)
+    reply_name_bytes = reply_name.encode("utf-8")
+    if not reply_name_bytes or len(reply_name_bytes) > 0xFFFF:
+        raise ValueError("IPC reply shm name must be non-empty and fit in uint16")
+    payload = bytearray()
+    payload += _IPC_REQUEST_NAME_LEN.pack(len(reply_name_bytes))
+    payload += reply_name_bytes
+    payload += _IPC_REQUEST_COUNT.pack(len(normalized))
+    for device_id in sorted(normalized):
+        payload += _IPC_REQUEST_RECORD.pack(device_id)
+        payload += normalized[device_id]
+    return bytes(payload)
+
+
+def _decode_ipc_import_payload(payload: bytes) -> tuple[str, dict[int, bytes]]:
+    min_size = _IPC_REQUEST_NAME_LEN.size + _IPC_REQUEST_COUNT.size
+    if len(payload) < min_size:
+        raise RuntimeError(f"IPC import payload is truncated: {len(payload)} bytes")
+    offset = 0
+    (reply_name_len,) = _IPC_REQUEST_NAME_LEN.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_NAME_LEN.size
+    reply_name_end = offset + reply_name_len
+    if reply_name_len == 0 or reply_name_end + _IPC_REQUEST_COUNT.size > len(payload):
+        raise RuntimeError("IPC import payload has an invalid reply shm name length")
+    reply_name = payload[offset:reply_name_end].decode("utf-8")
+    offset = reply_name_end
+    (count,) = _IPC_REQUEST_COUNT.unpack_from(payload, offset)
+    offset += _IPC_REQUEST_COUNT.size
+    expected_size = offset + count * (_IPC_REQUEST_RECORD.size + _IPC_KEY_BYTES)
+    if expected_size != len(payload):
+        raise RuntimeError(
+            f"IPC import payload size mismatch: expected {expected_size}, got {len(payload)}"
+        )
+    device_key_map: dict[int, bytes] = {}
+    for _ in range(count):
+        (device_id,) = _IPC_REQUEST_RECORD.unpack_from(payload, offset)
+        offset += _IPC_REQUEST_RECORD.size
+        if device_id in device_key_map:
+            raise RuntimeError(f"IPC import payload repeats device id {device_id}")
+        device_key_map[device_id] = payload[offset : offset + _IPC_KEY_BYTES]
+        offset += _IPC_KEY_BYTES
+    return reply_name, device_key_map
+
+
+def _handle_ctrl_import_ipc(buf: memoryview, device_id: int) -> None:
+    """Import this chip's external ACL IPC key and publish its peer VA.
+
+    Staged request payload:
+    ``<u16 reply-name-len><reply-name><u32 count><count * (u32 device, 256B key)>``.
+
+    Reply shm:
+    ``<u32 count><count * (u32 device, u64 imported-va)>``.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        if payload_size <= 0 or payload_size > staged.size:
+            raise RuntimeError(
+                f"IPC import payload size mismatch: payload={payload_size}, shm={staged.size}"
+            )
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    reply_name, device_key_map = _decode_ipc_import_payload(payload)
+    try:
+        key = device_key_map[device_id]
+    except KeyError as exc:
+        raise RuntimeError(f"IPC import has no key for device_id {device_id}") from exc
+
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtIpcMemImportByKey.restype = ctypes.c_int
+    acl.aclrtIpcMemImportByKey.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_uint64]
+    key_buffer = ctypes.create_string_buffer(key, _IPC_KEY_BYTES)
+    va = ctypes.c_void_p(0)
+    rc = acl.aclrtIpcMemImportByKey(ctypes.byref(va), key_buffer, ctypes.c_uint64(0x1))
+    if rc != 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey rc={rc} device_id={device_id}")
+    va_int = int(va.value or 0)
+    if va_int <= 0:
+        raise RuntimeError(f"aclrtIpcMemImportByKey returned null VA for device_id={device_id}")
+
+    reply = SharedMemory(name=reply_name)
+    try:
+        reply_buf = reply.buf
+        assert reply_buf is not None
+        (reply_count,) = _IPC_REPLY_HEADER.unpack_from(reply_buf, 0)
+        found = False
+        for index in range(reply_count):
+            record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+            reply_device_id, _ = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+            if reply_device_id == device_id:
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, va_int)
+                found = True
+                break
+        if not found:
+            raise RuntimeError(f"IPC reply shm has no slot for device_id={device_id}")
+    finally:
+        reply.close()
+
+
+def _encode_memset_payload(device_ranges: dict[int, tuple[int, int]]) -> bytes:
+    """Encode ``<u32 count><count * (u32 device, u64 base, u64 nbytes)>``."""
+    parts = [_MEMSET_COUNT.pack(len(device_ranges))]
+    for device_id in sorted(device_ranges):
+        base, nbytes = device_ranges[device_id]
+        parts.append(_MEMSET_RECORD.pack(int(device_id), int(base), int(nbytes)))
+    return b"".join(parts)
+
+
+def _decode_memset_payload(payload: bytes) -> dict[int, tuple[int, int]]:
+    """Inverse of :func:`_encode_memset_payload`."""
+    (count,) = _MEMSET_COUNT.unpack_from(payload, 0)
+    offset = _MEMSET_COUNT.size
+    ranges: dict[int, tuple[int, int]] = {}
+    for _ in range(count):
+        device_id, base, nbytes = _MEMSET_RECORD.unpack_from(payload, offset)
+        offset += _MEMSET_RECORD.size
+        ranges[int(device_id)] = (int(base), int(nbytes))
+    return ranges
+
+
+def _handle_ctrl_memset(buf: memoryview, device_id: int) -> None:
+    """Zero this chip's staged device range in place.
+
+    Staged request payload:
+    ``<u32 count><count * (u32 device, u64 base, u64 nbytes)>``.
+
+    A payload carrying no record for this device is a no-op: the broadcast
+    reaches every chip child, but a range set may cover only the subset of
+    chips that participate in the caller's domain.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        if payload_size <= 0 or payload_size > staged.size:
+            raise RuntimeError(f"memset payload size mismatch: payload={payload_size}, shm={staged.size}")
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    ranges = _decode_memset_payload(payload)
+
+    acl = ctypes.CDLL("libascendcl.so")
+    acl.aclrtMemset.restype = ctypes.c_int
+    acl.aclrtMemset.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_size_t]
+
+    entry = ranges.get(device_id)
+    if entry is None:
+        return
+    base, nbytes = entry
+    if nbytes <= 0:
+        return
+    if base <= 0:
+        raise RuntimeError(f"memset range for device_id={device_id} has a null base")
+    rc = acl.aclrtMemset(ctypes.c_void_p(base), ctypes.c_size_t(nbytes), 0, ctypes.c_size_t(nbytes))
+    if rc != 0:
+        raise RuntimeError(f"aclrtMemset rc={rc} device_id={device_id} base=0x{base:x} nbytes={nbytes}")
 
 
 def _allocate_local_slot(registry: dict[int, Any]) -> int:
@@ -3001,6 +3203,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 struct.pack_into("Q", buf, _CTRL_OFF_RESULT, cw.committed_device_memory)
             elif sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
+            elif sub_cmd == _CTRL_IMPORT_IPC:
+                _handle_ctrl_import_ipc(buf, device_id)
+            elif sub_cmd == _CTRL_MEMSET:
+                _handle_ctrl_memset(buf, device_id)
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_PREPARE:
                 _handle_ctrl_global_domain_prepare(cw, buf, global_domain_store)
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_IMPORT:
@@ -10503,8 +10709,146 @@ class Worker:
                     self._worker.copy_from(wid, host.to_descriptor(), src.to_descriptor(), nbytes)
 
     # ------------------------------------------------------------------
-    # Post-fork zero-copy host buffers
+    # Chip-child device-context controls (external IPC import, device memset)
     # ------------------------------------------------------------------
+
+    def import_ipc_all(
+        self,
+        device_key_map: dict[int, bytes],
+        *,
+        region_bytes: "dict[int, int] | int | None" = None,
+    ) -> dict[int, int]:
+        """Import one external ACL IPC allocation in every chip child.
+
+        ``device_key_map`` is keyed by physical device id.  Each 256-byte key is
+        imported inside the matching child ACL context with peer access enabled;
+        the returned map contains child-valid device VAs.  This is a zero-copy
+        ownership bridge: the exporter must keep every allocation alive until
+        this Worker is closed.
+
+        ``region_bytes`` (optional) is the imported pool size — a dict keyed by
+        device id, or a single int applied to every device. When given, the
+        imported region ``[peer_va, peer_va + size)`` is recorded as a live child
+        allocation so the dispatch provenance guard accepts the INTERIOR pointers
+        (``DeviceTensor(peer_base + offset)``) that callers carve out of the pool.
+        Without it, imported VAs are returned but not provenance-registered, so a
+        later child_memory dispatch of an interior pointer is rejected.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("import_ipc_all requires Worker.init()")
+        normalized = _normalize_ipc_device_key_map(device_key_map)
+        expected_devices = [int(device_id) for device_id in self._config.get("device_ids", [])]
+        if set(normalized) != set(expected_devices):
+            raise ValueError(
+                "import_ipc_all device map must exactly match Worker device_ids: "
+                f"expected={sorted(expected_devices)}, got={sorted(normalized)}"
+            )
+        device_ids = sorted(normalized)
+        reply = SharedMemory(
+            create=True,
+            size=_IPC_REPLY_HEADER.size + len(device_ids) * _IPC_REPLY_RECORD.size,
+        )
+        try:
+            reply_buf = reply.buf
+            assert reply_buf is not None
+            _IPC_REPLY_HEADER.pack_into(reply_buf, 0, len(device_ids))
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                _IPC_REPLY_RECORD.pack_into(reply_buf, record_offset, device_id, 0)
+            payload = _encode_ipc_import_payload(reply.name, normalized)
+            results = self._worker.broadcast_control_all(
+                WorkerType.NEXT_LEVEL,
+                int(_CTRL_IMPORT_IPC),
+                payload,
+                None,
+                timeout_s=self._py_control_timeout_s,
+            )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"import_ipc_all failed on {len(errors)} chip children; first: {errors[0]}"
+                )
+            imported: dict[int, int] = {}
+            for index, device_id in enumerate(device_ids):
+                record_offset = _IPC_REPLY_HEADER.size + index * _IPC_REPLY_RECORD.size
+                reply_device_id, va = _IPC_REPLY_RECORD.unpack_from(reply_buf, record_offset)
+                if reply_device_id != device_id or va <= 0:
+                    raise RuntimeError(
+                        "import_ipc_all received an invalid reply: "
+                        f"expected device={device_id}, got device={reply_device_id}, va=0x{va:x}"
+                    )
+                imported[device_id] = va
+            if region_bytes is not None:
+                # Map physical device id -> chip worker id (== config device_ids
+                # order, the fork order the dispatch guard keys on), then record
+                # each imported pool as a live interior-addressable region.
+                device_to_chip = {dev: i for i, dev in enumerate(expected_devices)}
+                with self._child_prov_lock:
+                    for device_id, va in imported.items():
+                        size = region_bytes[device_id] if isinstance(region_bytes, dict) else int(region_bytes)
+                        wid = device_to_chip[device_id]
+                        # Imported pools are owned by the exporter and live until this
+                        # Worker closes; mint a fresh allocation id so no domain release
+                        # can revoke them, and record the pool extent so the dispatch
+                        # guard accepts INTERIOR pointers carved out of it.
+                        allocation_id = self._next_alloc_id
+                        self._next_alloc_id += 1
+                        self._child_prov_record_domain(wid, int(va), allocation_id, int(size))
+            return imported
+        finally:
+            reply.close()
+            reply.unlink()
+
+    @property
+    def device_memset_available(self) -> bool:
+        """True when chip children can zero device memory in place.
+
+        The sim platform has no ACL runtime to call, so callers there must move
+        zeros through :meth:`copy_to` instead of :meth:`memset_all`.
+        """
+        return not str(self._config.get("platform", "")).endswith("sim")
+
+    def memset_all(self, worker_ranges: dict[int, tuple[int, int]]) -> None:
+        """Zero one device range per chip child, on the device, in parallel.
+
+        ``worker_ranges`` maps chip worker id to ``(device_base, nbytes)``. Each
+        range is zeroed by ``aclrtMemset`` inside the child that owns the ACL
+        context, so no bytes cross PCIe. Chip children absent from the map are
+        left untouched. Blocks until every child has finished, so the zeroing is
+        ordered before any work the caller submits afterwards.
+
+        Requires :attr:`device_memset_available`.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("memset_all requires Worker.init()")
+        if not self.device_memset_available:
+            raise RuntimeError(
+                f"memset_all is unavailable on platform {self._config.get('platform', '')!r}: "
+                "no ACL runtime to call"
+            )
+        device_ids = [int(device_id) for device_id in self._config.get("device_ids", [])]
+        ranges: dict[int, tuple[int, int]] = {}
+        for worker_id, (base, nbytes) in worker_ranges.items():
+            if not 0 <= int(worker_id) < len(device_ids):
+                raise ValueError(
+                    f"memset_all worker id {worker_id} is out of range for {len(device_ids)} chip children"
+                )
+            ranges[device_ids[int(worker_id)]] = (int(base), int(nbytes))
+        if not ranges:
+            return
+        with self._child_prov_lock:
+            for worker_id, (base, nbytes) in worker_ranges.items():
+                self._child_prov_require_live_range(int(worker_id), int(base), int(nbytes), api="memset_all")
+        results = self._worker.broadcast_control_all(
+            WorkerType.NEXT_LEVEL,
+            int(_CTRL_MEMSET),
+            _encode_memset_payload(ranges),
+            None,
+            timeout_s=self._py_control_timeout_s,
+        )
+        errors = self._control_errors(list(results))
+        if errors:
+            raise RuntimeError(f"memset_all failed on {len(errors)} chip children; first: {errors[0]}")
 
     def create_buffer(self, nbytes: int) -> Buffer:
         """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
