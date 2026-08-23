@@ -4803,6 +4803,12 @@ class Worker:
         # two concurrent allocations don't share a marker file.  Wraps after
         # 2^64 allocations — far beyond any realistic Worker lifetime.
         self._next_alloc_id: int = 0
+        # One Buffer per interior slice of an imported zero-copy IPC pool, keyed
+        # by (worker_id, device_ptr, nbytes).  Memoized because a consumer's
+        # ImportRegistry refuses a second descriptor for an identity it has
+        # already materialized, so a slice must keep one identity for the whole
+        # Worker lifetime — see imported_region_buffer().
+        self._imported_slice_buffers: dict[tuple[int, int, int], Buffer] = {}
         # Exactly one caller drives CTRL_RELEASE_DOMAIN for a given allocation,
         # and every other caller waits for its outcome. Several paths can reach
         # one handle at once — an end-of-run or close() sweep working from its
@@ -10487,6 +10493,7 @@ class Worker:
         """Drop the whole child-pointer provenance table (close-path hygiene)."""
         with self._child_prov_lock:
             self._child_alloc_prov.clear()
+            self._imported_slice_buffers.clear()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
         """Range-check ``worker_id`` against the L3-level chip mailbox set.
@@ -10798,6 +10805,58 @@ class Worker:
         finally:
             reply.close()
             reply.unlink()
+
+    def imported_region_buffer(self, worker_id: int, device_ptr: int, nbytes: int) -> Buffer:
+        """Return a dispatchable ``Buffer`` naming one interior slice of an imported IPC pool.
+
+        ``import_ipc_all(..., region_bytes=...)`` registers the whole zero-copy pool as one
+        live child allocation, which is what ``copy_to`` needs — that path range-checks and
+        so accepts ``base + offset``.  Dispatch is stricter: its descriptor is derived from
+        an owner ``Buffer`` whose ``base`` *is* the argument's address, so a pool-wide
+        Buffer cannot name a view carved out of the pool.  This mints one Buffer per slice.
+
+        ``VMM_WINDOW`` rather than ``DEVICE_MALLOC`` because the exporter owns the memory
+        and keeps it alive until this Worker closes: ``worker.free`` must not be able to
+        reclaim it, which is precisely what distinguishes the two backend kinds.
+
+        The slice is also recorded at its own base, so the dispatch provenance guard
+        resolves it by exact lookup and needs no interior-pointer special case.
+
+        Memoized per ``(worker_id, device_ptr, nbytes)``: a consumer's ``ImportRegistry``
+        refuses a second descriptor for an identity it has already materialized, so
+        re-deriving a slice must return the same Buffer, not a fresh identity.
+        """
+        if self._worker is None or not self._initialized:
+            raise RuntimeError("imported_region_buffer requires Worker.init()")
+        if nbytes <= 0:
+            raise ValueError(f"imported_region_buffer: nbytes must be positive, got {nbytes}")
+        if device_ptr <= 0:
+            raise ValueError(f"imported_region_buffer: device_ptr must be positive, got {device_ptr}")
+        key = (int(worker_id), int(device_ptr), int(nbytes))
+        with self._child_prov_lock:
+            cached = self._imported_slice_buffers.get(key)
+            if cached is not None:
+                return cached
+            # Proves the slice lies wholly inside a live allocation on this chip; for an
+            # imported pool that is the region recorded by import_ipc_all(region_bytes=).
+            self._child_prov_require_live_range(
+                int(worker_id), int(device_ptr), int(nbytes), api="imported_region_buffer"
+            )
+            allocation_id = self._next_alloc_id
+            self._next_alloc_id += 1
+            self._child_prov_record_domain(
+                int(worker_id), int(device_ptr), allocation_id, int(nbytes)
+            )
+            handle = wrap_vmm_window(
+                int(device_ptr),
+                int(nbytes),
+                self._owner_instance_id,
+                self._next_buffer_id(),
+                f"L{self.level}",
+                owner_worker_id=int(worker_id),
+            )
+            self._imported_slice_buffers[key] = handle
+            return handle
 
     @property
     def device_memset_available(self) -> bool:
